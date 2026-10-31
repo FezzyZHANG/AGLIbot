@@ -21,8 +21,9 @@ pub struct Telegram {
 impl Telegram {
     pub fn from_env(cfg: &TelegramCfg) -> Result<Self> {
         let token = std::env::var("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN is not set")?;
+        let http = http_client(cfg)?;
         Ok(Telegram {
-            http: reqwest::Client::new(),
+            http,
             base: format!("https://api.telegram.org/bot{token}"),
             offset: 0,
             poll_timeout_s: cfg.poll_timeout_s,
@@ -75,6 +76,16 @@ impl Telegram {
     }
 }
 
+fn http_client(cfg: &TelegramCfg) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(cfg.poll_timeout_s + 10));
+    if let Some(proxy) = &cfg.proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy).context("invalid Telegram proxy URL")?);
+    }
+    builder.build().context("building Telegram HTTP client")
+}
+
 fn parse_message(msg: &Value) -> Option<Envelope> {
     let text = msg.get("text")?.as_str()?.to_string();
     let from = msg.get("from")?;
@@ -118,5 +129,65 @@ mod tests {
         let text = "汉".repeat(7);
         assert_eq!(chunks(&text, 3), ["汉汉汉", "汉汉汉", "汉"]);
         assert!(chunks("", 3).is_empty());
+    }
+
+    #[tokio::test]
+    async fn polling_and_sending_use_configured_proxy() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = TelegramCfg {
+            poll_timeout_s: 1,
+            proxy_env: None,
+            proxy: Some(format!("http://{}", listener.local_addr().unwrap())),
+        };
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let headers = String::from_utf8(request).unwrap();
+                let length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                }).unwrap_or(0);
+                socket.read_exact(&mut vec![0; length]).unwrap();
+                requests.push(headers.lines().next().unwrap().to_string());
+                let body = r#"{"ok":true,"result":[]}"#;
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let mut tg = Telegram {
+            http: http_client(&cfg).unwrap(),
+            base: "http://telegram.invalid/bot-test".into(),
+            offset: 0,
+            poll_timeout_s: cfg.poll_timeout_s,
+        };
+        assert!(tg.poll().await.unwrap().is_empty());
+        tg.send("42", "proxy test").await.unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET http://telegram.invalid/bot-test/getUpdates?"));
+        assert_eq!(requests[1], "POST http://telegram.invalid/bot-test/sendMessage HTTP/1.1");
+    }
+
+    /// Reads bot metadata only; does not send messages or consume pending updates.
+    #[tokio::test]
+    #[ignore = "requires TELEGRAM_BOT_TOKEN, local proxy and network"]
+    async fn live_telegram_proxy() -> Result<()> {
+        dotenvy::dotenv().ok();
+        let cfg = crate::config::Config::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))?;
+        let tg = Telegram::from_env(&cfg.channels.telegram)?;
+        let response = tg.http.get(format!("{}/getMe", tg.base)).send().await.map_err(reqwest::Error::without_url)?;
+        let value: Value = response.json().await.map_err(reqwest::Error::without_url)?;
+        assert_eq!(value["ok"], true, "Telegram getMe failed");
+        Ok(())
     }
 }

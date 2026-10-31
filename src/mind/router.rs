@@ -127,6 +127,8 @@ mod tests {
             l,
             local,
             fallbacks: None,
+            stream: false,
+            enable_thinking: None,
         }
     }
 
@@ -198,5 +200,19 @@ mod tests {
         assert_eq!(r.next_stronger("chat", &any, "cheap").unwrap().id, "mid");
         assert_eq!(r.next_stronger("chat", &any, "mid").unwrap().id, "top");
         assert!(r.next_stronger("chat", &any, "top").is_none());
+    }
+
+    #[test]
+    fn bailian_alone_covers_repo_scenarios() {
+        let cfg = crate::config::Config::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let models = cfg.models.models.into_iter().filter(|m| m.provider == "bailian").collect();
+        let r = Router::new(models, cfg.scenarios);
+        for name in r.scenarios.keys() {
+            for exhausted in [false, true] {
+                assert_eq!(r.select(name, &ProcessingPolicy::Any, exhausted).unwrap().provider, "bailian");
+            }
+        }
+        assert_eq!(r.select("chat", &ProcessingPolicy::Any, false).unwrap().id, "qwen-flash");
+        assert!(r.select("chat", &ProcessingPolicy::LocalOnly, false).is_err());
     }
 }

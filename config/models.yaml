@@ -15,6 +15,11 @@ providers:
     kind: openai_compat
     base_url: https://api.deepseek.com
     api_key_env: DEEPSEEK_API_KEY
+  bailian:
+    kind: openai_compat
+    base_url: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+    base_url_env: BAILIAN_BASE_URL_OAI
+    api_key_env: BAILIAN_API_KEY
   local:
     kind: openai_compat
     base_url: http://localhost:11434/v1   # 例如 Ollama；没跑本地模型也无妨，只是 local_only 的信息将无模型可用
@@ -46,6 +51,47 @@ models:
     q: 7.5
     c: { input: 0.27, cached: 0.07, output: 1.10 }
     l: 1.5
+  # Token Plan 支持的模型以账户 /models 返回为准；q/l 是可调的路由估计。
+  # c 仅为路由使用的美元等效估值，不是套餐报价或 Credits 余额；请按实际消耗调整。
+  # Qwen 思考模式使用 SSE；内部收齐正文后再发给 Telegram，不发送推理内容。
+  - id: qwen-flash
+    provider: bailian
+    model: qwen3.8-flash
+    stream: true
+    enable_thinking: true
+    q: 8.0
+    c: { input: 0.10, cached: 0.01, output: 0.50 }
+    l: 0.6
+  - id: qwen-plus
+    provider: bailian
+    model: qwen3.7-plus
+    stream: true
+    enable_thinking: true
+    q: 8.5
+    c: { input: 0.50, cached: 0.05, output: 2.0 }
+    l: 1.2
+  - id: qwen-max
+    provider: bailian
+    model: qwen3.8-max
+    stream: true
+    enable_thinking: true
+    q: 9.5
+    c: { input: 2.0, cached: 0.20, output: 10.0 }
+    l: 3.0
+  - id: bailian-deepseek-flash
+    provider: bailian
+    model: deepseek-v4.1-flash
+    stream: true
+    q: 8.5
+    c: { input: 0.27, cached: 0.07, output: 1.10 }
+    l: 1.5
+  - id: bailian-deepseek-pro
+    provider: bailian
+    model: deepseek-v4-pro
+    stream: true
+    q: 9.0
+    c: { input: 0.50, cached: 0.05, output: 2.0 }
+    l: 2.0
   - id: local
     provider: local
     model: qwen3:8b

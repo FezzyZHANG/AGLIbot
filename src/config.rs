@@ -19,6 +19,9 @@ pub struct ProviderCfg {
     pub kind: ProviderKind,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Optional environment override, useful for plan/region-specific endpoints.
+    #[serde(default)]
+    pub base_url_env: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
 }
@@ -46,6 +49,10 @@ pub struct ModelEntry {
     pub local: bool,
     #[serde(default)]
     pub fallbacks: Option<String>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +89,10 @@ pub type ScenariosCfg = BTreeMap<String, Scenario>;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Owner {
     pub person_id: String,
+    /// Env var holding the owner's numeric Telegram id; read once by `Config::load`.
+    pub telegram_user_id_env: String,
+    /// 0 until resolved, and stays 0 when the env var is unset: then nobody is the owner.
+    #[serde(skip)]
     pub telegram_user_id: i64,
 }
 
@@ -93,6 +104,11 @@ pub struct AclCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelegramCfg {
     pub poll_timeout_s: u64,
+    /// Env var holding the proxy URL; unset or empty means no explicit proxy.
+    #[serde(default)]
+    pub proxy_env: Option<String>,
+    #[serde(skip)]
+    pub proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,7 +143,7 @@ pub struct Config {
 impl Config {
     pub fn load(root: &Path) -> Result<Self> {
         let dir = root.join("config");
-        let cfg = Config {
+        let mut cfg = Config {
             root: root.to_path_buf(),
             models: read_yaml(&dir.join("models.yaml"))?,
             scenarios: read_yaml(&dir.join("scenarios.yaml"))?,
@@ -135,6 +151,7 @@ impl Config {
             channels: read_yaml(&dir.join("channels.yaml"))?,
             runtime: read_yaml(&dir.join("runtime.yaml"))?,
         };
+        cfg.resolve_env()?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -145,6 +162,18 @@ impl Config {
 
     pub fn data_dir(&self) -> PathBuf {
         self.root.join(&self.runtime.data_dir)
+    }
+
+    /// Machine- and person-specific values live in env vars (or `.env`), not in the repo.
+    fn resolve_env(&mut self) -> Result<()> {
+        let owner = &mut self.acl.owner;
+        if let Some(id) = env_value(&owner.telegram_user_id_env) {
+            owner.telegram_user_id =
+                id.parse().with_context(|| format!("{} must be a numeric Telegram id", owner.telegram_user_id_env))?;
+        }
+        let tg = &mut self.channels.telegram;
+        tg.proxy = tg.proxy_env.as_deref().and_then(env_value);
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -158,6 +187,10 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {

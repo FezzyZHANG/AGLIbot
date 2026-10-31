@@ -31,7 +31,10 @@ async fn main() -> Result<()> {
     let root = std::env::var_os("AGLI_ROOT").map(PathBuf::from).unwrap_or(std::env::current_dir()?);
     let cfg = Arc::new(Config::load(&root)?);
     if cfg.acl.owner.telegram_user_id == 0 {
-        warn!("config/acl.yaml 里还没填 telegram_user_id：所有消息都会被忽略，日志会打印发信人的 ID");
+        warn!(
+            "{} 未设置：所有消息都会被忽略，日志会打印发信人的 ID",
+            cfg.acl.owner.telegram_user_id_env
+        );
     }
     let store = Arc::new(JsonlStore::open(&cfg.data_dir())?);
     let mut mind = Mind::new(cfg.clone(), store)?;

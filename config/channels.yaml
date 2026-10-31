@@ -1,2 +1,4 @@
 telegram:
   poll_timeout_s: 30
+  # 代理地址写在这个环境变量里（例如 http://127.0.0.1:7890）；不设置则不走显式代理。
+  proxy_env: TELEGRAM_PROXY

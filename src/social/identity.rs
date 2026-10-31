@@ -38,14 +38,14 @@ mod tests {
 
     #[test]
     fn owner_is_matched_by_id_not_name() {
-        let acl = AclCfg { owner: Owner { person_id: "owner".into(), telegram_user_id: 42 } };
+        let acl = AclCfg { owner: Owner { person_id: "owner".into(), telegram_user_id_env: String::new(), telegram_user_id: 42 } };
         assert_eq!(classify(&acl, &env("42", "whoever")), Sender::Owner);
         assert_eq!(classify(&acl, &env("7", "owner")), Sender::Other);
     }
 
     #[test]
     fn unset_owner_id_matches_nobody() {
-        let acl = AclCfg { owner: Owner { person_id: "owner".into(), telegram_user_id: 0 } };
+        let acl = AclCfg { owner: Owner { person_id: "owner".into(), telegram_user_id_env: String::new(), telegram_user_id: 0 } };
         assert_eq!(classify(&acl, &env("0", "x")), Sender::Other);
     }
 }

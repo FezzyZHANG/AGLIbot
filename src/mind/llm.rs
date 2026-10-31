@@ -1,5 +1,5 @@
 //! Model clients over raw HTTP: Anthropic Messages API and OpenAI-compatible chat completions
-//! (DeepSeek, OpenAI, local servers). Request bodies keep L1/L2 as a stable prefix so prompt
+//! (Bailian, DeepSeek, OpenAI, local servers). Request bodies keep L1/L2 as a stable prefix so prompt
 //! caching hits; transcripts are append-only.
 
 use std::collections::BTreeMap;
@@ -93,7 +93,64 @@ pub fn openai_body(m: &ModelEntry, p: &Prompt<'_>) -> Value {
         Turn::User(text) => json!({"role": "user", "content": text}),
         Turn::Assistant { text, .. } => json!({"role": "assistant", "content": text}),
     }));
-    json!({"model": m.model, "messages": messages, "stream": false})
+    let mut body = json!({"model": m.model, "messages": messages, "stream": m.stream});
+    if m.stream {
+        body["stream_options"] = json!({"include_usage": true});
+    }
+    if let Some(thinking) = m.enable_thinking {
+        body["enable_thinking"] = json!(thinking);
+    }
+    body
+}
+
+/// Collect OpenAI SSE output into the same reply shape as a non-streaming request.
+/// Thinking deltas stay private; the final usage-only event supplies token accounting.
+fn parse_openai_stream(body: &str) -> Result<(String, Usage)> {
+    let mut text = String::new();
+    let mut usage = Value::Null;
+    let mut done = false;
+    let normalized = body.replace("\r\n", "\n");
+    for event in normalized.split("\n\n") {
+        let data = event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:").map(|s| s.strip_prefix(' ').unwrap_or(s)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() {
+            continue;
+        }
+        if data.trim() == "[DONE]" {
+            done = true;
+            break;
+        }
+        let chunk: Value = serde_json::from_str(&data).context("invalid chat completion stream event")?;
+        if let Some(error) = chunk.get("error") {
+            bail!("chat completion stream error: {error}");
+        }
+        if let Some(delta) = chunk.pointer("/choices/0/delta/content").and_then(Value::as_str) {
+            text.push_str(delta);
+        }
+        if chunk.get("usage").is_some_and(Value::is_object) {
+            usage = chunk["usage"].clone();
+        }
+    }
+    if !done {
+        bail!("chat completion stream ended before [DONE]");
+    }
+    if text.is_empty() {
+        bail!("chat completion stream returned no text");
+    }
+    parse_openai(&json!({"choices": [{"message": {"content": text}}], "usage": usage}))
+}
+
+fn provider_base_url(provider: &ProviderCfg) -> Option<String> {
+    provider
+        .base_url_env
+        .as_deref()
+        .and_then(|var| std::env::var(var).ok())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| provider.base_url.clone())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
 }
 
 fn u64_at(v: &Value, ptr: &str) -> u64 {
@@ -175,7 +232,7 @@ impl LlmClient {
         let started = Instant::now();
         let reply = match provider.kind {
             ProviderKind::Anthropic => {
-                let base = provider.base_url.as_deref().unwrap_or("https://api.anthropic.com");
+                let base = provider_base_url(provider).unwrap_or_else(|| "https://api.anthropic.com".into());
                 let mut req = self
                     .http
                     .post(format!("{}/v1/messages", base.trim_end_matches('/')))
@@ -192,7 +249,7 @@ impl LlmClient {
                 Reply { text, raw: Some(raw), usage, latency: started.elapsed() }
             }
             ProviderKind::OpenaiCompat => {
-                let base = provider.base_url.as_deref().ok_or_else(|| anyhow!("provider {} needs base_url", m.provider))?;
+                let base = provider_base_url(provider).ok_or_else(|| anyhow!("provider {} needs base_url", m.provider))?;
                 let mut req = self
                     .http
                     .post(format!("{}/chat/completions", base.trim_end_matches('/')))
@@ -200,8 +257,12 @@ impl LlmClient {
                 if let Some(key) = &key {
                     req = req.bearer_auth(key);
                 }
-                let v = send_json(req).await?;
-                let (text, usage) = parse_openai(&v)?;
+                let body = send_text(req).await?;
+                let (text, usage) = if m.stream {
+                    parse_openai_stream(&body)?
+                } else {
+                    parse_openai(&serde_json::from_str(&body).context("response is not JSON")?)?
+                };
                 Reply { text, raw: None, usage, latency: started.elapsed() }
             }
         };
@@ -210,6 +271,10 @@ impl LlmClient {
 }
 
 async fn send_json(req: reqwest::RequestBuilder) -> Result<Value> {
+    serde_json::from_str(&send_text(req).await?).context("response is not JSON")
+}
+
+async fn send_text(req: reqwest::RequestBuilder) -> Result<String> {
     let resp = req.send().await?;
     let status = resp.status();
     let body = resp.text().await?;
@@ -217,7 +282,7 @@ async fn send_json(req: reqwest::RequestBuilder) -> Result<Value> {
         let snippet: String = body.chars().take(500).collect();
         bail!("HTTP {status}: {snippet}");
     }
-    serde_json::from_str(&body).context("response is not JSON")
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -235,6 +300,8 @@ mod tests {
             l: 3.0,
             local: false,
             fallbacks: fallbacks.map(String::from),
+            stream: false,
+            enable_thinking: None,
         }
     }
 
@@ -295,5 +362,78 @@ mod tests {
     fn refusal_is_an_error() {
         let v = json!({"content": [], "stop_reason": "refusal", "stop_details": {"category": "cyber"}});
         assert!(parse_anthropic(&v).is_err());
+    }
+
+    #[test]
+    fn streaming_thinking_request_keeps_provider_options_separate() {
+        let mut m = model(None);
+        let prompt = Prompt { l1: "system", l2: "", turns: &[], effort: Some("low") };
+        let plain = openai_body(&m, &prompt);
+        assert_eq!(plain["stream"], false);
+        assert!(plain.get("enable_thinking").is_none());
+        assert!(plain.get("stream_options").is_none());
+        m.stream = true;
+        m.enable_thinking = Some(true);
+        let body = openai_body(&m, &prompt);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["enable_thinking"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn streaming_reply_collects_text_and_final_usage_without_reasoning() {
+        let body = concat!(
+            ": keepalive\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private\",\"content\":null}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"！\"},\"finish_reason\":\"stop\"}]}\r\n\r\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":30,\"prompt_tokens_details\":{\"cached_tokens\":400}}}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+        );
+        let (text, usage) = parse_openai_stream(body).unwrap();
+        assert_eq!(text, "你好！");
+        assert_eq!(usage, Usage { uncached_input: 100, cached_input: 400, output: 30, cache_write: 0 });
+    }
+
+    #[test]
+    fn streaming_errors_and_incomplete_replies_are_rejected() {
+        for body in [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"quota exceeded\"}}\n\ndata: [DONE]\n\n",
+            "data: not json\n\ndata: [DONE]\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            assert!(parse_openai_stream(body).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_endpoint_uses_environment_override_then_fallback() {
+        let mut provider: ProviderCfg = serde_yaml::from_str(
+            "kind: openai_compat\nbase_url: https://fallback.example/v1/\nbase_url_env: AGLIBOT_UNSET_TEST_BASE_URL",
+        ).unwrap();
+        assert_eq!(provider_base_url(&provider).as_deref(), Some("https://fallback.example/v1"));
+        // Use an existing variable without mutating the process environment in parallel tests.
+        let value = std::env::var("PATH").unwrap();
+        provider.base_url_env = Some("PATH".into());
+        assert_eq!(provider_base_url(&provider).unwrap(), value.trim().trim_end_matches('/'));
+    }
+
+    /// Explicit opt-in only: sends a tiny prompt to each configured Bailian model.
+    #[tokio::test]
+    #[ignore = "requires BAILIAN_API_KEY and network; consumes Token Plan quota"]
+    async fn live_bailian_models() -> Result<()> {
+        let cfg = crate::config::Config::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))?;
+        let client = LlmClient::new(cfg.models.providers.clone())?;
+        let turns = [Turn::User("Reply with exactly OK.".into())];
+        let prompt = Prompt { l1: "This is a connection test. Keep the answer minimal.", l2: "", turns: &turns, effort: None };
+        for m in cfg.models.models.iter().filter(|m| m.provider == "bailian") {
+            let reply = client.complete(m, &prompt).await.with_context(|| format!("testing {}", m.model))?;
+            assert!(!reply.text.trim().is_empty(), "{} returned no text", m.model);
+            assert!(reply.usage.output > 0, "{} returned no usage", m.model);
+            println!("{}: reply received, output_tokens={}", m.model, reply.usage.output);
+        }
+        Ok(())
     }
 }
