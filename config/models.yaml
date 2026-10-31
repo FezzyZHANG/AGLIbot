@@ -1,0 +1,55 @@
+# QCL 表（见 docs/DESIGN.md 第 5 节）
+#   q: 你手填的综合分（1–10），凭使用印象填，想到就改 —— 这是你唯一需要维护的列
+#   c: $/M tokens —— input / cached（缓存命中）/ output；cache_write 不填则按 input × 1.25 计
+#   l: 首字延迟粗估（秒）
+#   local: true 表示本地模型，可以处理 processing_policy = local_only 的信息
+# 价格请对照各家官方价格页核实，下面的 DeepSeek 价格尤其可能过时。
+
+daily_budget_usd: 2.0
+
+providers:
+  anthropic:
+    kind: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+  deepseek:
+    kind: openai_compat
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+  local:
+    kind: openai_compat
+    base_url: http://localhost:11434/v1   # 例如 Ollama；没跑本地模型也无妨，只是 local_only 的信息将无模型可用
+
+models:
+  - id: opus
+    provider: anthropic
+    model: claude-opus-5-5
+    q: 9.5
+    c: { input: 4.0, cached: 0.20, output: 20.0 }
+    l: 3.0
+    fallbacks: default        # 服务端拒答回退（beta），Anthropic 推荐默认开启
+  - id: sonnet
+    provider: anthropic
+    model: claude-sonnet-5-5
+    q: 8.5
+    c: { input: 2.0, cached: 0.20, output: 10.0 }
+    l: 1.5
+    fallbacks: default
+  - id: haiku
+    provider: anthropic
+    model: claude-haiku-5-5
+    q: 7.0
+    c: { input: 0.10, cached: 0.01, output: 0.50 }
+    l: 0.7
+  - id: deepseek
+    provider: deepseek
+    model: deepseek-chat
+    q: 7.5
+    c: { input: 0.27, cached: 0.07, output: 1.10 }
+    l: 1.5
+  - id: local
+    provider: local
+    model: qwen3:8b
+    q: 5.0
+    c: { input: 0, cached: 0, output: 0 }
+    l: 1.0
+    local: true

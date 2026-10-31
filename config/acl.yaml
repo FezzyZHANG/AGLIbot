@@ -1,0 +1,5 @@
+# 身份 → 权限。权限只认平台数字 ID，不认昵称。
+# 你的 Telegram 数字 ID 可以通过给 @userinfobot 发消息获得。
+owner:
+  person_id: owner
+  telegram_user_id: 0

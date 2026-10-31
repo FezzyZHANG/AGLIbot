@@ -1,0 +1,7 @@
+data_dir: data            # 无 Mongo 时的 JSONL 存储目录
+mind_dir: mind
+
+session:
+  max_turns: 40           # 一个会话最多多少轮，超过就开新会话（L2 用最近记录重建）
+  idle_minutes: 360       # 空闲多久后开新会话
+  recap_messages: 20      # 新会话的 L2 里带多少条最近聊天记录
