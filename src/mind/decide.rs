@@ -44,6 +44,7 @@ pub enum Action {
     Nothing,
     MessageOwner { reason: String },
     Work { task_id: String },
+    FollowUp { topic_id: String },
 }
 
 pub struct Situation {
@@ -52,6 +53,7 @@ pub struct Situation {
     pub commitments: Vec<Commitment>,
     /// Task ids he may start now (approved, not running, nothing else running).
     pub startable: Vec<String>,
+    pub watchlist: Vec<super::watchlist::Topic>,
     /// Whether starting a conversation with the owner is allowed right now.
     pub may_message_owner: bool,
 }
@@ -109,6 +111,10 @@ pub async fn decide(models: &Models, policy: &ProcessingPolicy, l1: &str, s: &Si
     if !s.startable.is_empty() {
         options.push(format!("\"work\"：开始做一件任务（target 写任务编号，可选：{}）", s.startable.join("、")));
     }
+    if !s.watchlist.is_empty() {
+        options.push(format!("\"follow_up\"：建立一个跟进研究任务（target 填关注编号）：\n{}",
+            s.watchlist.iter().map(|t| format!("- {}: {}（{}）", t.id, t.topic, t.why)).collect::<Vec<_>>().join("\n")));
+    }
     let user = format!(
         "（这不是聊天消息，是你自己在想接下来做什么。）\n\n{}\n\n## 临近或逾期的承诺（私人思考，披露仍受来源范围限制）\n{}\n\n## 可选的行动\n{}\n\n\
          像一个真实的人那样选：不必每次都做点什么，也可以推迟。\
@@ -127,6 +133,10 @@ pub async fn decide(models: &Models, policy: &ProcessingPolicy, l1: &str, s: &Si
 pub fn validate(d: &Decision, s: &Situation) -> Action {
     match d.action.trim() {
         "message" if s.may_message_owner => Action::MessageOwner { reason: d.reason.clone() },
+        "follow_up" => match d.target.as_deref().map(str::trim) {
+            Some(t) if s.watchlist.iter().any(|item| item.id == t) => Action::FollowUp { topic_id: t.to_string() },
+            _ => Action::Nothing,
+        },
         "work" => match d.target.as_deref().map(str::trim) {
             Some(t) if s.startable.iter().any(|id| id == t) => Action::Work { task_id: t.to_string() },
             _ => Action::Nothing,
@@ -166,7 +176,7 @@ mod tests {
 
     #[test]
     fn runtime_refuses_what_is_not_allowed() {
-        let s = Situation { text: String::new(), commitments: vec![], startable: vec!["t1".into()], may_message_owner: false };
+        let s = Situation { text: String::new(), commitments: vec![], watchlist: vec![], startable: vec!["t1".into()], may_message_owner: false };
         assert_eq!(validate(&decision("message", Some("owner")), &s), Action::Nothing);
         assert_eq!(validate(&decision("work", Some("t2")), &s), Action::Nothing);
         assert_eq!(validate(&decision("work", Some("t1")), &s), Action::Work { task_id: "t1".into() });

@@ -27,7 +27,7 @@ use crate::mind::decide::{self, Action, Situation};
 use crate::mind::flow::{Bucket, Flow, TAG_SYSTEM};
 use crate::mind::judge;
 use crate::mind::models::Models;
-use crate::mind::reflect;
+use crate::mind::{reflect, watchlist};
 use crate::mind::speak::Speaker;
 use crate::mind::state::{Change, MindState};
 use crate::ns::{Audience, Namespace, ProcessingPolicy, Scope};
@@ -893,6 +893,7 @@ impl Agli {
                 return Err(e);
             }
         };
+        let raw = watchlist::accept_reply(self.store.as_ref(), &self.cfg.mind_dir(), &raw, ctx.owner_private(), &ctx.key, now)?;
         let mut intent = parse_intent(&raw);
         let from_owner = ctx.partner.as_ref().is_some_and(|w| w.is_owner);
         for (kind, title) in &intent.tasks {
@@ -1274,9 +1275,12 @@ impl Agli {
             self.maybe_digest(now).await?;
             self.extract_due().await?;
         }
+        watchlist::render_view(self.store.as_ref(), &self.cfg.mind_dir())?;
+        let watch_due = self.job.is_none() && self.state.revisit_at.is_none()
+            && !watchlist::due(self.store.as_ref(), &self.board(), now)?.is_empty();
         let revisit = self.state.revisit_at.is_some_and(|t| t <= now);
         let drive = changes.iter().any(|c| matches!(c, Change::DriveHigh(_)));
-        if !self.state.energy.asleep && !self.frozen() && (revisit || drive || self.wake_decide) {
+        if !self.state.energy.asleep && !self.frozen() && (revisit || drive || self.wake_decide || watch_due) {
             self.wake_decide = false;
             self.state.revisit_at = None;
             self.think(now).await?;
@@ -1357,7 +1361,8 @@ impl Agli {
         } else {
             self.board().tasks().iter().filter(|t| t.status == TaskStatus::Inbox).map(|t| t.id.clone()).collect()
         };
-        if !may_message_owner && startable.is_empty() && self.state.revisit_at.is_none() {
+        let watchlist = if self.job.is_none() { watchlist::due(self.store.as_ref(), &self.board(), now)? } else { vec![] };
+        if !may_message_owner && watchlist.is_empty() && startable.is_empty() && self.state.revisit_at.is_none() {
             // Nothing he could do anyway; don't spend a call.
             return Ok(());
         }
@@ -1392,7 +1397,7 @@ impl Agli {
                 policy = recall.policy();
             }
         }
-        let mut situation = Situation { text, commitments: vec![], startable, may_message_owner };
+        let mut situation = Situation { text, commitments: vec![], watchlist, startable, may_message_owner };
         situation.include_commitments(self.store.as_ref(), now, self.models.has_local())?;
         let d = decide::decide(&self.models, &policy, self.speaker.l1(), &situation).await?;
         info!("decide: {} {:?} — {} (deferred: {:?})", d.action, d.target, d.reason, d.deferred);
@@ -1400,7 +1405,18 @@ impl Agli {
             self.state.appraise(m.pleasure, m.arousal, m.dominance);
         }
         self.state.revisit_at = decide::parse_revisit(d.revisit_when.as_deref(), now);
+        if !situation.watchlist.is_empty() && self.state.revisit_at.is_none() {
+            self.state.revisit_at = Some(now + chrono::Duration::hours(1));
+        }
         match decide::validate(&d, &situation) {
+            Action::FollowUp { topic_id } => {
+                let task = watchlist::create_task(self.store.as_ref(), &mut self.board(), &topic_id, &self.cfg.acl.owner.person_id, now)?;
+                watchlist::render_view(self.store.as_ref(), &self.cfg.mind_dir())?;
+                if let Some(task) = task.filter(|t| t.status == TaskStatus::Inbox) {
+                    let msg = self.start_job(&task.id)?;
+                    info!("{msg}");
+                }
+            }
             Action::Nothing => {}
             Action::Work { task_id } => {
                 let msg = self.start_job(&task_id)?;
@@ -1943,6 +1959,56 @@ mod tests {
         let preview = delivery_preview(&long);
         assert_eq!(preview.chars().count(), 600);
         assert_eq!(preview, format!("{}中…", "中🦀".repeat(299)));
+    }
+
+    #[tokio::test]
+    async fn watchlist_acceptance_uses_owner_private_context() {
+        let test = TestAgli::new("watchlist-owner").await;
+        let a = &test.agli;
+        a.store.kv_set("owner_last_chat", json!({"platform": "telegram", "chat_id": "42"})).unwrap();
+        let mut ctx = a.owner_ctx().unwrap();
+        let raw = "<关注 间隔=\"7\">主题</关注>";
+        let mind = test.dir.join("mind");
+        ctx.is_group = true;
+        watchlist::accept_reply(a.store.as_ref(), &mind, raw, ctx.owner_private(), &ctx.key, DateTime::UNIX_EPOCH).unwrap();
+        assert!(watchlist::load(a.store.as_ref()).unwrap().is_empty());
+        ctx.is_group = false;
+        ctx.partner.as_mut().unwrap().is_owner = false;
+        watchlist::accept_reply(a.store.as_ref(), &mind, raw, ctx.owner_private(), &ctx.key, DateTime::UNIX_EPOCH).unwrap();
+        assert!(watchlist::load(a.store.as_ref()).unwrap().is_empty());
+        ctx.partner.as_mut().unwrap().is_owner = true;
+        let stripped = watchlist::accept_reply(a.store.as_ref(), &mind, raw, ctx.owner_private(), &ctx.key, DateTime::UNIX_EPOCH).unwrap();
+        assert!(parse_intent(&stripped).silent);
+        assert_eq!(watchlist::load(a.store.as_ref()).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn think_starts_due_watchlist_research_with_stubbed_decide() {
+        let mut test = TestAgli::new("watchlist-think").await;
+        let a = &mut test.agli;
+        Arc::get_mut(&mut a.cfg).unwrap().runtime.mind_dir = test.dir.join("mind");
+        let now = DateTime::UNIX_EPOCH + chrono::Duration::days(7);
+        watchlist::accept_reply(a.store.as_ref(), &a.cfg.mind_dir(), "<关注>主题</关注>", true, "owner", DateTime::UNIX_EPOCH).unwrap();
+        let id = watchlist::load(a.store.as_ref()).unwrap()[0].id.clone();
+        a.models = Arc::new(Models::stub(a.store.clone(), vec![json!({
+            "action": "follow_up", "target": id, "reason": "curiosity"
+        }).to_string()]));
+        a.think(now).await.unwrap();
+        // Current-thread runtime: abort the queued worker before yielding; no external executor runs.
+        let job = a.job.take().expect("approved watchlist task should start");
+        job.handle.abort();
+        let prompts = a.models.stub_prompts();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].2.contains("主题") && prompts[0].2.contains(&id));
+        let board = a.board();
+        let task = board.get(&job.id).unwrap();
+        assert_eq!(task.kind, TaskKind::Research);
+        assert_eq!(task.status, TaskStatus::Active);
+        assert_eq!(task.requester, a.cfg.acl.owner.person_id);
+        let topics = watchlist::load(a.store.as_ref()).unwrap();
+        assert_eq!(topics[0].last_checked, Some(now));
+        assert_eq!(topics[0].next_due, now + chrono::Duration::days(7));
+        assert!(watchlist::due(a.store.as_ref(), &board, now + chrono::Duration::days(8)).unwrap().is_empty());
     }
 
     #[tokio::test]

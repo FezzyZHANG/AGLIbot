@@ -150,7 +150,7 @@ async fn due_soon_is_bounded_sorted_open_only_and_reaches_decide() {
         item("soon", Some(3), Status::Open), item("tomorrow", Some(1), Status::Open),
         item("today", Some(0), Status::Open), item("overdue", Some(-1), Status::Open)];
     f.store.kv_set(KEY, json!(items)).unwrap();
-    let mut s = decide::Situation { text: "quiet day".into(), commitments: vec![], startable: vec![], may_message_owner: true };
+    let mut s = decide::Situation { text: "quiet day".into(), commitments: vec![], watchlist: vec![], startable: vec![], may_message_owner: true };
     s.include_commitments(f.store.as_ref(), time(), false).unwrap();
     assert_eq!(s.commitments.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["overdue", "today", "tomorrow", "soon"]);
     let models = Models::stub(f.store.clone(), vec![r#"{"action":"message","target":"owner","reason":"check report"}"#.into()]);
@@ -187,7 +187,7 @@ async fn self_scoped_material_requires_local_processing_in_extraction_and_decide
     let (_, policy) = extraction_context(f.store.as_ref(), &m.ns, &[restricted, m.clone()]).unwrap();
     assert_eq!(policy, ProcessingPolicy::LocalOnly);
     f.store.kv_set(KEY, json!([c])).unwrap();
-    let mut s = decide::Situation { text: String::new(), commitments: vec![], startable: vec![], may_message_owner: false };
+    let mut s = decide::Situation { text: String::new(), commitments: vec![], watchlist: vec![], startable: vec![], may_message_owner: false };
     s.include_commitments(f.store.as_ref(), time(), false).unwrap();
     assert!(s.commitments.is_empty());
     s.include_commitments(f.store.as_ref(), time(), true).unwrap();

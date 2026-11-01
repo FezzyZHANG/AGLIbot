@@ -10,3 +10,4 @@ pub mod reflect;
 pub mod router;
 pub mod speak;
 pub mod state;
+pub mod watchlist;
