@@ -13,6 +13,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::board::{Board, Task, TaskKind};
+use super::resume::{self, Uncertain};
 use crate::config::{DelegateTool, HandsCfg};
 use crate::hands::delegate;
 use crate::mind::judge::{self, Verdict};
@@ -64,6 +65,13 @@ pub async fn run(job: Job) -> Outcome {
     match result {
         Ok(o) => o,
         Err(e) => {
+            if let Some(reason) = e.downcast_ref::<Uncertain>() {
+                job.log(&reason.to_string());
+                match waiting_for_owner(job.store.as_ref(), &job.task, &reason.0) {
+                    Ok(outcome) => return outcome,
+                    Err(error) => job.log(&format!("恢复核实审查项保存失败：{error:#}")),
+                }
+            }
             job.log(&format!("失败：{e:#}"));
             Outcome {
                 task_id: job.task.id.clone(),
@@ -74,6 +82,19 @@ pub async fn run(job: Job) -> Outcome {
             }
         }
     }
+}
+
+fn waiting_for_owner(store: &dyn Store, task: &Task, reason: &str) -> Result<Outcome> {
+    let j = judge::Judgement { verdict: Verdict::Owner, reasons: reason.into(), fixes: String::new() };
+    let item = judge::file(store, ReviewCategory::Act, &task.title, reason, &j, false, json!({"task_id": task.id}))?;
+    // on_job_done maps ok=false to Waiting; approving this review does not replay anything.
+    Ok(Outcome {
+        task_id: task.id.clone(),
+        title: task.title.clone(),
+        ok: false,
+        summary: format!("恢复前核实未完成，已停止并等待主人决定：{reason}"),
+        verdict: Some(format!("#{} {}", item.id, j.verdict.zh())),
+    })
 }
 
 fn read(dir: &Path, name: &str) -> String {
@@ -259,13 +280,16 @@ async fn gather(
     instructions: &str,
     session: &mut Option<String>,
 ) -> Result<String> {
-    let prompt = with_followups(&gather_prompt(&job.task, plan, fixes), instructions);
+    let snapshot = resume::inspect(dir, &job.task, job.store.as_ref()).await?;
+    let brief = snapshot.brief();
+    let prompt = format!("{brief}{}", with_followups(&gather_prompt(&job.task, plan, fixes), instructions));
     match job.hands.research {
         DelegateTool::Dsh => {
-            let prompt = with_followups(&dsh_gather_prompt(&job.task, plan, fixes), instructions);
+            let prompt = format!("{brief}{}", with_followups(&dsh_gather_prompt(&job.task, plan, fixes), instructions));
             let result =
                 delegate::dsh(dir, &prompt, &job.hands.dsh_profile, job.timeout(), session.as_deref(), job.store.as_ref(), "research")
                     .await;
+            // Gathering has no external effects and the brief makes a fresh session inspect first.
             let output = match result {
                 Ok(output) => output,
                 Err(e) if session.is_some() => {
@@ -279,9 +303,11 @@ async fn gather(
                 std::fs::write(dir.join("dsh-session-id"), id)?;
             }
             *session = output.session_id;
+            resume::check_reply(&output.text, snapshot.needs_reconciliation())?;
             save_dsh_research(dir, &output.text)
         }
         DelegateTool::Codex => {
+            // Gathering has no external effects and the brief makes a fresh session inspect first.
             let result = delegate::codex_session(dir, &prompt, &job.hands.codex_model, true, job.timeout(), session.as_deref()).await;
             let output = match result {
                 Ok(output) => output,
@@ -295,21 +321,26 @@ async fn gather(
             std::fs::write(dir.join("codex-session-id"), &output.session_id)?;
             job.log(&format!("Codex 会话：{}", output.session_id));
             *session = Some(output.session_id);
+            resume::check_reply(&output.text, snapshot.needs_reconciliation())?;
             job.log("Codex 完成取证");
             Ok(output.text)
         }
         DelegateTool::Off => {
+            if snapshot.needs_reconciliation() {
+                return Err(Uncertain(format!("hands 已关闭，无法核实外部动作。\n{brief}")).into());
+            }
             // No hands: say so plainly instead of pretending to have sources.
             let user = format!(
                 "任务：{}\n计划：\n{plan}\n\n你现在无法联网查资料。根据已有知识写一份报告，开头注明“未联网，以下内容未经来源核实”，\
                  区分你确定的、不确定的和需要查证的。",
                 job.task.title
             );
-            let mut user = with_followups(&user, instructions);
+            let mut user = format!("{brief}{}", with_followups(&user, instructions));
             if let Some(f) = fixes {
                 user.push_str(&format!("\n\n审稿人修改意见：\n{f}"));
             }
             let text = job.models.ask("synthesize", &ProcessingPolicy::Any, &job.l1, &user).await?;
+            resume::check_reply(&text, false)?;
             std::fs::write(dir.join("report.md"), &text)?;
             job.log("未联网，凭已有知识写了报告");
             Ok(text.chars().take(400).collect())
@@ -366,19 +397,32 @@ fn save_dsh_research(dir: &Path, text: &str) -> Result<String> {
 
 async fn research(job: &Job) -> Result<Outcome> {
     let dir = job.dir();
+    let snapshot = resume::inspect(&dir, &job.task, job.store.as_ref()).await?;
+    let brief = snapshot.brief();
     let plan_prompt = format!(
-        "（这不是聊天，是你开始做一个研究任务前的准备。）任务：{}\n\n先想清楚再动手，写一份简短计划（Markdown）：\n\
+        "{brief}（这不是聊天，是你开始做一个研究任务前的准备。规划只依据所给资料，目录和外部结果的检查留给 hands。）任务：{}\n\n先想清楚再动手，写一份简短计划（Markdown）：\n\
          1. 问题本身准确吗？有没有概念混淆（例如把 P vs NP 说成 N=NP）？你理解的真正问题是什么。\n\
          2. 拆成哪几个子问题。\n3. 什么算一手来源，去哪里找。\n4. 交付时要回答到什么程度。",
         job.task.title
     );
     let mut followups = Followups::default();
+    let initial_followups = followup_snapshot(job)?;
+    followups.consume(&initial_followups)?;
+    let existing_plan = resume::read_optional(&dir.join("plan.md"))?;
+    let mut saved_plan = resume::reuse_plan(&existing_plan, &initial_followups).then_some(existing_plan.clone());
     let mut replans = 0;
     let plan = loop {
-        let prompt = with_followups(&plan_prompt, &followups.instructions);
-        let plan = job.models.ask("research_plan", &ProcessingPolicy::Any, &job.l1, &prompt).await?;
-        std::fs::write(dir.join("plan.md"), &plan)?;
-        job.log(if replans == 0 { "计划写好了" } else { "已按补充重新规划，覆盖 plan.md" });
+        let plan = if let Some(plan) = saved_plan.take() {
+            job.log("恢复前核实：plan.md 非空且没有补充，复用已有计划");
+            plan
+        } else {
+            let prompt = with_followups(&format!("{plan_prompt}\n已有计划（保留仍有效的部分）：\n{existing_plan}"), &followups.instructions);
+            let plan = job.models.ask("research_plan", &ProcessingPolicy::Any, &job.l1, &prompt).await?;
+            resume::check_reply(&plan, false)?;
+            std::fs::write(dir.join("plan.md"), &plan)?;
+            job.log(if replans == 0 { "计划写好了" } else { "已按补充重新规划，覆盖 plan.md" });
+            plan
+        };
         if boundary(job, &mut followups, Boundary::Plan, replans, 0)? != FollowupAction::Replan {
             break plan;
         }
@@ -440,9 +484,12 @@ async fn research(job: &Job) -> Result<Outcome> {
 }
 
 async fn code(job: &Job) -> Result<Outcome> {
-    let dir = job.dir().join("scratch");
+    let task_dir = std::path::absolute(job.dir())?;
+    let snapshot = resume::inspect(&task_dir, &job.task, job.store.as_ref()).await?;
+    let dir = task_dir.join("scratch");
     std::fs::create_dir_all(&dir)?;
-    let prompt = format!("任务：{}\n只在当前目录里工作。完成后用几句话说明做了什么、怎么验证的、还有什么没做。", job.task.title);
+    let prompt = format!("{}任务：{}\n任务资料目录（只读）：{}\n只在当前 scratch 目录里工作。完成后用几句话说明做了什么、怎么验证的、还有什么没做。",
+        snapshot.brief(), job.task.title, task_dir.display());
     let instructions = followup_snapshot(job)?;
     let prompt = with_followups(&prompt, &instructions);
     if !instructions.trim().is_empty() {
@@ -455,6 +502,7 @@ async fn code(job: &Job) -> Result<Outcome> {
         }
         DelegateTool::Off => anyhow::bail!("编码委托已关闭（config/runtime.yaml 的 hands.code）"),
     };
+    resume::check_reply(&text, snapshot.needs_reconciliation())?;
     job.log("编码委托完成");
     let files: Vec<String> =
         std::fs::read_dir(&dir)?.filter_map(|e| e.ok().and_then(|e| e.file_name().to_str().map(String::from))).collect();
@@ -475,6 +523,28 @@ async fn code(job: &Job) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncertain_resume_files_owner_review_and_returns_waiting_outcome() {
+        use crate::store::{ReviewStatus, jsonl::JsonlStore};
+        use super::super::board::TaskStatus;
+        let root = std::env::temp_dir().join(format!("agli-resume-wait-{}", std::process::id()));
+        let mut board = Board::load(&root).unwrap();
+        let task = board.add("publish", TaskKind::Code, "owner", TaskStatus::Active, None).unwrap();
+        let store = JsonlStore::open(&root.join("data")).unwrap();
+        let error = resume::check_reply("RESUME_WAIT: remote result unknown; owner must check receipt", true).unwrap_err();
+        let reason = error.downcast_ref::<Uncertain>().unwrap();
+        let outcome = waiting_for_owner(&store, &task, &reason.0).unwrap();
+        assert!(!outcome.ok);
+        assert!(outcome.summary.contains("remote result unknown"));
+        let reviews = store.reviews().unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].status, ReviewStatus::Open);
+        assert_eq!(reviews[0].category, ReviewCategory::Act);
+        assert_eq!(reviews[0].payload["task_id"], task.id);
+        assert!(reviews[0].detail.contains("owner must check receipt"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn dsh_read_only_research_materializes_fixed_paths_for_review() {

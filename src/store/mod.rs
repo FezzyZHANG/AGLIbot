@@ -202,6 +202,7 @@ pub trait Store: Send + Sync {
     fn lessons(&self) -> Result<Vec<Lesson>>;
 
     fn append_audit(&self, a: &AuditRecord) -> Result<()>;
+    fn audits(&self) -> Result<Vec<AuditRecord>>;
 
     fn reviews(&self) -> Result<Vec<ReviewItem>>;
     /// Insert or replace by id. Callers allocate ids via `next_review_id`.

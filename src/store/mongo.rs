@@ -277,6 +277,10 @@ impl Store for MongoStore {
         self.append("audit", a, doc! { "ts": timestamp(a.ts) })
     }
 
+    fn audits(&self) -> Result<Vec<AuditRecord>> {
+        self.scan("audit", doc! {})
+    }
+
     fn reviews(&self) -> Result<Vec<ReviewItem>> {
         self.scan("reviews", doc! {})
     }
