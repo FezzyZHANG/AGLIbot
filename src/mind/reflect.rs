@@ -15,8 +15,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
 
-use super::judge;
 use super::models::Models;
+use super::{commitments, judge};
 use crate::ns::{Namespace, ProcessingPolicy, Scope};
 use crate::social::people::People;
 use crate::store::{Episode, Fact, Lesson, ReviewCategory, Store};
@@ -47,6 +47,8 @@ struct RawLesson {
 
 #[derive(Deserialize)]
 struct Extracted {
+    #[serde(flatten)]
+    agenda: commitments::Extracted,
     #[serde(default)]
     episodes: Vec<RawEpisode>,
     #[serde(default)]
@@ -87,7 +89,7 @@ pub async fn extract_ns(models: &Models, store: &dyn Store, people: &mut People,
         let (id, name) = if m.outgoing { ("me".to_string(), "我".to_string()) } else { (m.sender.clone(), people.name_of(&m.sender)) };
         transcript.push_str(&format!(
             "[{}] {name}（{id}）：{}\n",
-            m.ts.with_timezone(&Local).format("%m-%d %H:%M"),
+            m.ts.with_timezone(&Local).to_rfc3339(),
             m.text
         ));
         ids.insert(id);
@@ -102,9 +104,11 @@ pub async fn extract_ns(models: &Models, store: &dyn Store, people: &mut People,
          只输出一个 JSON 对象：{{\"episodes\": [{{\"summary\": \"\", \"participants\": [], \"emotion\": \"\", \"salience\": 0.5}}], \
          \"facts\": [{{\"person\": \"\", \"text\": \"\"}}], \"lessons\": [{{\"text\": \"\", \"shareable\": false}}]}}，没有就给空数组。\n\n{transcript}"
     );
-    let raw: Extracted = models.ask_json("extract", &ProcessingPolicy::default_for(&scope), system, &user).await?;
+    let (agenda, policy) = commitments::extraction_context(store, ns, &msgs)?;
+    let raw: Extracted = models.ask_json("extract", &policy, system, &format!("{user}\n{agenda}")).await?;
 
     let now = Utc::now();
+    commitments::apply(store, ns, &msgs, raw.agenda, now)?;
     let mut out = ExtractOutcome { messages: msgs.len(), ..Default::default() };
     let mut episode_ids = Vec::new();
     for (i, e) in raw.episodes.into_iter().enumerate() {

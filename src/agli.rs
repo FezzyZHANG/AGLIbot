@@ -1235,6 +1235,7 @@ impl Agli {
             let since = reflect::watermark(self.store.as_ref(), &ns)?;
             if self.store.messages_after(&ns, since)?.len() >= self.cfg.runtime.memory.extract_after {
                 reflect::extract_ns(&self.models, self.store.as_ref(), &mut self.people, &ns).await?;
+                self.render_agenda()?;
             }
         }
         Ok(())
@@ -1246,7 +1247,12 @@ impl Agli {
             let o = reflect::extract_ns(&self.models, self.store.as_ref(), &mut self.people, &ns).await?;
             n += usize::from(o.messages > 0);
         }
+        self.render_agenda()?;
         Ok(n)
+    }
+
+    fn render_agenda(&self) -> Result<()> {
+        crate::mind::commitments::render_view(self.store.as_ref(), &self.cfg.mind_dir())
     }
 
     async fn nightly(&mut self) -> Result<()> {
@@ -1310,7 +1316,8 @@ impl Agli {
                 policy = recall.policy();
             }
         }
-        let situation = Situation { text, startable, may_message_owner };
+        let mut situation = Situation { text, commitments: vec![], startable, may_message_owner };
+        situation.include_commitments(self.store.as_ref(), now, self.models.has_local())?;
         let d = decide::decide(&self.models, &policy, self.speaker.l1(), &situation).await?;
         info!("decide: {} {:?} — {} (deferred: {:?})", d.action, d.target, d.reason, d.deferred);
         if let Some(m) = &d.mood {
@@ -2224,6 +2231,31 @@ mod tests {
             env.mentions_me = mention_first && i == 0;
             env
         }).collect()
+    }
+
+    #[tokio::test]
+    async fn group_l2_never_reads_the_private_agenda_even_for_its_own_namespace() {
+        use crate::mind::commitments;
+        let mut test = TestAgli::new("agenda-privacy").await;
+        let a = &mut test.agli;
+        let batch = a.prepare_messages(group_messages(&["hello"], true)).await;
+        let ctx = batch.ctx.unwrap();
+        let private = private_record("42", "42", "old promise", true);
+        let group = MessageRecord { ns: ctx.ns.clone(), scope: ctx.scope.clone(), ..private.clone() };
+        for (source, secret) in [(private, "PRIVATE_AGENDA_SECRET"), (group, "GROUP_AGENDA_SECRET")] {
+            let raw = serde_json::from_value(json!({"commitments": [
+                {"who":"me", "what":secret, "due":"2026-11-03", "evidence":source.ts}
+            ]})).unwrap();
+            commitments::apply(a.store.as_ref(), &source.ns, std::slice::from_ref(&source), raw, source.ts).unwrap();
+        }
+        Arc::make_mut(&mut a.cfg).runtime.mind_dir = test.dir.join("mind");
+        a.render_agenda().unwrap();
+        assert_eq!(commitments::load(a.store.as_ref()).unwrap().len(), 2);
+        let view = std::fs::read_to_string(a.cfg.mind_dir().join("agenda/commitments.md")).unwrap();
+        assert!(view.contains("PRIVATE_AGENDA_SECRET") && view.contains("GROUP_AGENDA_SECRET"));
+        let (l2, _) = a.frame(&ctx, 0, &ctx.task_cards(&a.board())).unwrap();
+        assert!(!l2.contains("AGENDA_SECRET"));
+        assert!(!a.speaker.l1().contains("AGENDA_SECRET"));
     }
 
     #[tokio::test]
