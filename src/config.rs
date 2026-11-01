@@ -195,19 +195,28 @@ pub struct MemoryCfg {
     pub facts_in_context: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegateTool {
+    #[default]
     Codex,
+    Dsh,
     Off,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HandsCfg {
+    #[serde(default)]
     pub research: DelegateTool,
     pub code: DelegateTool,
     pub codex_model: String,
+    #[serde(default = "default_dsh_profile")]
+    pub dsh_profile: String,
     pub timeout_min: u64,
+}
+
+fn default_dsh_profile() -> String {
+    "agli".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -360,6 +369,18 @@ fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hands_defaults_preserve_codex_and_dsh_is_opt_in() {
+        let yaml = "code: codex\ncodex_model: pinned\ntimeout_min: 10\n";
+        let hands: HandsCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(hands.research, DelegateTool::Codex);
+        assert_eq!(hands.dsh_profile, "agli");
+        let hands: HandsCfg = serde_yaml::from_str(&format!("{yaml}research: dsh\ndsh_profile: agli-research")).unwrap();
+        assert_eq!(hands.research, DelegateTool::Dsh);
+        assert_eq!(hands.code, DelegateTool::Codex);
+        assert_eq!(hands.dsh_profile, "agli-research");
+    }
 
     #[test]
     fn mongo_defaults_and_env_overrides() {

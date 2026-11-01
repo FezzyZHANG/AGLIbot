@@ -1,0 +1,17 @@
+{"type":"session","sessionId":"session-research-25","cwd":"C:/tasks/research"}
+{"type":"status","phase":"turn_start","turn":0}
+{"type":"status","phase":"step_start","turn":0,"step":0}
+{"type":"thinking","text":"not the answer"}
+{"type":"text","text":"intermediate answer"}
+{"type":"tool_call","callId":"call-1","tool":"web_search","input":{"queries":["primary source"]}}
+{"type":"tool_result","callId":"call-1","status":"completed","result":"https://example.org/source"}
+{"type":"tool_call","callId":"call-2","tool":"web_fetch","input":{"url":"https://example.org/source"}}
+{"type":"tool_call","callId":"call-3","tool":"read","input":{"file_path":"C:/tasks/research/plan.md"}}
+{"type":"tool_call","callId":"call-4","tool":"read","input":"{broken","truncated":true}
+{"type":"tool_call","callId":"call-5","tool":"web_fetch","truncated":true}
+{"type":"status","phase":"step_end","turn":0,"step":0,"usage":{"inputTokens":100,"outputTokens":20,"totalTokens":120,"cacheReadTokens":30,"cacheWriteTokens":5,"reasoningTokens":10}}
+{"type":"status","phase":"step_end","turn":0,"step":1,"usage":{"inputTokens":60,"outputTokens":10}}
+{"type":"status","phase":"turn_end","turn":0,"reason":"completed"}
+{"type":"future_event","usage":{"inputTokens":9999,"outputTokens":9999}}
+not json
+{"type":"final","text":"Final answer.\nWith evidence."}

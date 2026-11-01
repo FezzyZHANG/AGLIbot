@@ -10,6 +10,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures-util",
+ "libc",
  "mongodb",
  "reqwest",
  "serde",
@@ -20,6 +21,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

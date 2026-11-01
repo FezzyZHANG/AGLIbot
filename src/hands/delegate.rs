@@ -1,36 +1,69 @@
-//! His hands: delegate work to Codex (`codex exec`) as a subprocess, confined to the task
+//! His hands: delegate work to Codex or DSH as a subprocess, rooted at the task
 //! directory. Only owner-approved tasks ever reach here. Claude Code is the owner's tool and is
 //! never invoked from here (see the root AGENTS.md).
 //!
 //! The prompt goes through stdin, so no shell quoting is involved; on Windows the npm shims are
 //! `.cmd` files, which `Command` runs through cmd.exe.
 
+use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+
+use super::process_tree::ProcessTree;
+use crate::store::{ModelCallRecord, Store};
 
 fn program(name: &str) -> String {
     if cfg!(windows) { format!("{name}.cmd") } else { name.to_string() }
 }
 
-async fn run(mut cmd: Command, stdin: &str, timeout: Duration) -> Result<String> {
+async fn run(mut cmd: Command, stdin: &str, timeout: Duration, mut on_line: impl FnMut(&[u8]) -> Result<()>) -> Result<String> {
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let mut tree = ProcessTree::prepare(&mut cmd)?;
     let mut child = cmd.spawn().context("starting delegate process")?;
-    if let Some(mut input) = child.stdin.take() {
-        input.write_all(stdin.as_bytes()).await?;
-        input.shutdown().await?;
-    }
-    let out = tokio::time::timeout(timeout, child.wait_with_output()).await.context("delegate timed out")??;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    if !out.status.success() {
+    tree.attach(&child)?;
+    let mut input = child.stdin.take().context("delegate stdin")?;
+    let mut output = BufReader::new(child.stdout.take().context("delegate stdout")?);
+    let mut errors = child.stderr.take().context("delegate stderr")?;
+    // Input, both output pipes, and wait share one deadline. No detached reader tasks survive
+    // cancellation; the tree guard closes even when /stop or /freeze aborts this future.
+    let work = async {
+        let write = async {
+            input.write_all(stdin.as_bytes()).await?;
+            input.shutdown().await?;
+            drop(input);
+            Ok::<_, anyhow::Error>(())
+        };
+        let read = async {
+            let mut stdout = Vec::new();
+            let mut line = Vec::new();
+            while output.read_until(b'\n', &mut line).await? != 0 {
+                on_line(&line)?;
+                stdout.extend_from_slice(&line);
+                line.clear();
+            }
+            Ok::<_, anyhow::Error>(stdout)
+        };
+        let stderr = async {
+            let mut bytes = Vec::new();
+            errors.read_to_end(&mut bytes).await?;
+            Ok::<_, anyhow::Error>(bytes)
+        };
+        let wait = async { Ok::<_, anyhow::Error>(child.wait().await?) };
+        let (_, stdout, stderr, status) = tokio::try_join!(write, read, stderr, wait)?;
+        Ok::<_, anyhow::Error>((stdout, stderr, status))
+    };
+    let (stdout, stderr, status) = tokio::time::timeout(timeout, work).await.context("delegate timed out")??;
+    let stdout = String::from_utf8_lossy(&stdout).to_string();
+    if !status.success() {
         // CLIs do not agree on which stream carries the error, so show both.
-        let err = String::from_utf8_lossy(&out.stderr);
+        let err = String::from_utf8_lossy(&stderr);
         let detail: String = format!("{} {}", err.trim(), stdout.trim()).chars().take(800).collect();
-        bail!("delegate exited with {}: {detail}", out.status);
+        bail!("delegate exited with {status}: {detail}");
     }
     Ok(stdout)
 }
@@ -93,7 +126,7 @@ pub async fn codex_session(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let events = run(codex_command(&dir, &last, model, search, resume), prompt, timeout).await?;
+    let events = run(codex_command(&dir, &last, model, search, resume), prompt, timeout, |_| Ok(())).await?;
     let session_id = session_id(&events)?;
     if let Some(expected) = resume {
         anyhow::ensure!(session_id == expected, "Codex resumed a different session: {session_id}");
@@ -102,9 +135,530 @@ pub async fn codex_session(
     Ok(CodexOutput { text, session_id })
 }
 
+#[derive(Debug)]
+pub struct DshOutput {
+    pub text: String,
+    pub session_id: Option<String>,
+}
+
+#[derive(Default, Debug, PartialEq)]
+struct DshUsage {
+    input: u64,
+    cached: u64,
+    cache_write: u64,
+    output: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DshToolCall {
+    call_id: Option<String>,
+    tool: Option<String>,
+    input: serde_json::Value,
+    targets: Vec<String>,
+    truncated: bool,
+}
+
+#[derive(Default)]
+struct DshEvents {
+    text: Option<String>,
+    session_id: Option<String>,
+    usage: Option<DshUsage>,
+    missing_usage_steps: usize,
+    calls: Vec<DshToolCall>,
+    error: Option<String>,
+}
+
+fn targets(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if matches!(key.as_str(), "url" | "urls" | "path" | "paths" | "file_path" | "filePath" | "cwd") {
+                    match value {
+                        serde_json::Value::String(s) => out.push(s.clone()),
+                        serde_json::Value::Array(items) => out.extend(items.iter().filter_map(|v| v.as_str().map(String::from))),
+                        _ => {}
+                    }
+                }
+                targets(value, out);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|v| targets(v, out)),
+        _ => {}
+    }
+}
+
+impl DshEvents {
+    // CLI 0.2.1-rc.5: C:/dev/DSH/resources/app.asar/dsh/node_modules/@deepseek-ai/
+    // dsh-headless/lib/json-stream-BA-F3lfb.js, projectJsonRun/addUsage; errors in
+    // dsh-headless/lib/index.js, fail(). step_end usage already includes retried attempts.
+    // Tool inputs can be text or absent when DSH truncates a bounded event; final is lossless.
+    fn line(&mut self, line: &[u8]) {
+        let Ok(event) = serde_json::from_slice::<serde_json::Value>(line) else {
+            return;
+        };
+        match event["type"].as_str() {
+            Some("session") => {
+                if let Some(id) = event["sessionId"].as_str().filter(|s| valid_dsh_id(s)) {
+                    self.session_id = Some(id.into());
+                }
+            }
+            Some("final") => {
+                if let Some(text) = event["text"].as_str() {
+                    self.text = Some(text.into());
+                }
+            }
+            Some("error") => self.error = Some(event["message"].as_str().unwrap_or("DSH reported an error").into()),
+            Some("status") if event["phase"] == "step_end" => {
+                let u = &event["usage"];
+                if let (Some(input), Some(output)) = (u["inputTokens"].as_u64(), u["outputTokens"].as_u64()) {
+                    let usage = self.usage.get_or_insert_with(DshUsage::default);
+                    usage.input = usage.input.saturating_add(input);
+                    usage.output = usage.output.saturating_add(output);
+                    usage.cached = usage.cached.saturating_add(u["cacheReadTokens"].as_u64().unwrap_or(0).min(input));
+                    usage.cache_write = usage.cache_write.saturating_add(u["cacheWriteTokens"].as_u64().unwrap_or(0));
+                } else {
+                    self.missing_usage_steps += 1;
+                }
+            }
+            Some("tool_call") => {
+                let input = event["input"].as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_else(|| event["input"].clone());
+                let mut found = Vec::new();
+                targets(&input, &mut found);
+                self.calls.push(DshToolCall {
+                    call_id: event["callId"].as_str().map(String::from),
+                    tool: event["tool"].as_str().map(String::from),
+                    input,
+                    targets: found,
+                    truncated: event["truncated"] == true,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn valid_dsh_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 256 && !id.starts_with('-') && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+
+fn dsh_command(executable: &std::ffi::OsStr, dir: &Path, profile: &str, resume: Option<&str>) -> Result<Command> {
+    anyhow::ensure!(valid_dsh_id(profile), "invalid DSH profile name");
+    let mut cmd = Command::new(executable);
+    cmd.current_dir(dir).args(["--profile", profile, "--json"]);
+    if let Some(id) = resume {
+        anyhow::ensure!(valid_dsh_id(id), "invalid DSH session id");
+        cmd.args(["--session-id", id]);
+    }
+    cmd.arg("-");
+    Ok(cmd)
+}
+
+struct DshAudit<'a> {
+    events: DshEvents,
+    raw: std::fs::File,
+    calls: std::fs::File,
+    log: std::fs::File,
+    store: &'a dyn Store,
+    profile: &'a str,
+    kind: &'a str,
+    started: std::time::Instant,
+    error: Option<String>,
+}
+
+impl<'a> DshAudit<'a> {
+    fn open(dir: &Path, store: &'a dyn Store, profile: &'a str, kind: &'a str) -> Result<Self> {
+        let append = |name| std::fs::OpenOptions::new().create(true).append(true).open(dir.join(name));
+        let mut raw = append("dsh-events.jsonl")?;
+        // A cancelled invocation may have ended on a partial line. Keep the next run separate.
+        writeln!(raw)?;
+        Ok(Self {
+            events: DshEvents::default(),
+            raw,
+            calls: append("dsh-tool-calls.jsonl")?,
+            log: append("log.md")?,
+            store,
+            profile,
+            kind,
+            started: std::time::Instant::now(),
+            error: Some("delegate cancelled".into()),
+        })
+    }
+
+    fn line(&mut self, line: &[u8]) -> Result<()> {
+        self.raw.write_all(line)?;
+        let count = self.events.calls.len();
+        self.events.line(line);
+        if let Some(call) = self.events.calls.get(count) {
+            serde_json::to_writer(&mut self.calls, call)?;
+            writeln!(self.calls)?;
+        }
+        Ok(())
+    }
+
+    fn record(&self) -> Option<ModelCallRecord> {
+        let u = self.events.usage.as_ref()?;
+        Some(ModelCallRecord {
+            ts: chrono::Utc::now(),
+            scenario: format!("dsh:{}", self.kind),
+            model_id: format!("dsh:profile:{}", self.profile),
+            session_id: self.events.session_id.clone().unwrap_or_default(),
+            uncached_input: u.input.saturating_sub(u.cached),
+            cached_input: u.cached,
+            cache_write: u.cache_write,
+            output: u.output,
+            latency_ms: self.started.elapsed().as_millis() as u64,
+            cost_usd: 0.0,
+            ok: self.error.is_none(),
+            error: self.error.clone(),
+            escalated_from: None,
+        })
+    }
+}
+
+impl Drop for DshAudit<'_> {
+    fn drop(&mut self) {
+        // Store is synchronous, so cancellation also records any usage received before /stop.
+        let usage = match self.record() {
+            Some(record) => {
+                if let Err(e) = self.store.append_model_call(&record) {
+                    tracing::warn!("DSH usage log failed: {e:#}");
+                    let _ = writeln!(self.log, "- DSH usage storage failed: {e:#}");
+                }
+                format!(
+                    "input={}, output={}, cost unknown (recorded as 0)",
+                    record.uncached_input.saturating_add(record.cached_input),
+                    record.output
+                )
+            }
+            None => "usage not reported".into(),
+        };
+        let status = if self.error.is_none() { "completed" } else { "failed/cancelled" };
+        if let Err(e) = writeln!(
+            self.log,
+            "- {} DSH {status}; session={}; tool calls={}; {usage}; steps without usage={}; audit=dsh-events.jsonl",
+            chrono::Utc::now().to_rfc3339(),
+            self.events.session_id.as_deref().unwrap_or("not reported"),
+            self.events.calls.len(),
+            self.events.missing_usage_steps
+        ) {
+            tracing::warn!("DSH task log failed: {e:#}");
+        }
+    }
+}
+
+/// A profile is owner-provisioned; no profile creation, credential changes, or budget gate here.
+pub async fn dsh(
+    dir: &Path,
+    prompt: &str,
+    profile: &str,
+    timeout: Duration,
+    resume: Option<&str>,
+    store: &dyn Store,
+    kind: &str,
+) -> Result<DshOutput> {
+    let executable = std::env::var_os("AGLI_DSH_BIN").filter(|s| !s.is_empty()).unwrap_or_else(|| program("dsh").into());
+    let dir = std::path::absolute(dir)?;
+    let cmd = dsh_command(&executable, &dir, profile, resume)?;
+    dsh_run(cmd, &dir, prompt, profile, timeout, resume, store, kind).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dsh_run(
+    cmd: Command,
+    dir: &Path,
+    prompt: &str,
+    profile: &str,
+    timeout: Duration,
+    resume: Option<&str>,
+    store: &dyn Store,
+    kind: &str,
+) -> Result<DshOutput> {
+    let mut audit = DshAudit::open(dir, store, profile, kind)?;
+    let result = async {
+        run(cmd, prompt, timeout, |line| audit.line(line)).await?;
+        if let Some(error) = &audit.events.error {
+            bail!("DSH: {error}");
+        }
+        if let (Some(expected), Some(actual)) = (resume, audit.events.session_id.as_deref()) {
+            anyhow::ensure!(actual == expected, "DSH resumed a different session: {actual}");
+        }
+        let text = audit.events.text.as_ref().filter(|t| !t.trim().is_empty()).context("DSH did not emit a nonempty final answer")?.clone();
+        Ok(DshOutput { text, session_id: audit.events.session_id.clone().or_else(|| resume.map(String::from)) })
+    }
+    .await;
+    audit.error = result.as_ref().err().map(|e| format!("{e:#}"));
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DSH_EVENTS: &str = include_str!("fixtures/dsh-events.jsonl");
+
+    #[test]
+    fn dsh_schema_extracts_final_session_step_usage_and_every_tool_call() {
+        let mut events = DshEvents::default();
+        for line in DSH_EVENTS.lines() {
+            events.line(line.as_bytes());
+        }
+        assert_eq!(events.text.as_deref(), Some("Final answer.\nWith evidence."));
+        assert_eq!(events.session_id.as_deref(), Some("session-research-25"));
+        assert_eq!(events.usage, Some(DshUsage { input: 160, output: 30, cached: 30, cache_write: 5 }));
+        assert_eq!(events.calls.len(), 5);
+        assert!(events.calls[0].targets.is_empty()); // Search has a query, not a fetched URL.
+        assert_eq!(events.calls[1].targets, ["https://example.org/source"]);
+        assert_eq!(events.calls[2].targets, ["C:/tasks/research/plan.md"]);
+        assert!(events.calls[3].truncated);
+        assert_eq!(events.calls[3].input, "{broken");
+        assert!(events.calls[4].input.is_null());
+    }
+
+    #[test]
+    fn dsh_missing_malformed_and_future_events_are_safe() {
+        let mut events = DshEvents::default();
+        for line in [
+            "",
+            "null",
+            "[]",
+            "{",
+            r#"{"type":"session","sessionId":"--bad"}"#,
+            r#"{"type":"final","text":17}"#,
+            r#"{"type":"status","phase":"step_end"}"#,
+            r#"{"type":"status","phase":"step_end","usage":{"inputTokens":-1,"outputTokens":"oops"}}"#,
+        ] {
+            events.line(line.as_bytes());
+        }
+        assert!(events.text.is_none() && events.session_id.is_none() && events.usage.is_none());
+        assert_eq!(events.missing_usage_steps, 2);
+        events.line(br#"{"type":"status","phase":"step_end","usage":{"inputTokens":0,"outputTokens":0}}"#);
+        assert_eq!(events.usage, Some(DshUsage::default()));
+        events.line(br#"{"type":"error","message":"unknown session"}"#);
+        assert_eq!(events.error.as_deref(), Some("unknown session"));
+        events.line(br#"{"type":"tool_call","input":"{\"paths\":[\"a\",\"b\"]}"}"#);
+        assert_eq!(events.calls[0].targets, ["a", "b"]);
+    }
+
+    #[test]
+    fn dsh_fresh_and_resume_commands_use_profile_stdin_and_json() {
+        let dir = Path::new("task with spaces");
+        for resume in [None, Some("session-research-25")] {
+            let cmd = dsh_command("C:/DSH/dsh.cmd".as_ref(), dir, "agli", resume).unwrap();
+            assert_eq!(cmd.as_std().get_current_dir(), Some(dir));
+            assert_eq!(cmd.as_std().get_program(), "C:/DSH/dsh.cmd");
+            let args: Vec<_> = cmd.as_std().get_args().map(|s| s.to_str().unwrap()).collect();
+            let mut expected = vec!["--profile", "agli", "--json"];
+            if let Some(id) = resume {
+                expected.extend(["--session-id", id]);
+            }
+            expected.push("-");
+            assert_eq!(args, expected);
+        }
+        assert!(dsh_command("dsh".as_ref(), dir, "agli", Some("--last")).is_err());
+        assert!(dsh_command("dsh".as_ref(), dir, "a&b", None).is_err());
+    }
+
+    fn fixture_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("agli-dsh-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn fixture_command(dir: &Path, role: &str) -> Command {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "hands::delegate::tests::delegate_child_fixture", "--nocapture"])
+            .current_dir(dir)
+            .env("AGLI_TEST_DELEGATE_ROLE", role);
+        cmd
+    }
+
+    /// Runs only inside this test executable, never a real hand or a model.
+    #[test]
+    fn delegate_child_fixture() {
+        let Ok(role) = std::env::var("AGLI_TEST_DELEGATE_ROLE") else {
+            return;
+        };
+        if matches!(role.as_str(), "events" | "failure" | "no-usage" | "no-final" | "error") {
+            let mut input = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).unwrap();
+            assert_eq!(input, "prompt through stdin");
+            if role == "no-usage" {
+                println!(r#"{{"type":"final","text":"No tokens"}}"#);
+            } else if role == "no-final" {
+                println!(r#"{{"type":"text","text":"Not a final answer"}}"#);
+            } else if role == "error" {
+                println!(r#"{{"type":"error","message":"Unknown session"}}"#);
+            } else {
+                print!("{DSH_EVENTS}");
+            }
+            if role == "failure" {
+                std::process::exit(7);
+            }
+            return;
+        }
+        if role == "tree" || role == "branch" {
+            let next = if role == "tree" { "branch" } else { "leaf" };
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "hands::delegate::tests::delegate_child_fixture", "--nocapture"]).env("AGLI_TEST_DELEGATE_ROLE", next);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                child.creation_flags(0x08000000);
+            }
+            let mut child = child.spawn().unwrap();
+            std::fs::write(format!("{role}.pid"), std::process::id().to_string()).unwrap();
+            child.wait().unwrap();
+        } else {
+            println!(r#"{{"type":"status","phase":"step_end","usage":{{"inputTokens":3,"outputTokens":2}}}}"#);
+            std::io::stdout().flush().unwrap();
+            std::fs::write("leaf.pid", std::process::id().to_string()).unwrap();
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[tokio::test]
+    async fn dsh_audits_success_failure_and_missing_usage_without_models() -> Result<()> {
+        let dir = fixture_dir("audit");
+        let store = crate::store::jsonl::JsonlStore::open(&dir.join("store"))?;
+        for role in ["events", "failure", "no-usage"] {
+            let result = dsh_run(
+                fixture_command(&dir, role),
+                &dir,
+                "prompt through stdin",
+                "agli",
+                Duration::from_secs(10),
+                None,
+                &store,
+                "research",
+            )
+            .await;
+            assert_eq!(result.is_ok(), role != "failure");
+        }
+        let calls = std::fs::read_to_string(dir.join("store/model_calls.jsonl"))?;
+        let calls: Vec<ModelCallRecord> = calls.lines().map(serde_json::from_str).collect::<std::result::Result<_, _>>()?;
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].ok && !calls[1].ok);
+        assert_eq!(calls[0].scenario, "dsh:research");
+        assert_eq!((calls[0].uncached_input, calls[0].cached_input, calls[0].output), (130, 30, 30));
+        assert_eq!(calls[0].cost_usd, 0.0);
+        assert_eq!(std::fs::read_to_string(dir.join("dsh-tool-calls.jsonl"))?.lines().count(), 10);
+        assert_eq!(std::fs::read_to_string(dir.join("dsh-events.jsonl"))?.matches(DSH_EVENTS).count(), 2);
+        assert!(std::fs::read_to_string(dir.join("log.md"))?.contains("usage not reported"));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dsh_validates_resume_identity_and_terminal_answer() -> Result<()> {
+        let dir = fixture_dir("resume");
+        let store = crate::store::jsonl::JsonlStore::open(&dir.join("store"))?;
+        for (role, session, ok) in [
+            ("events", Some("session-research-25"), true),
+            ("events", Some("different-session"), false),
+            ("no-usage", None, true),
+            ("no-final", None, false),
+            ("error", Some("missing-session"), false),
+        ] {
+            let result = dsh_run(
+                fixture_command(&dir, role),
+                &dir,
+                "prompt through stdin",
+                "agli",
+                Duration::from_secs(10),
+                session,
+                &store,
+                "research",
+            )
+            .await;
+            assert_eq!(result.is_ok(), ok, "{role}: {result:?}");
+            if role == "no-usage" {
+                assert!(result?.session_id.is_none());
+            }
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn check_process_tree_cleanup(cancel: bool) -> Result<()> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{OpenProcess, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject};
+        let dir = fixture_dir(if cancel { "cancel tree with spaces" } else { "timeout tree with spaces" });
+        let store = std::sync::Arc::new(crate::store::jsonl::JsonlStore::open(&dir.join("store"))?);
+        let script = dir.join("tree.cmd");
+        std::fs::write(
+            &script,
+            format!(
+                "@echo off\r\n\"{}\" --exact hands::delegate::tests::delegate_child_fixture --nocapture\r\n",
+                std::env::current_exe()?.display()
+            ),
+        )?;
+        let mut cmd = Command::new(&script);
+        cmd.current_dir(&dir).env("AGLI_TEST_DELEGATE_ROLE", "tree");
+        let work_dir = dir.clone();
+        let handle = tokio::spawn(async move {
+            // A full pipe must not prevent the timeout from firing (the fixture never reads stdin).
+            let prompt = if cancel { String::new() } else { "x".repeat(1024 * 1024) };
+            dsh_run(cmd, &work_dir, &prompt, "agli", Duration::from_secs(8), None, store.as_ref(), "research").await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if dir.join("leaf.pid").exists()
+                    && std::fs::read_to_string(dir.join("dsh-events.jsonl")).unwrap_or_default().contains("inputTokens")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if ready.is_err() {
+            handle.abort();
+            let _ = handle.await;
+            bail!("test child tree did not become ready");
+        }
+        let mut processes = Vec::new();
+        for role in ["tree", "branch", "leaf"] {
+            let pid = std::fs::read_to_string(dir.join(format!("{role}.pid")))?.parse::<u32>()?;
+            let raw = unsafe { OpenProcess(SYNCHRONIZATION_SYNCHRONIZE, 0, pid) };
+            anyhow::ensure!(!raw.is_null(), "fixture process should be alive");
+            processes.push(unsafe { OwnedHandle::from_raw_handle(raw) });
+        }
+        if cancel {
+            // This is exactly the JoinHandle::abort path used by /stop and /freeze.
+            handle.abort();
+            assert!(handle.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(handle.await?.err().unwrap().to_string().contains("timed out"));
+        }
+        for process in processes {
+            assert_eq!(
+                unsafe { WaitForSingleObject(process.as_raw_handle(), 5000) },
+                WAIT_OBJECT_0,
+                "descendant survived delegate cleanup"
+            );
+        }
+        let calls = std::fs::read_to_string(dir.join("store/model_calls.jsonl"))?;
+        assert_eq!(calls.lines().count(), 1);
+        let call: ModelCallRecord = serde_json::from_str(calls.lines().next().unwrap())?;
+        assert!(!call.ok);
+        assert_eq!((call.uncached_input, call.output), (3, 2));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancellation_kills_cmd_child_and_grandchild_and_records_usage() -> Result<()> {
+        check_process_tree_cleanup(true).await
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn timeout_kills_cmd_child_and_grandchild_and_records_usage() -> Result<()> {
+        check_process_tree_cleanup(false).await
+    }
 
     #[test]
     fn captures_session_uuid_from_jsonl_not_other_events() {
