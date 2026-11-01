@@ -8,7 +8,7 @@ use super::models::Models;
 use crate::ns::ProcessingPolicy;
 use crate::store::{Episode, EpisodeEmbedding, Store};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct EmbeddingCfg {
     pub provider: String,
     pub model: String,
