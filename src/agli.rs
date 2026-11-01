@@ -1228,6 +1228,7 @@ impl Agli {
         }
         info!("going to sleep: reflecting on {date}");
         self.extract_all(chrono::Duration::days(2)).await?;
+        crate::mind::knowledge::consolidate(&self.models, self.store.as_ref(), &self.cfg.work_dir(), &self.cfg.mind_dir().join("knowledge")).await?;
         let dir = self.cfg.mind_dir().join("life").join("journal");
         if let Some(path) = reflect::write_journal(&self.models, self.store.as_ref(), self.speaker.l1(), dir, date).await? {
             info!("journal written: {}", path.display());
