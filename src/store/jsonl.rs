@@ -32,6 +32,23 @@ pub struct JsonlStore {
 }
 
 impl JsonlStore {
+    pub(super) fn import_snapshot(dir: &Path) -> Result<super::import::Snapshot> {
+        anyhow::ensure!(dir.is_dir(), "source must be an existing data directory");
+        let store = Self { dir: dir.to_path_buf(), lock: Mutex::new(()) };
+        let snapshot = super::import::Snapshot {
+            messages: store.scan_mode(MESSAGES, true)?,
+            model_calls: store.scan_mode(MODEL_CALLS, true)?,
+            episodes: store.scan_mode(EPISODES, true)?,
+            persons: store.persons()?,
+            lessons: store.scan_mode(LESSONS, true)?,
+            audit: store.scan_mode(AUDIT, true)?,
+            reviews: store.reviews()?,
+            kv: store.read_doc(KV)?,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(JsonlStore { dir: dir.to_path_buf(), lock: Mutex::new(()) })
@@ -50,6 +67,10 @@ impl JsonlStore {
     }
 
     fn scan<T: DeserializeOwned>(&self, file: &str) -> Result<Vec<T>> {
+        self.scan_mode(file, false)
+    }
+
+    fn scan_mode<T: DeserializeOwned>(&self, file: &str, strict: bool) -> Result<Vec<T>> {
         let path = self.dir.join(file);
         let f = match File::open(&path) {
             Ok(f) => f,
@@ -64,6 +85,9 @@ impl JsonlStore {
             }
             match serde_json::from_str(&line) {
                 Ok(rec) => out.push(rec),
+                Err(e) if strict => {
+                    return Err(e).with_context(|| format!("parsing {} line {}", path.display(), i + 1));
+                }
                 Err(e) => tracing::warn!("skipping bad line {} in {}: {e}", i + 1, path.display()),
             }
         }

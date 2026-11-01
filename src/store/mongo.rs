@@ -84,6 +84,10 @@ fn indexes() -> Vec<(&'static str, IndexModel)> {
 
 impl MongoStore {
     pub fn open(url: &str, database: &str) -> Result<Self> {
+        Self::open_for_import(url, database, false)
+    }
+
+    pub(super) fn open_for_import(url: &str, database: &str, read_only: bool) -> Result<Self> {
         blocking(|| {
             // Driver errors can quote connection-string input. Do not attach their source here.
             let mut options = ClientOptions::parse(url).run().map_err(|_| {
@@ -96,13 +100,49 @@ impl MongoStore {
             let store = Self { db: client.database(database), writes: Mutex::new(()) };
             store.db.run_command(doc! { "ping": 1 }).run()
                 .map_err(|_| anyhow!("MongoDB startup: connection/authentication failed; check MONGO_URL, MONGO_DATABASE and server availability; no JSONL fallback"))?;
-            store.init().map_err(|_| anyhow!("MongoDB startup: creating collections/indexes failed; check database permissions and existing indexes; no JSONL fallback"))?;
+            if !read_only {
+                store.init().map_err(|_| anyhow!("MongoDB startup: creating collections/indexes failed; check database permissions and existing indexes; no JSONL fallback"))?;
+            }
             Ok(store)
         })
     }
 
     fn collection(&self, name: &str) -> Collection<Document> {
         self.db.collection(name)
+    }
+
+    fn keyed_snapshot<T: DeserializeOwned + Send>(&self, name: &str) -> Result<BTreeMap<String, T>> {
+        blocking(|| {
+            self.collection(name)
+                .find(doc! {})
+                .run()?
+                .map(|doc| {
+                    let doc = doc?;
+                    Ok((doc.get_str("_id")?.to_owned(), decode(doc)?))
+                })
+                .collect()
+        })
+    }
+
+    pub(super) fn snapshot(&self) -> Result<super::import::Snapshot> {
+        let snapshot = super::import::Snapshot {
+            messages: self.scan("messages", doc! {})?,
+            model_calls: self.scan("model_calls", doc! {})?,
+            episodes: self.episodes()?,
+            persons: self.keyed_snapshot("persons")?,
+            lessons: self.lessons()?,
+            audit: self.scan("audit", doc! {})?,
+            reviews: self.reviews()?,
+            kv: self.keyed_snapshot("kv")?,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    #[cfg(test)]
+    pub(super) fn drop_import_test_database(&self) -> Result<()> {
+        anyhow::ensure!(self.db.name().starts_with("aglibot_test_"), "test database required");
+        blocking(|| Ok(self.db.drop().run()?))
     }
 
     fn init(&self) -> Result<()> {

@@ -1,5 +1,6 @@
 //! Storage behind a synchronous trait: MongoDB when configured, JSONL otherwise (DESIGN 2b).
 
+pub mod import;
 pub mod jsonl;
 pub mod mongo;
 
