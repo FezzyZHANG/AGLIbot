@@ -2,7 +2,7 @@
 //!
 //! - `Namespace`: which context a piece of information belongs to (organisation + retrieval).
 //! - `Scope`: who it may be disclosed to.
-//! - `ProcessingPolicy`: which models may process it.
+//! - `ProcessingPolicy`: which models or executors may process it.
 //!
 //! A namespace is never an access grant; only `Scope::permits` decides what enters a context.
 
@@ -14,6 +14,8 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::config::ModelEntry;
+
+pub mod secrets;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Namespace {
@@ -132,6 +134,15 @@ pub enum ProcessingPolicy {
 }
 
 impl ProcessingPolicy {
+    /// A delegate is outside AGLI's process, even when its CLI runs on this machine.
+    pub fn allows_executor(&self, executor: &str) -> bool {
+        match self {
+            ProcessingPolicy::LocalOnly => false,
+            ProcessingPolicy::Any => true,
+            ProcessingPolicy::Providers { names } => names.iter().any(|name| name == executor),
+        }
+    }
+
     /// Default derived from scope, so most namespaces need no manual policy.
     pub fn default_for(scope: &Scope) -> Self {
         match scope {
@@ -152,6 +163,17 @@ impl ProcessingPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn processing_policy_checks_executors_without_model_entries() {
+        let dsh = ProcessingPolicy::Providers { names: vec!["dsh".into()] };
+        for executor in ["codex", "dsh", "local", "unknown"] {
+            assert!(!ProcessingPolicy::LocalOnly.allows_executor(executor));
+            assert!(ProcessingPolicy::Any.allows_executor(executor));
+            assert_eq!(dsh.allows_executor(executor), executor == "dsh");
+            assert!(!ProcessingPolicy::Providers { names: vec![] }.allows_executor(executor));
+        }
+    }
 
     #[test]
     fn namespace_round_trips() {

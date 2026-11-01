@@ -5,6 +5,7 @@
 //! The prompt goes through stdin, so no shell quoting is involved; on Windows the npm shims are
 //! `.cmd` files, which `Command` runs through cmd.exe.
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
@@ -15,13 +16,80 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use super::process_tree::ProcessTree;
+use crate::ns::secrets::{SecretRegistry, process_registry};
 use crate::store::{ModelCallRecord, Store};
 
 fn program(name: &str) -> String {
     if cfg!(windows) { format!("{name}.cmd") } else { name.to_string() }
 }
 
-async fn run(mut cmd: Command, stdin: &str, timeout: Duration, mut on_line: impl FnMut(&[u8]) -> Result<()>) -> Result<String> {
+// Runtime discovery, npm shims, CLI homes/login, and network proxies only. New parent
+// variables are private by default; do not add credential or code-injection variables.
+const DELEGATE_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "SystemRoot",
+    "windir",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "CODEX_HOME",
+    "DSH_HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+
+#[derive(Clone, Copy)]
+enum Delegate {
+    Codex,
+    Dsh,
+}
+
+fn delegate_environment(
+    cmd: &mut Command,
+    delegate: Delegate,
+    registry: &SecretRegistry,
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+) {
+    cmd.env_clear();
+    let executor = match delegate {
+        Delegate::Codex => "codex",
+        Delegate::Dsh => "dsh",
+    };
+    let environment = registry.assemble(executor, DELEGATE_ENV_ALLOWLIST, parent);
+    cmd.envs(environment.variables);
+    for source in environment.missing {
+        tracing::warn!(
+            "{executor} dedicated key {source} is missing or empty; configure it in AGLI's environment if required by the profile"
+        );
+    }
+}
+
+async fn run(
+    mut cmd: Command,
+    delegate: Delegate,
+    stdin: &str,
+    timeout: Duration,
+    mut on_line: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<String> {
+    delegate_environment(&mut cmd, delegate, &process_registry(), std::env::vars_os());
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let mut tree = ProcessTree::prepare(&mut cmd)?;
     let mut child = cmd.spawn().context("starting delegate process")?;
@@ -126,7 +194,7 @@ pub async fn codex_session(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let events = run(codex_command(&dir, &last, model, search, resume), prompt, timeout, |_| Ok(())).await?;
+    let events = run(codex_command(&dir, &last, model, search, resume), Delegate::Codex, prompt, timeout, |_| Ok(())).await?;
     let session_id = session_id(&events)?;
     if let Some(expected) = resume {
         anyhow::ensure!(session_id == expected, "Codex resumed a different session: {session_id}");
@@ -375,7 +443,7 @@ async fn dsh_run(
 ) -> Result<DshOutput> {
     let mut audit = DshAudit::open(dir, store, profile, kind)?;
     let result = async {
-        run(cmd, prompt, timeout, |line| audit.line(line)).await?;
+        run(cmd, Delegate::Dsh, prompt, timeout, |line| audit.line(line)).await?;
         if let Some(error) = &audit.events.error {
             bail!("DSH: {error}");
         }
@@ -393,8 +461,90 @@ async fn dsh_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ns::secrets::env_name_matches;
+    use std::ffi::OsStr;
 
     const DSH_EVENTS: &str = include_str!("fixtures/dsh-events.jsonl");
+    const DSH_ENV_KEYS: &[(&str, &str)] =
+        &[("AGLI_DSH_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"), ("AGLI_DSH_BAILIAN_API_KEY", "DSH_BAILIAN_API_KEY")];
+
+    #[test]
+    fn environment_names_follow_platform_case_rules() {
+        assert!(env_name_matches(OsStr::new("PATH"), "PATH"));
+        assert_eq!(env_name_matches(OsStr::new("pAtH"), "PATH"), cfg!(windows));
+        assert_eq!(env_name_matches(OsStr::new("agli_dsh_bailian_api_key"), "AGLI_DSH_BAILIAN_API_KEY"), cfg!(windows));
+        assert!(!env_name_matches(OsStr::new("PATH_EXTRA"), "PATH"));
+    }
+
+    #[tokio::test]
+    async fn delegate_child_environment_is_allowlisted_and_dsh_keys_are_private() -> Result<()> {
+        // Inject a parent map, never mutate the test process environment. Only Windows' OS
+        // directory comes from the host; all credentials and other values are synthetic.
+        let mut parent: Vec<(OsString, OsString)> = DELEGATE_ENV_ALLOWLIST
+            .iter()
+            .map(|name| {
+                let value = if cfg!(windows) && matches!(*name, "SystemRoot" | "windir") {
+                    std::env::var_os("SystemRoot").unwrap()
+                } else {
+                    "allowlisted-value".into()
+                };
+                let name = if cfg!(windows) { name.to_ascii_lowercase() } else { name.to_string() };
+                (name.into(), value)
+            })
+            .collect();
+        let blocked = [
+            "TELEGRAM_BOT_TOKEN",
+            "BAILIAN_API_KEY",
+            "ONEBOT_TOKEN",
+            "DEEPSEEK_API_KEY",
+            "DSH_BAILIAN_API_KEY",
+            "FUTURE_API_KEY",
+            "NODE_OPTIONS",
+        ];
+        parent.extend(blocked.iter().map(|name| ((*name).into(), "parent-secret".into())));
+        for (delegate, key_value) in [
+            (Delegate::Codex, Some("dedicated-secret")),
+            (Delegate::Codex, None),
+            (Delegate::Dsh, Some("dedicated-secret")),
+            (Delegate::Dsh, None),
+            (Delegate::Dsh, Some("")),
+        ] {
+            let mut source = parent.clone();
+            if let Some(value) = key_value {
+                source.extend(DSH_ENV_KEYS.iter().map(|(name, target)| {
+                    let name = if cfg!(windows) { name.to_ascii_lowercase() } else { name.to_string() };
+                    let value = if value.is_empty() { String::new() } else { format!("{value}-{target}") };
+                    (name.into(), value.into())
+                }));
+            }
+            let mut cmd = fixture_command(&std::env::current_dir()?, "environment");
+            cmd.env("COMMAND_OVERRIDE_SECRET", "must-be-cleared");
+            delegate_environment(&mut cmd, delegate, &SecretRegistry::default(), source);
+            let output = cmd.output().await?;
+            assert!(output.status.success(), "{}: {}", output.status, String::from_utf8_lossy(&output.stderr));
+            let stdout = String::from_utf8(output.stdout)?;
+            let actual: Vec<_> = stdout.lines().filter_map(|line| line.split_once('=')).collect();
+            let value = |name: &str| actual.iter().find(|(key, _)| env_name_matches(OsStr::new(key), name)).map(|(_, value)| *value);
+            for (name, expected) in parent.iter().take(DELEGATE_ENV_ALLOWLIST.len()) {
+                assert_eq!(value(name.to_str().unwrap()), expected.to_str(), "allowlisted variable {name:?}");
+            }
+            for name in blocked.iter().chain(["COMMAND_OVERRIDE_SECRET"].iter()) {
+                if !matches!(*name, "DEEPSEEK_API_KEY" | "DSH_BAILIAN_API_KEY") {
+                    assert!(value(name).is_none(), "unexpected variable {name}");
+                }
+            }
+            for (source, target) in DSH_ENV_KEYS {
+                assert!(value(source).is_none(), "prefixed variable {source} leaked");
+                let expected = if matches!(delegate, Delegate::Dsh) {
+                    key_value.filter(|v| !v.is_empty()).map(|v| format!("{v}-{target}"))
+                } else {
+                    None
+                };
+                assert_eq!(value(target), expected.as_deref(), "DSH-only variable {target}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn dsh_schema_extracts_final_session_step_usage_and_every_tool_call() {
@@ -466,18 +616,27 @@ mod tests {
 
     fn fixture_command(dir: &Path, role: &str) -> Command {
         let mut cmd = Command::new(std::env::current_exe().unwrap());
+        // libtest accepts no custom arguments. A nonmatching skip filter carries the
+        // fixture role without depending on an environment variable that run() scrubs.
         cmd.args(["--exact", "hands::delegate::tests::delegate_child_fixture", "--nocapture"])
             .current_dir(dir)
-            .env("AGLI_TEST_DELEGATE_ROLE", role);
+            .args(["--skip", &format!("agli-fixture-role={role}")]);
         cmd
     }
 
     /// Runs only inside this test executable, never a real hand or a model.
     #[test]
     fn delegate_child_fixture() {
-        let Ok(role) = std::env::var("AGLI_TEST_DELEGATE_ROLE") else {
+        let role = std::env::args().find_map(|arg| arg.strip_prefix("agli-fixture-role=").map(String::from));
+        let Some(role) = role else {
             return;
         };
+        if role == "environment" {
+            for (name, value) in std::env::vars() {
+                println!("{name}={value}");
+            }
+            return;
+        }
         if matches!(role.as_str(), "events" | "failure" | "no-usage" | "no-final" | "error") {
             let mut input = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).unwrap();
@@ -499,7 +658,13 @@ mod tests {
         if role == "tree" || role == "branch" {
             let next = if role == "tree" { "branch" } else { "leaf" };
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-            child.args(["--exact", "hands::delegate::tests::delegate_child_fixture", "--nocapture"]).env("AGLI_TEST_DELEGATE_ROLE", next);
+            child.args([
+                "--exact",
+                "hands::delegate::tests::delegate_child_fixture",
+                "--nocapture",
+                "--skip",
+                &format!("agli-fixture-role={next}"),
+            ]);
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -590,12 +755,12 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "@echo off\r\n\"{}\" --exact hands::delegate::tests::delegate_child_fixture --nocapture\r\n",
+                "@echo off\r\n\"{}\" --exact hands::delegate::tests::delegate_child_fixture --nocapture --skip agli-fixture-role=tree\r\n",
                 std::env::current_exe()?.display()
             ),
         )?;
         let mut cmd = Command::new(&script);
-        cmd.current_dir(&dir).env("AGLI_TEST_DELEGATE_ROLE", "tree");
+        cmd.current_dir(&dir);
         let work_dir = dir.clone();
         let handle = tokio::spawn(async move {
             // A full pipe must not prevent the timeout from firing (the fixture never reads stdin).

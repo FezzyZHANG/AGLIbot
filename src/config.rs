@@ -304,6 +304,7 @@ impl Config {
         };
         cfg.resolve_env()?;
         cfg.validate()?;
+        crate::ns::secrets::register_config(&cfg);
         Ok(cfg)
     }
 
