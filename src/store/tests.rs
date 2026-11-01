@@ -45,6 +45,18 @@ fn same<T: Serialize>(got: &T, expected: &T) {
 }
 
 pub(super) fn contract(store: &dyn Store) {
+    assert!(store.load_embeddings("embed-a").unwrap().is_empty());
+    let mut embedding = EpisodeEmbedding { episode_id: "episode/a.$".into(), model_id: "embed-a".into(), vector: vec![0.5, -0.25] };
+    store.save_embedding(&embedding).unwrap();
+    assert_eq!(store.load_embeddings("embed-a").unwrap()[&embedding.episode_id], embedding.vector);
+    assert!(store.load_embeddings("embed-b").unwrap().is_empty());
+    embedding.vector = vec![0.25, 0.75];
+    store.save_embedding(&embedding).unwrap();
+    assert_eq!(store.load_embeddings("embed-a").unwrap().len(), 1);
+    assert_eq!(store.load_embeddings("embed-a").unwrap()[&embedding.episode_id], embedding.vector);
+    embedding.model_id = "embed-b".into();
+    store.save_embedding(&embedding).unwrap();
+    assert!(store.load_embeddings("embed-a").unwrap().is_empty());
     let ts = time();
     let ns: Namespace = "person/a".parse().unwrap();
     assert!(store.recent_in_ns(&ns, 10).unwrap().is_empty());
@@ -255,6 +267,8 @@ pub(super) fn contract(store: &dyn Store) {
 }
 
 pub(super) fn persisted(store: &dyn Store) {
+    assert!(store.load_embeddings("embed-a").unwrap().is_empty());
+    assert_eq!(store.load_embeddings("embed-b").unwrap(), BTreeMap::from([("episode/a.$".into(), vec![0.25, 0.75])]));
     let audit = store.audits().unwrap();
     assert_eq!(audit.len(), 1);
     assert_eq!(audit[0].outcome, Outcome::Denied);

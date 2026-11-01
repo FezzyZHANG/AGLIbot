@@ -58,6 +58,15 @@ pub struct ModelCallRecord {
     pub escalated_from: Option<String>,
 }
 
+/// Derived cache, kept separate from the source episode and replaceable after a model change.
+/// Offline migration omits this cache; the target lazily rebuilds it from active episodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeEmbedding {
+    pub episode_id: String,
+    pub model_id: String,
+    pub vector: Vec<f32>,
+}
+
 /// Something that happened, distilled from messages. ns/scope come from the source chat, never the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {
@@ -275,6 +284,9 @@ pub trait Store: Send + Sync {
     fn spent_since(&self, since: DateTime<Utc>) -> Result<f64>;
 
     fn append_episode(&self, e: &Episode) -> Result<()>;
+    fn save_embedding(&self, embedding: &EpisodeEmbedding) -> Result<()>;
+    /// Only vectors from this embedder; a model change makes old cache entries missing.
+    fn load_embeddings(&self, model_id: &str) -> Result<BTreeMap<String, Vec<f32>>>;
     /// Active memories, with archived originals excluded from normal recall.
     fn episodes(&self) -> Result<Vec<Episode>> { Ok(active_episodes(self.all_episodes()?)) }
     /// Includes unchanged originals, retrievable by the summary's `sources` ids.

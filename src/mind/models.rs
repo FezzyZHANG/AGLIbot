@@ -3,12 +3,13 @@
 //! (docs/DESIGN.md 5d). JSON answers get a self-check: unparsable output also escalates.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Local, NaiveTime, Utc};
 use serde::de::DeserializeOwned;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::llm::{LlmClient, Prompt, Reply, Turn, Usage, cost_usd};
 use super::router::{Budget, Router};
@@ -17,6 +18,8 @@ use crate::ns::ProcessingPolicy;
 use crate::store::{ModelCallRecord, Store};
 
 pub struct Models {
+    embedding: Option<super::embedding::EmbeddingCfg>,
+    embedding_warned: AtomicBool,
     router: Router,
     llm: LlmClient,
     store: Arc<dyn Store>,
@@ -86,7 +89,15 @@ impl Models {
             .select("chat", &ProcessingPolicy::Any, false)
             .map_err(|e| anyhow!("没有可用的聊天模型，请在 .env 里配置至少一个提供商的密钥：{e}"))?;
         let budget = Budget::new(cfg.models.daily_budget_usd, store.spent_since(local_midnight_utc())?);
+        let embedding = cfg.models.embedding.clone().filter(|embedding| {
+            if let Err(e) = embedding.validate() {
+                warn!("semantic recall disabled: {e}");
+                false
+            } else { true }
+        });
+        info!(enabled = embedding.is_some(), model = ?embedding.as_ref().map(|e| e.model_id()), "semantic recall startup");
         Ok(Models {
+            embedding, embedding_warned: AtomicBool::new(false),
             router, llm, store, budget: Mutex::new(budget), has_local,
             #[cfg(test)]
             stub: None,
@@ -96,6 +107,7 @@ impl Models {
     #[cfg(test)]
     pub fn stub(store: Arc<dyn Store>, replies: Vec<String>) -> Self {
         Self {
+            embedding: None, embedding_warned: AtomicBool::new(false),
             router: Router::new(vec![], Default::default()),
             llm: LlmClient::new(Default::default()).unwrap(), store,
             budget: Mutex::new(Budget::new(1.0, 0.0)), has_local: false,
@@ -111,6 +123,52 @@ impl Models {
     #[cfg(test)]
     pub fn stub_cost(&self, cost: f64) {
         self.stub.as_ref().unwrap().lock().unwrap().cost_usd = cost;
+    }
+
+    #[cfg(test)]
+    pub fn with_embedding(mut self, cfg: super::embedding::EmbeddingCfg) -> Self {
+        self.embedding = Some(cfg);
+        self
+    }
+
+    pub fn embedding(&self) -> Option<&super::embedding::EmbeddingCfg> { self.embedding.as_ref() }
+
+    pub fn warn_embedding(&self, error: &anyhow::Error) {
+        if !self.embedding_warned.swap(true, Ordering::Relaxed) {
+            warn!("semantic recall unavailable; retaining ordinary recall: {error:#}");
+        }
+    }
+
+    /// Check policy before passing any input to the client (including the test client).
+    /// No escalation: another provider may not be allowed to process this text.
+    pub async fn embed(&self, policy: &ProcessingPolicy, text: &str) -> Result<Option<Vec<f32>>> {
+        let Some(cfg) = &self.embedding else { return Ok(None) };
+        if !cfg.allows(policy) || self.budget_exhausted() || text.trim().is_empty() { return Ok(None) }
+        let started = Instant::now();
+        let outcome = self.embedding_call(cfg, policy, text).await;
+        let usage = outcome.as_ref().map(|(_, usage)| usage.clone()).unwrap_or_default();
+        let cost = usage.uncached_input as f64 * cfg.input_usd_per_million / 1_000_000.0;
+        self.budget().add(cost);
+        let record = ModelCallRecord {
+            ts: Utc::now(), scenario: "embed".into(), model_id: cfg.model_id(), session_id: "embed".into(),
+            uncached_input: usage.uncached_input, cached_input: 0, cache_write: 0, output: 0,
+            latency_ms: started.elapsed().as_millis() as u64, cost_usd: cost,
+            ok: outcome.is_ok(), error: outcome.as_ref().err().map(|_| "embedding request or response failed".into()),
+            escalated_from: None,
+        };
+        if let Err(e) = self.store.append_model_call(&record) { self.warn_embedding(&e); }
+        outcome.map(|(vector, _)| Some(vector))
+    }
+
+    async fn embedding_call(&self, cfg: &super::embedding::EmbeddingCfg, _policy: &ProcessingPolicy, text: &str) -> Result<(Vec<f32>, Usage)> {
+        #[cfg(test)]
+        if let Some(stub) = &self.stub {
+            let mut stub = stub.lock().unwrap();
+            stub.prompts.push(("embed".into(), _policy.clone(), text.into()));
+            let reply = stub.replies.pop_front().ok_or_else(|| anyhow!("stub embedder unavailable"))?;
+            return super::llm::parse_embedding(&serde_json::from_str(&reply)?);
+        }
+        self.llm.embed(cfg, text).await
     }
 
     #[cfg(test)]

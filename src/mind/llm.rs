@@ -208,6 +208,19 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
+    pub async fn embed(&self, cfg: &super::embedding::EmbeddingCfg, text: &str) -> Result<(Vec<f32>, Usage)> {
+        let provider = self.providers.get(&cfg.provider).ok_or_else(|| anyhow!("unknown embedding provider"))?;
+        anyhow::ensure!(matches!(provider.kind, ProviderKind::OpenaiCompat), "embedding provider must be openai_compat");
+        let base = provider_base_url(provider).ok_or_else(|| anyhow!("embedding provider needs base_url"))?;
+        let mut request = self.http.post(format!("{base}/embeddings"))
+            .timeout(Duration::from_secs(10))
+            .json(&json!({"model": cfg.model, "input": text, "encoding_format": "float"}));
+        if let Some(key) = Self::api_key(provider)? { request = request.bearer_auth(key); }
+        // Do not log provider response bodies: they may echo the private input.
+        let value: Value = request.send().await?.error_for_status()?.json().await?;
+        parse_embedding(&value)
+    }
+
     pub fn new(providers: BTreeMap<String, ProviderCfg>) -> Result<Self> {
         let http = reqwest::Client::builder().timeout(Duration::from_secs(600)).build()?;
         Ok(LlmClient { http, providers })
@@ -281,6 +294,15 @@ impl LlmClient {
 
 async fn send_json(req: reqwest::RequestBuilder) -> Result<Value> {
     serde_json::from_str(&send_text(req).await?).context("response is not JSON")
+}
+
+pub(super) fn parse_embedding(value: &Value) -> Result<(Vec<f32>, Usage)> {
+    let data = value["data"].as_array().ok_or_else(|| anyhow!("embedding response has no data"))?;
+    anyhow::ensure!(data.len() == 1 && data[0]["index"].as_u64() == Some(0), "embedding response must contain exactly index 0");
+    let vector: Vec<f32> = serde_json::from_value(data[0]["embedding"].clone()).context("invalid embedding array")?;
+    anyhow::ensure!(super::embedding::valid_vector(&vector), "embedding must be finite and nonzero");
+    let usage = Usage { uncached_input: u64_at(value, "/usage/prompt_tokens"), ..Usage::default() };
+    Ok((vector, usage))
 }
 
 async fn send_text(req: reqwest::RequestBuilder) -> Result<String> {

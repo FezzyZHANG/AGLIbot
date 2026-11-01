@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::{AuditRecord, Episode, Group, Lesson, MessageRecord, ModelCallRecord, Person, Relation, ReviewItem, Store};
+use super::{AuditRecord, Episode, EpisodeEmbedding, Group, Lesson, MessageRecord, ModelCallRecord, Person, Relation, ReviewItem, Store};
 use crate::ns::Namespace;
 
 const MESSAGES: &str = "messages.jsonl";
@@ -168,6 +168,18 @@ impl Store for JsonlStore {
 
     fn append_episode(&self, e: &Episode) -> Result<()> {
         self.append(EPISODES, e)
+    }
+
+    fn save_embedding(&self, embedding: &EpisodeEmbedding) -> Result<()> {
+        self.update_doc("embeddings.json", |doc: &mut BTreeMap<String, EpisodeEmbedding>| {
+            doc.insert(embedding.episode_id.clone(), embedding.clone());
+        })
+    }
+
+    fn load_embeddings(&self, model_id: &str) -> Result<BTreeMap<String, Vec<f32>>> {
+        let _g = self.guard();
+        let all: BTreeMap<String, EpisodeEmbedding> = self.read_doc("embeddings.json")?;
+        Ok(all.into_iter().filter(|(_, e)| e.model_id == model_id).map(|(id, e)| (id, e.vector)).collect())
     }
 
     fn all_episodes(&self) -> Result<Vec<Episode>> {

@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::{AuditRecord, Episode, Group, Lesson, MessageRecord, ModelCallRecord, Person, Relation, ReviewItem, Store};
+use super::{AuditRecord, Episode, EpisodeEmbedding, Group, Lesson, MessageRecord, ModelCallRecord, Person, Relation, ReviewItem, Store};
 use crate::ns::Namespace;
 
 const COLLECTIONS: &[&str] =
@@ -253,6 +253,15 @@ impl Store for MongoStore {
 
     fn append_episode(&self, e: &Episode) -> Result<()> {
         self.append("episodes", e, doc! { "ns": e.ns.to_string(), "ts": timestamp(e.ts) })
+    }
+
+    fn save_embedding(&self, embedding: &EpisodeEmbedding) -> Result<()> {
+        self.save("embeddings", &embedding.episode_id, embedding, false)
+    }
+
+    fn load_embeddings(&self, model_id: &str) -> Result<BTreeMap<String, Vec<f32>>> {
+        let all: BTreeMap<String, EpisodeEmbedding> = self.keyed_snapshot("embeddings")?;
+        Ok(all.into_iter().filter(|(_, e)| e.model_id == model_id).map(|(id, e)| (id, e.vector)).collect())
     }
 
     fn all_episodes(&self) -> Result<Vec<Episode>> {

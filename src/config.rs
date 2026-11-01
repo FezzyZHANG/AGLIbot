@@ -59,6 +59,8 @@ pub struct ModelEntry {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelsCfg {
+    #[serde(default)]
+    pub embedding: Option<crate::mind::embedding::EmbeddingCfg>,
     pub daily_budget_usd: f64,
     pub providers: BTreeMap<String, ProviderCfg>,
     pub models: Vec<ModelEntry>,

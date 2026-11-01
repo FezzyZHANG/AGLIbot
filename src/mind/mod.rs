@@ -1,6 +1,7 @@
 pub mod commitments;
 pub mod context;
 pub mod decide;
+pub mod embedding;
 pub mod flow;
 pub mod judge;
 pub mod knowledge;

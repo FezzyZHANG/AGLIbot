@@ -131,13 +131,14 @@ async fn extract_messages(
     }
     let mut out = ExtractOutcome { messages: msgs.len(), ..Default::default() };
     let mut episode_ids = Vec::new();
+    let mut new_episodes = Vec::new();
     for (i, e) in raw.episodes.into_iter().enumerate() {
         if e.summary.trim().is_empty() {
             continue;
         }
         let id = format!("{}-{}-{i}", ns, last.ts.timestamp_millis());
         let participants = e.participants.into_iter().filter(|p| ids.contains(p)).collect();
-        store.append_episode(&Episode {
+        let episode = Episode {
             id: id.clone(),
             ts: last.ts,
             participants,
@@ -147,7 +148,9 @@ async fn extract_messages(
             ns: ns.clone(),
             scope: scope.clone(),
             sources: vec![],
-        })?;
+        };
+        store.append_episode(&episode)?;
+        new_episodes.push(episode);
         episode_ids.push(id);
         out.episodes += 1;
     }
@@ -178,6 +181,11 @@ async fn extract_messages(
     }
     // Mark the batch done before the slower reviews, so a failure there never re-extracts it.
     store.kv_set(&watermark_key(ns), json!(through.unwrap_or(last.ts).to_rfc3339()))?;
+    // A few new memories are cheap to cache here; larger backlogs wait for the nightly cap.
+    // Budget-limited read-only extraction leaves this optional work to the nightly pass too.
+    if limit.is_none() && let Err(e) = super::embedding::fill(models, store, &new_episodes, 3).await {
+        models.warn_embedding(&e);
+    }
     for lesson in widen {
         // Widening scope always goes through review (2d). A pass widens it now, as a separate
         // record pointing at its source; anything else stays self-only or waits for the owner.
