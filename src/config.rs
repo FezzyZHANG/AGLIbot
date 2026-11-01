@@ -265,6 +265,9 @@ pub struct HeartbeatCfg {
 pub struct MemoryCfg {
     /// Extract episodes from a chat once this many messages are unprocessed (also nightly).
     pub extract_after: usize,
+    /// Weekly reflection boundary; defaults to Sunday without editing owner config.
+    #[serde(default = "default_weekly_weekday")]
+    pub weekly_weekday: chrono::Weekday,
     pub episodes_in_context: usize,
     pub facts_in_context: usize,
     #[serde(default = "default_half_life_days")]
@@ -276,6 +279,8 @@ pub struct MemoryCfg {
     #[serde(default = "default_archive_max_groups")]
     pub archive_max_groups: usize,
 }
+
+fn default_weekly_weekday() -> chrono::Weekday { chrono::Weekday::Sun }
 
 fn default_half_life_days() -> f64 { 30.0 }
 fn default_archive_threshold() -> f64 { 0.05 }

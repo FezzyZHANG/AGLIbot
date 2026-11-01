@@ -51,6 +51,8 @@ impl People {
                     tier,
                     trust: 0.0,
                     intimacy: 0.0,
+                    last_update: None,
+                    last_update_day: None,
                     facts: Vec::new(),
                     last_seen: now,
                 };
@@ -98,11 +100,19 @@ impl People {
             tier,
             trust: 0.0,
             intimacy: 0.0,
+            last_update: None,
+            last_update_day: None,
             facts: Vec::new(),
             last_seen: Utc::now(),
         };
         store.save_person(&p)?;
         self.cache.insert(person_id.into(), p);
+        Ok(())
+    }
+
+    pub fn save(&mut self, store: &dyn Store, person: Person) -> Result<()> {
+        store.save_person(&person)?;
+        self.cache.insert(person.person_id.clone(), person);
         Ok(())
     }
 

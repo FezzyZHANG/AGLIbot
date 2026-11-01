@@ -1647,6 +1647,14 @@ impl Agli {
         if let Some(path) = reflect::write_journal(&self.models, self.store.as_ref(), self.speaker.l1(), dir, date).await? {
             info!("journal written: {}", path.display());
         }
+        if let Err(e) = crate::mind::reciprocity::nightly(&self.models, self.store.as_ref(), &mut self.people, date, Utc::now()).await {
+            warn!("nightly reciprocity failed: {e:#}");
+        }
+        match crate::mind::growth::weekly(&self.models, &self.cfg.mind_dir(), date, self.cfg.runtime.memory.weekly_weekday).await {
+            Ok(true) => self.speaker.replace_l1(build_l1(&self.cfg.mind_dir())?),
+            Ok(false) => {},
+            Err(e) => warn!("weekly reflection rejected: {e:#}"),
+        }
         // Archiving is housekeeping: a failure must not make the whole nightly pass (journal
         // included) rerun on every tick.
         if let Err(e) = reflect::archive_nightly(&self.models, self.store.as_ref(), &self.cfg.runtime.memory,
