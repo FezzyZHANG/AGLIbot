@@ -2,11 +2,10 @@
 id: "n-agli-asm-dsh-apikeyenv"
 title: "The agli profile's Bailian provider entry reads its key only from DSH_BAILIAN_API_KEY"
 kind: "assumption"
-state: "adopted"
+state: "proposed"
 relations: [{"type": "assumes", "target": "ticket:46"}, {"type": "assumes", "target": "ticket:25"}, {"type": "relates", "target": "note:n-agli-q-dsh-tokens"}, {"type": "relates", "target": "note:n-agli-q-dsh-search"}]
 abstract_zh: "前提：agli profile 里百炼 provider 条目（qwen-token-plan-cn）设 apiKeyEnv: DSH_BAILIAN_API_KEY 后，DSH 只从子进程环境的这个名字取 key，缺键即失败而不回退。已由 2026-11-02 对 0.2.1-rc.5 的假 key 实测支持（n-ev-dsh-apikeyenv-live）。前提是 agli 基于 headless、不挂 credentials 服务；DSH 升级或 profile 基座变化时重验。"
 abstract_en: "Premise: with apiKeyEnv: DSH_BAILIAN_API_KEY on the agli profile's Bailian provider entry, DSH reads the key only from that child-env name and fails rather than falling back. Supported by 2026-11-02 fake-key runs on 0.2.1-rc.5, assuming a headless base with no credentials service; re-verify on DSH upgrades or base changes."
-adopted_digest: "ff643ebbe3d56c6cfd1152fdbb06c48e6805e9b94c287239d572aa4f62fbf579"
 ---
 Claim: in the `agli` profile, the Bailian provider entry `llm-pi-ai.providers.qwen-token-plan-cn`
 sets `apiKeyEnv: DSH_BAILIAN_API_KEY`. DSH then authenticates that route only from
@@ -43,3 +42,5 @@ a key-isolation failure, not just a rename. Retarget #46 to the provider's ambie
 ambient copy is already dropped; keep that name out of `DELEGATE_ENV_ALLOWLIST`, extend the #46
 tests so only the dedicated source populates it, and keep a test that a missing
 dedicated key fails the DSH run instead of succeeding on another key.
+
+Added 2026-11-02: verification must run with AGLI's own DSH home (#48), not ~/.dsh, whose .credentials.yaml holds the owner's DeepSeek account token. Also check that web_search bills the separate DeepSeek search key (owner uses a dedicated key with separate search billing) and not an account token.
