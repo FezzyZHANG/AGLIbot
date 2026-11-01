@@ -142,7 +142,7 @@ fn apply(overlay: &mut Overlay, proposal: Proposal, seed: &serde_json::Value, da
     changes
 }
 
-fn week_start(date: NaiveDate, weekday: Weekday) -> NaiveDate {
+pub(super) fn week_start(date: NaiveDate, weekday: Weekday) -> NaiveDate {
     let offset = (7 + date.weekday().num_days_from_monday() - weekday.num_days_from_monday()) % 7;
     date - Duration::days(i64::from(offset))
 }

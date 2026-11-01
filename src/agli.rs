@@ -1326,6 +1326,9 @@ impl Agli {
         if let Some(sender) = item.payload.get("agent_candidate").and_then(Value::as_str) {
             bot_flags::settle(self.store.as_ref(), sender, approve)?;
         }
+        if approve && item.payload.get("persona_probe_week").is_some() {
+            crate::mind::probes::rebaseline(self.store.as_ref())?;
+        }
         item.status = if approve { ReviewStatus::Approved } else { ReviewStatus::Rejected };
         if !reason.is_empty() {
             item.verdict.push_str(&format!("；主人：{reason}"));
@@ -1336,6 +1339,9 @@ impl Agli {
         }
         let p = &item.payload;
         let done = match item.category {
+            ReviewCategory::Verify if p.get("persona_probe_week").is_some() => {
+                "人格探针已以最新答案重设基线。".to_string()
+            }
             ReviewCategory::Act if p.get("agent_candidate").is_some() => {
                 format!("已将 {} 加入运行时 agent 名单并应用 agent 回复限制。写入 config/acl.yaml 的 known_agents 可在数据重置后保留。",
                     p["agent_candidate"].as_str().unwrap_or_default())
@@ -1650,10 +1656,18 @@ impl Agli {
         if let Err(e) = crate::mind::reciprocity::nightly(&self.models, self.store.as_ref(), &mut self.people, date, Utc::now()).await {
             warn!("nightly reciprocity failed: {e:#}");
         }
+        if let Err(e) = crate::social::cards::nightly(self.store.as_ref(), &self.cfg.data_dir(),
+            &self.cfg.acl.owner.person_id, &self.cfg.acl.known_agents) {
+            warn!("nightly person cards failed: {e:#}");
+        }
         match crate::mind::growth::weekly(&self.models, &self.cfg.mind_dir(), date, self.cfg.runtime.memory.weekly_weekday).await {
             Ok(true) => self.speaker.replace_l1(build_l1(&self.cfg.mind_dir())?),
             Ok(false) => {},
             Err(e) => warn!("weekly reflection rejected: {e:#}"),
+        }
+        if let Err(e) = crate::mind::probes::weekly(&self.models, self.store.as_ref(), &self.cfg.mind_dir(),
+            &self.cfg.data_dir(), date, self.cfg.runtime.memory.weekly_weekday, self.speaker.l1()).await {
+            warn!("weekly persona probes failed: {e:#}");
         }
         // Archiving is housekeeping: a failure must not make the whole nightly pass (journal
         // included) rerun on every tick.
@@ -2437,6 +2451,24 @@ mod tests {
             restarted.on_messages(vec![env]).await.unwrap();
         }
         assert_eq!(restarted.store.reviews().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn persona_probe_approve_rebaselines_latest_and_reject_preserves_baseline() {
+        let mut test = TestAgli::new("probe-approval").await;
+        let a = &mut test.agli;
+        let latest = serde_json::json!({"date": "2026-11-08", "week": "2026-11-08",
+            "answers": ["a", "b", "c", "d", "e"], "changelog": "new", "comparison": null});
+        a.store.kv_set("persona_probe_latest", latest.clone()).unwrap();
+        a.store.kv_set("persona_probe_baseline", Value::Null).unwrap();
+        let ctx = a.focus_ctx("telegram", "42", "42").unwrap();
+        for approve in [false, true] {
+            let item = judge::file(a.store.as_ref(), ReviewCategory::Verify, "probe", "pairs",
+                &judge::Judgement { verdict: judge::Verdict::Owner, reasons: "drift".into(), fixes: String::new(), urgent: false },
+                true, serde_json::json!({"persona_probe_week": "2026-11-08"})).unwrap();
+            a.run_command(if approve { "/approve" } else { "/reject" }, &item.id.to_string(), &ctx).await.unwrap();
+            assert_eq!(a.store.kv_get("persona_probe_baseline").unwrap(), Some(if approve { latest.clone() } else { Value::Null }));
+        }
     }
 
     #[test]
