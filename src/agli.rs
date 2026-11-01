@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::channels::{Envelope, Outlets};
 use crate::config::{AclCfg, Config, DebounceCfg, HandsCfg, SessionCfg};
@@ -588,9 +588,9 @@ impl Agli {
         let who = identify(&self.cfg.acl, &env);
         let group_key = env.group_key();
         if let Some(g) = &group_key {
-            if !self.cfg.social.groups.contains(g) {
+            if self.cfg.social.ignored_groups.contains(g) {
                 if self.ignored_logged.insert(g.clone()) {
-                    info!("ignoring group {g} (add it to config/social.yaml `groups` to let him join in)");
+                    debug!("ignoring group {g} (social.ignored_groups)");
                 }
                 return Ok(());
             }
@@ -651,6 +651,11 @@ impl Agli {
             ns: ctx.ns.clone(),
             scope: ctx.scope.clone(),
         })?;
+
+        // Read-only batches stop before flow, floor, unseen lines or any reply/command path.
+        if group_key.as_ref().is_some_and(|g| self.cfg.social.read_only_group(g)) {
+            return Ok(());
+        }
 
         if who.is_owner && !env.is_group {
             self.store.kv_set("owner_last_chat", json!({"platform": env.platform, "chat_id": env.chat_id}))?;
@@ -1376,6 +1381,7 @@ impl Agli {
     async fn extract_due(&mut self) -> Result<()> {
         let after = Utc::now() - chrono::Duration::days(2);
         for ns in self.store.active_namespaces(after)? {
+            if !self.cfg.social.reflects_normally(&ns) { continue }
             let since = reflect::watermark(self.store.as_ref(), &ns)?;
             if self.store.messages_after(&ns, since)?.len() >= self.cfg.runtime.memory.extract_after {
                 reflect::extract_ns(&self.models, self.store.as_ref(), &mut self.people, &ns).await?;
@@ -1388,6 +1394,7 @@ impl Agli {
     async fn extract_all(&mut self, window: chrono::Duration) -> Result<usize> {
         let mut n = 0;
         for ns in self.store.active_namespaces(Utc::now() - window)? {
+            if !self.cfg.social.reflects_normally(&ns) { continue }
             let o = reflect::extract_ns(&self.models, self.store.as_ref(), &mut self.people, &ns).await?;
             n += usize::from(o.messages > 0);
         }
@@ -1406,6 +1413,8 @@ impl Agli {
         }
         info!("going to sleep: reflecting on {date}");
         self.extract_all(chrono::Duration::days(2)).await?;
+        reflect::read_only_nightly(&self.models, self.store.as_ref(), &mut self.people, &self.cfg.social, date,
+            Utc::now() - chrono::Duration::days(2)).await?;
         crate::mind::knowledge::consolidate(&self.models, self.store.as_ref(), &self.cfg.work_dir(), &self.cfg.mind_dir().join("knowledge")).await?;
         let dir = self.cfg.mind_dir().join("life").join("journal");
         if let Some(path) = reflect::write_journal(&self.models, self.store.as_ref(), self.speaker.l1(), dir, date).await? {
@@ -2768,6 +2777,173 @@ mod tests {
             env.mentions_me = mention_first && i == 0;
             env
         }).collect()
+    }
+
+    #[tokio::test]
+    async fn read_only_group_batches_store_people_and_scope_without_replies_or_models() {
+        let mut test = TestAgli::new("read-only-group").await;
+        let a = &mut test.agli;
+        Arc::make_mut(&mut a.cfg).social.groups.clear();
+        a.models = Arc::new(Models::stub(a.store.clone(), vec![]));
+        a.test_chat = Some(TestChat::new(&[], &[]));
+        Arc::make_mut(&mut a.cfg).runtime.memory.extract_after = 1;
+        a.flow.enter(Namespace::Project("busy".into()), "t1", "busy", Utc::now());
+        for mentioned in [false, true] {
+            let batch = a.prepare_messages_with_triage(group_messages(&["/status", "<任务 code>do it</任务>", "hello"], mentioned),
+                |_| async { panic!("read-only group must never triage") }).await;
+            assert!(batch.ctx.is_none() && !batch.speak && !batch.consider);
+            assert_eq!(batch.current, 0);
+        }
+        a.on_messages(group_messages(&["@bot reply now"], true)).await.unwrap();
+        a.extract_due().await.unwrap();
+        let ns = Namespace::Group("telegram:-7".into());
+        let msgs = a.store.messages_after(&ns, DateTime::<Utc>::MIN_UTC).unwrap();
+        assert_eq!(msgs.len(), 7);
+        for m in &msgs {
+            assert_eq!(m.ns, ns);
+            assert_eq!(m.scope, Scope::Group { id: "telegram:-7".into() });
+            assert!(!m.outgoing);
+            let person = a.people.get(&m.sender).unwrap();
+            assert_eq!(person.tier, Tier::Groupmate);
+            assert_eq!(person.name, m.sender_name);
+        }
+        assert!(a.unseen.is_empty());
+        assert!(a.flow.exit(Utc::now()).pending.is_empty());
+        assert!(a.board().tasks().is_empty());
+        assert!(a.models.stub_prompts().is_empty());
+        assert!(a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().is_empty());
+        // None of the read-only messages advanced floor counters for a later allowlist edit.
+        Arc::make_mut(&mut a.cfg).social.groups.push("telegram:-7".into());
+        let batch = a.prepare_messages(group_messages(&["one", "two"], false)).await;
+        assert!(!batch.speak && !batch.consider);
+        assert!(a.prepare_messages(group_messages(&["three"], false)).await.consider);
+        assert!(a.prepare_messages(group_messages(&["addressed"], true)).await.speak);
+    }
+
+    #[tokio::test]
+    async fn ignored_groups_override_allowlist_without_storage_or_person_bookkeeping() {
+        let mut test = TestAgli::new("ignored-group").await;
+        let a = &mut test.agli;
+        Arc::make_mut(&mut a.cfg).social.ignored_groups.push("telegram:-7".into());
+        a.models = Arc::new(Models::stub(a.store.clone(), vec![]));
+        let before = a.store.persons().unwrap().len();
+        a.on_messages(group_messages(&["one", "two", "three"], true)).await.unwrap();
+        assert!(a.store.active_namespaces(DateTime::<Utc>::MIN_UTC).unwrap().is_empty());
+        assert_eq!(a.store.persons().unwrap().len(), before);
+        assert_eq!(a.ignored_logged.len(), 1);
+        assert!(a.speakers.is_empty() && a.unseen.is_empty());
+        assert!(a.models.stub_prompts().is_empty());
+    }
+
+    fn reflection_messages(a: &Agli, id: &str, count: usize) -> Vec<MessageRecord> {
+        let ns: Namespace = id.parse().unwrap();
+        let scope = match &ns {
+            Namespace::Group(id) => Scope::Group { id: id.clone() },
+            Namespace::Person(id) => Scope::Persons { ids: vec![id.clone()] },
+            _ => unreachable!(),
+        };
+        let start = Utc::now() - chrono::Duration::hours(1);
+        (0..count).map(|i| {
+            let m = MessageRecord {
+                ts: start + chrono::Duration::seconds(i as i64),
+                ns: ns.clone(), scope: scope.clone(), sender: "owner".into(), text: format!("[{id}-message-{i}]"),
+                ..private_record("owner", "42", "", false)
+            };
+            a.store.append_message(&m).unwrap();
+            m
+        }).collect()
+    }
+
+    #[tokio::test]
+    async fn nightly_reflection_prioritizes_reply_chats_then_samples_read_only_activity() {
+        let mut test = TestAgli::new("read-only-reflect-order").await;
+        let a = &mut test.agli;
+        let cfg = Arc::make_mut(&mut a.cfg);
+        cfg.runtime.mind_dir = test.dir.join("mind");
+        cfg.social.ignored_groups = vec!["telegram:ignored".into()];
+        cfg.social.read_only_reflect.max_messages_per_night = 3;
+        reflection_messages(a, "person/owner", 1);
+        reflection_messages(a, "group/telegram:-7", 1);
+        reflection_messages(a, "group/telegram:quiet", 2);
+        reflection_messages(a, "group/telegram:ignored", 20);
+        let busy = reflection_messages(a, "group/telegram:busy", 6);
+        let raw = json!({
+            "episodes": [{"summary": "group event", "participants": ["owner"], "salience": 0.5}],
+            "facts": [{"person": "owner", "text": "group fact"}],
+            "group": {"topics": ["group topic"]}
+        }).to_string();
+        a.models = Arc::new(Models::stub(a.store.clone(), vec!["{}".into(), "{}".into(), raw, "{}".into()]));
+        let date = reflect::diary_day(Local::now());
+        let after = Utc::now() - chrono::Duration::days(2);
+        assert_eq!(a.extract_all(chrono::Duration::days(2)).await.unwrap(), 2);
+        reflect::read_only_nightly(&a.models, a.store.as_ref(), &mut a.people, &a.cfg.social, date, after).await.unwrap();
+        let prompts = a.models.stub_prompts();
+        assert_eq!(prompts.len(), 3);
+        for (_, _, text) in &prompts[..2] {
+            assert!(text.contains("[person/owner-message-0]") || text.contains("[group/telegram:-7-message-0]"));
+        }
+        let text = &prompts[2].2;
+        for i in 0..6 {
+            assert_eq!(text.contains(&format!("[group/telegram:busy-message-{i}]")), [0, 2, 5].contains(&i));
+        }
+        assert_eq!(reflect::watermark(a.store.as_ref(), &busy[0].ns).unwrap(), busy[5].ts);
+        let group = a.store.group("telegram:busy").unwrap().unwrap();
+        assert_eq!(group.topics, ["group topic"]);
+        assert_eq!(group.activity_stats.messages, 3);
+        let episode = a.store.episodes().unwrap().pop().unwrap();
+        assert_eq!((episode.ns, episode.scope), (busy[0].ns.clone(), busy[0].scope.clone()));
+        let fact = &a.people.get("owner").unwrap().facts[0];
+        assert_eq!((&fact.ns, &fact.scope), (&busy[0].ns, &busy[0].scope));
+        // A repeated invocation cannot spend another quota; the next diary night can.
+        reflect::read_only_nightly(&a.models, a.store.as_ref(), &mut a.people, &a.cfg.social, date, after).await.unwrap();
+        assert_eq!(a.models.stub_prompts().len(), 3);
+        reflect::read_only_nightly(&a.models, a.store.as_ref(), &mut a.people, &a.cfg.social, date.succ_opt().unwrap(), after).await.unwrap();
+        assert!(a.models.stub_prompts()[3].2.contains("[group/telegram:quiet-message-0]"));
+        assert_eq!(reflect::watermark(a.store.as_ref(), &Namespace::Group("telegram:ignored".into())).unwrap(), DateTime::<Utc>::MIN_UTC);
+    }
+
+    #[tokio::test]
+    async fn read_only_cost_budget_covers_reviews_and_persists_after_failed_calls() {
+        let mut test = TestAgli::new("read-only-reflect-cost").await;
+        let a = &mut test.agli;
+        reflection_messages(a, "group/telegram:a", 3);
+        reflection_messages(a, "group/telegram:b", 2);
+        reflection_messages(a, "group/telegram:c", 1);
+        a.models = Arc::new(Models::stub(a.store.clone(), vec!["invalid JSON".into(),
+            json!({"lessons": [{"text": "general lesson", "shareable": true}]}).to_string()]));
+        a.models.stub_cost(0.05);
+        let date = reflect::diary_day(Local::now());
+        let after = Utc::now() - chrono::Duration::days(2);
+        reflect::read_only_nightly(&a.models, a.store.as_ref(), &mut a.people, &a.cfg.social, date, after).await.unwrap();
+        assert_eq!(a.models.stub_prompts().len(), 2);
+        assert_eq!(a.store.spent_since(after).unwrap(), 0.10);
+        assert!(a.models.stub_prompts()[0].2.contains("[group/telegram:a-message-0]"));
+        assert!(a.models.stub_prompts()[1].2.contains("[group/telegram:b-message-0]"));
+        let lessons = a.store.lessons().unwrap();
+        assert_eq!(lessons.len(), 1);
+        assert_eq!(lessons[0].scope, Scope::SelfOnly);
+        assert_eq!(a.store.reviews().unwrap()[0].status, ReviewStatus::Open);
+        // Recover the ledger from storage; failed JSON still cost money, so no retry tonight.
+        reflect::read_only_nightly(&a.models, a.store.as_ref(), &mut a.people, &a.cfg.social, date, after).await.unwrap();
+        assert_eq!(a.models.stub_prompts().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn read_only_zero_or_invalid_budgets_never_call_models() {
+        let mut test = TestAgli::new("read-only-reflect-zero").await;
+        let a = &mut test.agli;
+        let msgs = reflection_messages(a, "group/telegram:quiet", 3);
+        a.models = Arc::new(Models::stub(a.store.clone(), vec![]));
+        let date = reflect::diary_day(Local::now());
+        let after = Utc::now() - chrono::Duration::days(2);
+        for (messages, cost) in [(0, 0.1), (400, 0.0), (400, -1.0), (400, f64::NAN), (400, f64::INFINITY)] {
+            let cfg = &mut Arc::make_mut(&mut a.cfg).social.read_only_reflect;
+            cfg.max_messages_per_night = messages;
+            cfg.max_cost_usd = cost;
+            reflect::read_only_nightly(&a.models, a.store.as_ref(), &mut a.people, &a.cfg.social, date, after).await.unwrap();
+        }
+        assert!(a.models.stub_prompts().is_empty());
+        assert_eq!(reflect::watermark(a.store.as_ref(), &msgs[0].ns).unwrap(), DateTime::<Utc>::MIN_UTC);
     }
 
     #[tokio::test]
