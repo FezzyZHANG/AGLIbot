@@ -29,6 +29,34 @@ impl Drop for Fixture { fn drop(&mut self) { std::fs::remove_dir_all(&self.dir).
 fn ids(recall: &Recall) -> Vec<&str> { recall.episodes.iter().map(|e| e.id.as_str()).collect() }
 
 #[test]
+fn warm_source_cache_still_recomputes_semantics_and_scope() {
+    let f = Fixture::new("source-cache");
+    f.add(episode("x", "project/x", Scope::Public, 1.0), &[1.0, 0.0]);
+    f.add(episode("y", "project/y", Scope::Public, 1.0), &[0.0, 1.0]);
+    f.add(episode("secret", "person/a", Scope::Persons { ids: vec!["a".into()] }, 1.0), &[1.0, 0.0]);
+    let ns = "person/a".parse().unwrap();
+    let audience = Audience::private("a");
+    let mut q = Query { ns: &ns, audience: &audience, partners: &[], max_episodes: 3, max_facts: 0,
+        include_lessons: false, half_life_days: 30.0 };
+    let first = recall_semantic_at(&f.store, &q, &config(), &[1.0, 0.0], now()).unwrap();
+    assert_eq!(ids(&first), ["secret", "x"]);
+    let counts = f.store.recall_cache_counts();
+    let second = recall_semantic_at(&f.store, &q, &config(), &[0.0, 1.0], now()).unwrap();
+    assert_eq!(ids(&second), ["secret", "y"]);
+    assert_eq!(f.store.recall_cache_counts(), counts);
+    let group = Audience::group("g", ["a".into(), "b".into()]);
+    q.audience = &group;
+    let shared = recall_semantic_at(&f.store, &q, &config(), &[1.0, 0.0], now()).unwrap();
+    assert_eq!(ids(&shared), ["x"]);
+    let fresh = JsonlStore::open(&f.dir).unwrap();
+    assert_eq!(render(&shared), render(&recall_semantic_at(&fresh, &q, &config(), &[1.0, 0.0], now()).unwrap()));
+    assert_eq!(f.store.recall_cache_counts(), counts);
+    f.store.save_embedding(&EpisodeEmbedding { episode_id: "x".into(), model_id: config().model_id(), vector: vec![0.0, 1.0] }).unwrap();
+    assert!(recall_semantic_at(&f.store, &q, &config(), &[1.0, 0.0], now()).unwrap().episodes.is_empty());
+    assert!(f.store.recall_cache_counts().1 > counts.1);
+}
+
+#[test]
 fn cross_namespace_threshold_score_decay_and_total_cap() {
     let f = Fixture::new("rank");
     f.add(episode("own", "person/a", Scope::Public, 0.01), &[0.0, 1.0]);

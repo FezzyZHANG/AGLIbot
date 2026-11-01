@@ -505,7 +505,9 @@ impl Agli {
         people.ensure(store.as_ref(), &cfg.acl.owner.person_id, "主人", Tier::Owner)?;
         let mut flow = Flow::load(&cfg.data_dir());
         if flow.is_focused() {
-            flow.exit(Utc::now()); // a crash mid-task; the task itself is recovered from the board
+            let now = Utc::now();
+            crate::mind::flow_metrics::record(store.as_ref(), &cfg.models.models, &flow, now)?;
+            flow.exit(now); // a crash mid-task; the task itself is recovered from the board
         }
         let mut board = Board::load(&cfg.work_dir())?;
         let recovered = board.recover()?;
@@ -1281,7 +1283,7 @@ impl Agli {
             "/stop" => match self.stop_job().await {
                 Some(id) => {
                     self.board().set_status(&id, TaskStatus::Waiting, "主人让我停下")?;
-                    self.flow.exit(Utc::now());
+                    self.exit_flow();
                     self.catch_up_focus().await?;
                     format!("停了：{id}")
                 }
@@ -1291,7 +1293,7 @@ impl Agli {
                 self.store.kv_set("frozen", json!(true))?;
                 if let Some(id) = self.stop_job().await {
                     self.board().set_status(&id, TaskStatus::Waiting, "冻结")?;
-                    self.flow.exit(Utc::now());
+                    self.exit_flow();
                     self.catch_up_focus().await?;
                 }
                 "已冻结：不再主动找人、不开始任务、不动用工具。聊天照常。".into()
@@ -1380,6 +1382,7 @@ impl Agli {
         self.audit(&task.requester, &format!("delegate:{:?}", task.kind), true, &task.title, Outcome::Unknown)?;
         let ns = Namespace::Project(task.id.clone());
         self.flow.enter(ns, &task.id, &task.title, Utc::now());
+        self.models.focus_cache.set_active(true);
         let job = Job {
             models: self.models.clone(),
             store: self.store.clone(),
@@ -1394,11 +1397,20 @@ impl Agli {
         Ok(format!("开始做：{}", task.title))
     }
 
+    fn exit_flow(&mut self) -> crate::mind::flow::Exit {
+        let now = Utc::now();
+        if let Err(e) = crate::mind::flow_metrics::record(self.store.as_ref(), &self.cfg.models.models, &self.flow, now) {
+            warn!("failed to record focus cache metrics: {e:#}");
+        }
+        self.models.focus_cache.set_active(false);
+        self.flow.exit(now)
+    }
+
     async fn on_job_done(&mut self, o: research::Outcome) -> Result<()> {
         if self.job.as_ref().is_some_and(|job| job.id == o.task_id) {
             self.job = None;
         }
-        let exit = self.flow.exit(Utc::now());
+        let exit = self.exit_flow();
         let note = if let Some(reason) = &o.paused {
             reason.as_str()
         } else if o.clarification.is_some() { "等待主人澄清" } else if o.ok { "" } else { "出错，等主人看" };
@@ -1749,6 +1761,56 @@ impl Agli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn repeated_frame_reuses_recall_sources_and_writes_invalidate() {
+        use crate::store::{Episode, EpisodeEmbedding, Lesson};
+        let mut test = TestAgli::new("recall-cache").await;
+        let a = &mut test.agli;
+        let store = Arc::new(crate::store::jsonl::JsonlStore::open(&a.cfg.data_dir()).unwrap());
+        a.store = store.clone();
+        let ctx = a.prepare_messages(vec![private_message("42", "hello")]).await.ctx.unwrap();
+        let mut episode = Episode { id: "original".into(), ts: Utc::now(), participants: vec![],
+            summary: "cached memory".into(), emotion: String::new(), salience: 0.5,
+            ns: ctx.ns.clone(), scope: Scope::Public, sources: vec![] };
+        store.append_episode(&episode).unwrap();
+        let cold = a.frame(&ctx, 0, "").unwrap();
+        let counts = store.recall_cache_counts();
+        assert_eq!(a.frame(&ctx, 0, "").unwrap(), cold);
+        assert_eq!(store.recall_cache_counts(), counts);
+        assert!(cold.0.contains("cached memory"));
+        for mutation in 0..5 {
+            let before = store.recall_cache_counts();
+            match mutation {
+                0 => { episode.id = "new".into(); store.append_episode(&episode).unwrap(); }
+                1 => {
+                    episode.id = "archive".into();
+                    episode.sources = vec!["original".into(), "new".into()];
+                    store.archive_episode(&episode).unwrap();
+                }
+                2 => {
+                    let mut person = store.persons().unwrap().into_values().next().unwrap();
+                    person.facts.push(crate::store::Fact { text: "updated fact".into(), ns: ctx.ns.clone(),
+                        scope: Scope::Public, ts: Utc::now() });
+                    store.save_person(&person).unwrap();
+                }
+                3 => store.append_lesson(&Lesson { id: "lesson".into(), ts: Utc::now(), text: "lesson".into(),
+                    scope: Scope::Public, sources: vec![] }).unwrap(),
+                _ => store.save_embedding(&EpisodeEmbedding { episode_id: episode.id.clone(),
+                    model_id: "test".into(), vector: vec![1.0, 0.0] }).unwrap(),
+            }
+            assert!(store.recall_cache_counts().0 > before.0);
+            let result = a.frame(&ctx, 0, "").unwrap();
+            assert!(store.recall_cache_counts().1 > before.1);
+            let warm = store.recall_cache_counts();
+            assert_eq!(a.frame(&ctx, 0, "").unwrap(), result);
+            assert_eq!(store.recall_cache_counts(), warm);
+            // A fresh store provides the uncached reference without a production bypass.
+            a.store = Arc::new(crate::store::jsonl::JsonlStore::open(&a.cfg.data_dir()).unwrap());
+            assert_eq!(a.frame(&ctx, 0, "").unwrap(), result);
+            a.store = store.clone();
+        }
+    }
 
     fn session(quiet: u64, cap: u64) -> SessionCfg {
         SessionCfg {
@@ -2335,6 +2397,9 @@ mod tests {
             assert!(!a.flow.is_focused());
             assert!(a.focus_chats().unwrap().is_empty());
             assert_eq!(a.test_chat.as_ref().unwrap().turns.len(), 1);
+            let key = format!("daylog:{}", reflect::diary_day(Local::now()));
+            let notes: Vec<String> = serde_json::from_value(a.store.kv_get(&key).unwrap().unwrap()).unwrap();
+            assert_eq!(notes.iter().filter(|line| line.starts_with("flow cache metrics")).count(), 1);
             a.catch_up_focus().await.unwrap();
         }
     }
