@@ -22,6 +22,14 @@ pub struct Models {
     store: Arc<dyn Store>,
     budget: Mutex<Budget>,
     has_local: bool,
+    #[cfg(test)]
+    stub: Option<Mutex<Stub>>,
+}
+
+#[cfg(test)]
+struct Stub {
+    replies: std::collections::VecDeque<String>,
+    prompts: Vec<(String, ProcessingPolicy, String)>,
 }
 
 pub fn local_midnight_utc() -> DateTime<Utc> {
@@ -64,7 +72,26 @@ impl Models {
             .select("chat", &ProcessingPolicy::Any, false)
             .map_err(|e| anyhow!("没有可用的聊天模型，请在 .env 里配置至少一个提供商的密钥：{e}"))?;
         let budget = Budget::new(cfg.models.daily_budget_usd, store.spent_since(local_midnight_utc())?);
-        Ok(Models { router, llm, store, budget: Mutex::new(budget), has_local })
+        Ok(Models {
+            router, llm, store, budget: Mutex::new(budget), has_local,
+            #[cfg(test)]
+            stub: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn stub(store: Arc<dyn Store>, replies: Vec<String>) -> Self {
+        Self {
+            router: Router::new(vec![], Default::default()),
+            llm: LlmClient::new(Default::default()).unwrap(), store,
+            budget: Mutex::new(Budget::new(1.0, 0.0)), has_local: false,
+            stub: Some(Mutex::new(Stub { replies: replies.into(), prompts: vec![] })),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn stub_prompts(&self) -> Vec<(String, ProcessingPolicy, String)> {
+        self.stub.as_ref().unwrap().lock().unwrap().prompts.clone()
     }
 
     pub fn router(&self) -> &Router {
@@ -180,6 +207,12 @@ impl Models {
         system: &str,
         user: &str,
     ) -> Result<T> {
+        #[cfg(test)]
+        if let Some(stub) = &self.stub {
+            let mut stub = stub.lock().unwrap();
+            stub.prompts.push((scenario.into(), policy.clone(), user.into()));
+            return extract_json(&stub.replies.pop_front().expect("unexpected model call"));
+        }
         let model = self.pick(scenario, policy)?;
         let turns = [Turn::User(user.to_string())];
         let effort = self.effort(scenario);

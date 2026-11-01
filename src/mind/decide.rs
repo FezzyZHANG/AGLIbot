@@ -6,8 +6,10 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Local, NaiveTime, TimeZone, Utc};
 use serde::Deserialize;
 
+use super::commitments::{self, Commitment};
 use super::models::Models;
-use crate::ns::ProcessingPolicy;
+use crate::ns::{ProcessingPolicy, Scope};
+use crate::store::Store;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MoodShift {
@@ -46,10 +48,19 @@ pub enum Action {
 
 pub struct Situation {
     pub text: String,
+    /// Private solo-thinking material, never part of a chat frame.
+    pub commitments: Vec<Commitment>,
     /// Task ids he may start now (approved, not running, nothing else running).
     pub startable: Vec<String>,
     /// Whether starting a conversation with the owner is allowed right now.
     pub may_message_owner: bool,
+}
+
+impl Situation {
+    pub fn include_commitments(&mut self, store: &dyn Store, now: DateTime<Utc>, has_local: bool) -> Result<()> {
+        self.commitments = commitments::due_soon(store, now.with_timezone(&Local).date_naive(), has_local)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -99,14 +110,16 @@ pub async fn decide(models: &Models, policy: &ProcessingPolicy, l1: &str, s: &Si
         options.push(format!("\"work\"：开始做一件任务（target 写任务编号，可选：{}）", s.startable.join("、")));
     }
     let user = format!(
-        "（这不是聊天消息，是你自己在想接下来做什么。）\n\n{}\n\n## 可选的行动\n{}\n\n\
+        "（这不是聊天消息，是你自己在想接下来做什么。）\n\n{}\n\n## 临近或逾期的承诺（私人思考，披露仍受来源范围限制）\n{}\n\n## 可选的行动\n{}\n\n\
          像一个真实的人那样选：不必每次都做点什么，也可以推迟。\
          只输出一个 JSON 对象：{{\"action\": \"...\", \"target\": \"...或 null\", \"reason\": \"一句话\", \
          \"deferred\": [\"暂时放下的事\"], \"revisit_when\": \"多少分钟后再想，或 HH:MM，或 null\", \
          \"mood\": {{\"pleasure\": 0, \"arousal\": 0, \"dominance\": 0}}}}。mood 是这些情况让你心情变化的幅度（-0.3 到 0.3）。",
         s.text,
+        commitments::summary(&s.commitments),
         options.iter().map(|o| format!("- {o}")).collect::<Vec<_>>().join("\n")
     );
+    let policy = if s.commitments.iter().any(|c| c.scope == Scope::SelfOnly) { &ProcessingPolicy::LocalOnly } else { policy };
     models.ask_json("triage", policy, l1, &user).await
 }
 
@@ -153,7 +166,7 @@ mod tests {
 
     #[test]
     fn runtime_refuses_what_is_not_allowed() {
-        let s = Situation { text: String::new(), startable: vec!["t1".into()], may_message_owner: false };
+        let s = Situation { text: String::new(), commitments: vec![], startable: vec!["t1".into()], may_message_owner: false };
         assert_eq!(validate(&decision("message", Some("owner")), &s), Action::Nothing);
         assert_eq!(validate(&decision("work", Some("t2")), &s), Action::Nothing);
         assert_eq!(validate(&decision("work", Some("t1")), &s), Action::Work { task_id: "t1".into() });
