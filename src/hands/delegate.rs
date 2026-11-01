@@ -227,6 +227,7 @@ struct DshToolCall {
 
 #[derive(Default)]
 struct DshEvents {
+    model_id: Option<String>,
     text: Option<String>,
     session_id: Option<String>,
     usage: Option<DshUsage>,
@@ -263,6 +264,17 @@ impl DshEvents {
         let Ok(event) = serde_json::from_slice::<serde_json::Value>(line) else {
             return;
         };
+        // Future DSH versions may expose either a model string or a model object.
+        let model = &event["model"];
+        let name = model.as_str().or_else(|| model["model"].as_str()).or_else(|| model["id"].as_str());
+        if let Some(name) = name.map(str::trim).filter(|s| !s.is_empty()) {
+            let provider = model["provider"].as_str().or_else(|| event["provider"].as_str())
+                .map(str::trim).filter(|s| !s.is_empty());
+            self.model_id = Some(match provider {
+                Some(provider) if !name.contains('/') => format!("dsh:{provider}/{name}"),
+                _ => format!("dsh:{}", name.strip_prefix("dsh:").unwrap_or(name)),
+            });
+        }
         match event["type"].as_str() {
             Some("session") => {
                 if let Some(id) = event["sessionId"].as_str().filter(|s| valid_dsh_id(s)) {
@@ -386,20 +398,38 @@ fn dsh_command(executable: &std::ffi::OsStr, dir: &Path, profile: &str, resume: 
     Ok(cmd)
 }
 
+/// Resolve per invocation: profile edits take effect without restarting AGLI.
+fn dsh_profile_model(home: &Path, profile: &str) -> String {
+    let read = || -> Result<String> {
+        let bytes = std::fs::read(home.join("profiles").join(profile).join("cordis.patch.yml"))?;
+        let patch: serde_yaml::Value = serde_yaml::from_slice(&bytes)?;
+        let entry = patch.as_sequence().context("profile patch must be a sequence")?
+            .iter().find(|entry| entry["id"].as_str() == Some("agent-default-model"))
+            .context("agent-default-model missing")?;
+        let field = |key: &str| entry["config"][key].as_str().map(str::trim)
+            .filter(|s| !s.is_empty()).with_context(|| format!("agent-default-model {key} missing"));
+        Ok(format!("dsh:{}/{}", field("provider")?, field("model")?))
+    };
+    read().unwrap_or_else(|error| {
+        tracing::debug!("DSH profile {profile} model unavailable: {error:#}");
+        format!("dsh:profile:{profile}")
+    })
+}
+
 struct DshAudit<'a> {
     events: DshEvents,
     raw: std::fs::File,
     calls: std::fs::File,
     log: std::fs::File,
     store: &'a dyn Store,
-    profile: &'a str,
+    model_id: String,
     kind: &'a str,
     started: std::time::Instant,
     error: Option<String>,
 }
 
 impl<'a> DshAudit<'a> {
-    fn open(dir: &Path, store: &'a dyn Store, profile: &'a str, kind: &'a str) -> Result<Self> {
+    fn open(dir: &Path, store: &'a dyn Store, profile: &str, home: &Path, kind: &'a str) -> Result<Self> {
         let append = |name| std::fs::OpenOptions::new().create(true).append(true).open(dir.join(name));
         let mut raw = append("dsh-events.jsonl")?;
         // A cancelled invocation may have ended on a partial line. Keep the next run separate.
@@ -411,7 +441,7 @@ impl<'a> DshAudit<'a> {
             calls: append("dsh-tool-calls.jsonl")?,
             log: append("log.md")?,
             store,
-            profile,
+            model_id: dsh_profile_model(home, profile),
             kind,
             started: std::time::Instant::now(),
             error: Some("delegate cancelled".into()),
@@ -434,7 +464,7 @@ impl<'a> DshAudit<'a> {
         Some(ModelCallRecord {
             ts: chrono::Utc::now(),
             scenario: format!("dsh:{}", self.kind),
-            model_id: format!("dsh:profile:{}", self.profile),
+            model_id: self.events.model_id.clone().unwrap_or_else(|| self.model_id.clone()),
             session_id: self.events.session_id.clone().unwrap_or_default(),
             uncached_input: u.input.saturating_sub(u.cached),
             cached_input: u.cached,
@@ -514,7 +544,7 @@ async fn dsh_run(
     kind: &str,
 ) -> Result<DshOutput> {
     prepare_dsh_home(home)?;
-    let mut audit = DshAudit::open(dir, store, profile, kind)?;
+    let mut audit = DshAudit::open(dir, store, profile, home, kind)?;
     let result = async {
         run(cmd, Delegate::Dsh(home), prompt, timeout, |line| audit.line(line)).await?;
         if let Some(error) = &audit.events.error {
@@ -540,6 +570,46 @@ mod tests {
     const DSH_EVENTS: &str = include_str!("fixtures/dsh-events.jsonl");
     const DSH_ENV_KEYS: &[(&str, &str)] =
         &[("AGLI_DSH_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"), ("AGLI_DSH_BAILIAN_API_KEY", "DSH_BAILIAN_API_KEY")];
+
+    #[test]
+    fn dsh_profile_model_is_read_per_run_with_safe_fallbacks() {
+        let home = fixture_dir("profile-model");
+        assert_eq!(dsh_profile_model(&home, "agli"), "dsh:profile:agli");
+        let profile = home.join("profiles/agli");
+        std::fs::create_dir_all(&profile).unwrap();
+        let path = profile.join("cordis.patch.yml");
+        for invalid in ["[", "- id: unrelated", "- id: agent-default-model\n  config: {provider: bailian}"] {
+            std::fs::write(&path, invalid).unwrap();
+            assert_eq!(dsh_profile_model(&home, "agli"), "dsh:profile:agli");
+        }
+        std::fs::write(&path, "- id: agent-default-model\n  config: {provider: bailian, model: deepseek-v4.1-flash}").unwrap();
+        assert_eq!(dsh_profile_model(&home, "agli"), "dsh:bailian/deepseek-v4.1-flash");
+        std::fs::write(&path, "- id: agent-default-model\n  config: {provider: other, model: edited}").unwrap();
+        assert_eq!(dsh_profile_model(&home, "agli"), "dsh:other/edited");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn dsh_model_event_overrides_profile_in_record() {
+        let dir = fixture_dir("model-event");
+        let profile = dir.join("profiles/agli");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("cordis.patch.yml"),
+            "- id: agent-default-model\n  config: {provider: bailian, model: deepseek-v4.1-flash}").unwrap();
+        let store = crate::store::jsonl::JsonlStore::open(&dir.join("store")).unwrap();
+        {
+            let mut audit = DshAudit::open(&dir, &store, "agli", &dir, "test").unwrap();
+            audit.line(b"{\"type\":\"status\",\"phase\":\"step_end\",\"usage\":{\"inputTokens\":5,\"outputTokens\":2}}\n").unwrap();
+            assert_eq!(audit.record().unwrap().model_id, "dsh:bailian/deepseek-v4.1-flash");
+            audit.line(include_bytes!("fixtures/dsh-model-event.jsonl")).unwrap();
+            assert_eq!(audit.record().unwrap().model_id, "dsh:future/event-model");
+            audit.line(b"{\"type\":\"status\",\"model\":{\"provider\":\"other\",\"id\":\"object-model\"}}\n").unwrap();
+            assert_eq!(audit.record().unwrap().model_id, "dsh:other/object-model");
+            audit.line(b"{\"type\":\"text\",\"model\":42}\n").unwrap();
+            assert_eq!(audit.record().unwrap().model_id, "dsh:other/object-model");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn environment_names_follow_platform_case_rules() {

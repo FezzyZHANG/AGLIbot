@@ -516,6 +516,21 @@ impl Agli {
         })
     }
 
+    pub fn reload_config(&mut self, watcher: &mut crate::config_watch::ConfigWatcher) {
+        let before = self.cfg.clone();
+        if let Err(e) = watcher.poll(&mut self.cfg) {
+            warn!("config reload rejected; keeping running config: {e:#}");
+        }
+        if !Arc::ptr_eq(&before, &self.cfg) {
+            // Held flow messages must not revive an old permission after an allowlist edit.
+            let restricted: Vec<_> = self.unseen.keys().filter(|key| self.group_ctx(key).is_none()).cloned().collect();
+            for key in restricted {
+                self.unseen.remove(&key);
+                self.speakers.remove(&key);
+            }
+        }
+    }
+
     fn board(&self) -> std::sync::MutexGuard<'_, Board> {
         self.board.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1287,6 +1302,9 @@ impl Agli {
             _ => return None,
         };
         let g = format!("{platform}:{}", chat_id.trim_start_matches("group:"));
+        if !self.cfg.social.groups.contains(&g) || self.cfg.social.ignored_groups.contains(&g) {
+            return None;
+        }
         Some(ChatCtx {
             key: key.to_string(),
             platform,
@@ -2929,6 +2947,36 @@ mod tests {
             env.mentions_me = mention_first && i == 0;
             env
         }).collect()
+    }
+
+    #[tokio::test]
+    async fn config_hot_reload_accepts_new_groups_and_revokes_held_group_work() {
+        let fixture = crate::config_watch::tests::Fixture::new("inbound");
+        let mut test = TestAgli::new("hot-reload").await;
+        let a = &mut test.agli;
+        let cfg = Arc::make_mut(&mut a.cfg);
+        cfg.root = fixture.root.clone();
+        cfg.social = Config::load(&fixture.root).unwrap().social;
+        let mut watcher = crate::config_watch::ConfigWatcher::new(&a.cfg).unwrap();
+        assert!(!a.prepare_messages(group_messages(&["before"], true)).await.speak);
+        fixture.social("['telegram:-7', 'qq:123']", 70);
+        a.reload_config(&mut watcher);
+        assert!(!a.prepare_messages(group_messages(&["unstable"], true)).await.speak);
+        a.reload_config(&mut watcher);
+        assert!(a.prepare_messages(group_messages(&["after"], true)).await.speak);
+        assert!(a.group_ctx("qq:group:123").is_some());
+        assert!(a.unseen.contains_key("telegram:-7"));
+        fixture.write("social.yaml", "groups: [");
+        a.reload_config(&mut watcher);
+        a.reload_config(&mut watcher);
+        assert!(a.prepare_messages(group_messages(&["invalid edit keeps permission"], true)).await.speak);
+        fixture.social("[]", 70);
+        a.reload_config(&mut watcher);
+        a.reload_config(&mut watcher);
+        assert!(!a.unseen.contains_key("telegram:-7"));
+        assert!(a.group_ctx("telegram:-7").is_none());
+        assert!(a.group_ctx("qq:group:123").is_none());
+        assert!(!a.prepare_messages(group_messages(&["revoked"], true)).await.speak);
     }
 
     #[tokio::test]

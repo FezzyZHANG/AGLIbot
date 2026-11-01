@@ -1,6 +1,7 @@
 mod agli;
 mod channels;
 mod config;
+mod config_watch;
 mod hands;
 mod mind;
 mod ns;
@@ -59,6 +60,7 @@ async fn main() -> Result<()> {
 
     let root = std::env::var_os("AGLI_ROOT").map(PathBuf::from).unwrap_or(std::env::current_dir()?);
     let cfg = Arc::new(Config::load(&root)?);
+    let mut config_watcher = config_watch::ConfigWatcher::new(&cfg)?;
     let owner = &cfg.acl.owner;
     if owner.telegram_user_id == 0 && owner.qq_user_id == 0 {
         warn!("没有设置主人的 ID（OWNER_TELEGRAM_ID / OWNER_QQ_ID）：没人能使用主人权限，日志会打印发信人的 ID");
@@ -118,10 +120,13 @@ async fn main() -> Result<()> {
 
     let mut queued = WorkQueue::with_store(store.clone());
     let mut agli = Agli::new(cfg.clone(), store, models, outlets, events_tx)?;
+    let mut config_poll = tokio::time::interval(Duration::from_secs(2));
+    config_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     info!("AGLI is up");
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            _ = config_poll.tick() => agli.reload_config(&mut config_watcher),
             work = recv_work(&mut events, &mut queued, &cfg.acl, &cfg.runtime.session) => match work {
                 Some(work) => agli.handle(work).await,
                 None => break,
