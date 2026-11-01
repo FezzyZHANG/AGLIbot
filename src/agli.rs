@@ -59,6 +59,9 @@ pub struct WorkQueue {
     events: VecDeque<QueuedEvent>,
     chats: HashMap<String, ChatTiming>,
     store: Option<Arc<dyn Store>>,
+    /// The line logged for the latest batch; tests read it instead of capturing tracing output,
+    /// whose callsite cache and max level are shared across concurrently running tests.
+    last_batch: Option<String>,
 }
 
 struct QueuedEvent {
@@ -227,8 +230,12 @@ pub fn next_work(queue: &mut WorkQueue, acl: &AclCfg, session: &SessionCfg) -> O
                 else if let Some(ewma) = batch.window.ewma_ms {
                     format!("ewma={ewma:.1} x {} (clamped={})", cfg.factor, batch.window.clamped)
                 } else { "default".into() };
-            info!(chat_key = %format!("{}:{}", first.platform, first.chat_id), messages = messages.len() + 1,
-                window_ms = batch.window.ms, %basis, cap_ended = batch.cap_ended, "reply batch");
+            let line = format!(
+                "reply batch chat_key={}:{} messages={} window_ms={} basis={basis} cap_ended={}",
+                first.platform, first.chat_id, messages.len() + 1, batch.window.ms, batch.cap_ended
+            );
+            info!("{line}");
+            queue.last_batch = Some(line);
             messages.insert(0, first);
             WorkItem::Messages(messages)
         }
@@ -1348,17 +1355,6 @@ mod tests {
         value
     }
 
-    struct TestLog(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for TestLog {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-    }
-
     #[tokio::test(start_paused = true)]
     async fn debounce_gaps_use_arrival_time_not_dequeue_time() {
         let cfg = DebounceCfg::default();
@@ -1579,10 +1575,6 @@ mod tests {
         let acl = acl();
         let mut session = session(2500, 10000);
         session.debounce.adaptive = true;
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let sink = log.clone();
-        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
-            .with_max_level(tracing::Level::INFO).with_writer(move || TestLog(sink.clone())).finish();
         let (tx, mut rx) = mpsc::channel(16);
         let mut queue = WorkQueue::new();
         let started = Instant::now();
@@ -1599,15 +1591,10 @@ mod tests {
         assert!(poll_once(recv.as_mut()).is_pending());
         tokio::time::advance(Duration::from_millis(1)).await;
         tx.try_send(inbound("42", "next batch", "10")).unwrap();
-        tracing::subscriber::with_default(subscriber, || {
-            // Another test may already have cached this callsite as uninteresting without a subscriber.
-            tracing::callsite::rebuild_interest_cache();
-            assert_eq!(texts(ready(recv.as_mut()).unwrap()), (0..10).map(|i| i.to_string()).collect::<Vec<_>>());
-        });
+        assert_eq!(texts(ready(recv.as_mut()).unwrap()), (0..10).map(|i| i.to_string()).collect::<Vec<_>>());
         drop(recv);
         assert_eq!(Instant::now() - started, Duration::from_secs(10));
-        let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
-        assert_eq!(logged.lines().count(), 1);
+        let logged = queue.last_batch.take().expect("batch line");
         for field in ["reply batch", "chat_key=telegram:42", "messages=10", "window_ms=2500",
             "basis=ewma=1000.0 x 2.5 (clamped=false)", "cap_ended=true"] {
             assert!(logged.contains(field), "{logged}");
