@@ -5,7 +5,7 @@
 //! privacy-filtered recall → speak → store. Ticks advance state and wake `decide` only when
 //! something changed; nothing-changed ticks make no model calls.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -486,7 +486,7 @@ pub struct Agli {
     state: MindState,
     appraisals: ConversationAppraisals,
     board: Arc<Mutex<Board>>,
-    job: Option<RunningJob>,
+    jobs: BTreeMap<String, RunningJob>,
     /// Group lines he has not yet "read" into his session, per chat key.
     unseen: HashMap<String, Vec<String>>,
     /// Recent speakers per group chat key, for the audience and recall.
@@ -523,7 +523,7 @@ impl Agli {
             state,
             appraisals: ConversationAppraisals::default(),
             board: Arc::new(Mutex::new(board)),
-            job: None,
+            jobs: BTreeMap::new(),
             unseen: HashMap::new(),
             speakers: HashMap::new(),
             deliveries: Vec::new(),
@@ -1270,7 +1270,7 @@ impl Agli {
                     self.flow.title.clone().unwrap_or_else(|| "无".into()),
                     self.frozen(),
                     self.models.pick("chat", &ProcessingPolicy::Any).map(|m| m.id).unwrap_or_else(|e| e.to_string()),
-                )
+                ) + &if self.cfg.runtime.hands.max_jobs > 1 { format!("\n运行任务：{}", self.running_jobs()) } else { String::new() }
             }
             "/board" => self.board().summary(),
             "/task" | "/code" if !arg.is_empty() => {
@@ -1279,21 +1279,26 @@ impl Agli {
                 self.wake_decide = true;
                 format!("记下了：{}", t.id)
             }
-            "/run" if !arg.is_empty() => self.start_job(arg)?,
-            "/stop" => match self.stop_job().await {
-                Some(id) => {
-                    self.board().set_status(&id, TaskStatus::Waiting, "主人让我停下")?;
-                    self.exit_flow();
+            "/run" if !arg.is_empty() => self.start_job_with_owner_slot(arg, ctx.owner_private())?,
+            "/stop" => match self.stop_jobs().await {
+                ids if !ids.is_empty() => {
+                    for id in &ids { self.board().set_status(id, TaskStatus::Waiting, "主人让我停下")?; }
+                    if self.cfg.runtime.hands.max_jobs == 1 || self.flow.task_id.as_ref().is_some_and(|id| ids.contains(id)) {
+                        self.exit_flow();
+                    }
                     self.catch_up_focus().await?;
-                    format!("停了：{id}")
+                    format!("停了：{}", ids.join("、"))
                 }
-                None => "现在没在做任务。".into(),
+                _ => "现在没在做任务。".into(),
             },
             "/freeze" => {
                 self.store.kv_set("frozen", json!(true))?;
-                if let Some(id) = self.stop_job().await {
-                    self.board().set_status(&id, TaskStatus::Waiting, "冻结")?;
-                    self.exit_flow();
+                let ids = self.stop_jobs().await;
+                if !ids.is_empty() {
+                    for id in &ids { self.board().set_status(id, TaskStatus::Waiting, "冻结")?; }
+                    if self.cfg.runtime.hands.max_jobs == 1 || self.flow.task_id.as_ref().is_some_and(|id| ids.contains(id)) {
+                        self.exit_flow();
+                    }
                     self.catch_up_focus().await?;
                 }
                 "已冻结：不再主动找人、不开始任务、不动用工具。聊天照常。".into()
@@ -1374,11 +1379,24 @@ impl Agli {
     // ---------------------------------------------------------------- work
 
     fn start_job(&mut self, task_id: &str) -> Result<String> {
+        self.start_job_with_owner_slot(task_id, false)
+    }
+
+    fn start_job_with_owner_slot(&mut self, task_id: &str, owner_run: bool) -> Result<String> {
         if self.frozen() {
             return Ok("冻结中，不开始任务。".into());
         }
-        if let Some(running) = &self.job {
+        let max = self.cfg.runtime.hands.max_jobs;
+        // Keep the default single-worker command behavior exactly as before.
+        if max == 1 && let Some(running) = self.jobs.values().next() {
             return Ok(format!("正在做 {}，一次只做一件。", running.id));
+        }
+        if self.jobs.contains_key(task_id) {
+            return Ok(format!("正在做 {task_id}，不能重复开始。"));
+        }
+        let limit = max.saturating_add(usize::from(owner_run && max > 1));
+        if self.jobs.len() >= limit {
+            return Ok(format!("任务槽位已满，正在做：{}。", self.running_jobs()));
         }
         let task = self.board().get(task_id).cloned().ok_or_else(|| anyhow::anyhow!("没有任务 {task_id}"))?;
         if task.status != TaskStatus::Inbox && task.status != TaskStatus::Waiting {
@@ -1387,8 +1405,10 @@ impl Agli {
         self.board().set_status(&task.id, TaskStatus::Active, "")?;
         self.audit(&task.requester, &format!("delegate:{:?}", task.kind), true, &task.title, Outcome::Unknown)?;
         let ns = Namespace::Project(task.id.clone());
-        self.flow.enter(ns, &task.id, &task.title, Utc::now());
-        self.models.focus_cache.set_active(true);
+        if max == 1 || (!self.flow.is_focused() && (self.jobs.is_empty() || owner_run)) {
+            self.flow.enter(ns, &task.id, &task.title, Utc::now());
+            self.models.focus_cache.set_active(true);
+        }
         let job = Job {
             models: self.models.clone(),
             store: self.store.clone(),
@@ -1398,7 +1418,7 @@ impl Agli {
             task: task.clone(),
         };
         let log_path = self.board().task_dir(&task.id).join("log.md");
-        self.job = Some(RunningJob::spawn(task.id.clone(), log_path, self.events.clone(), research::run(job)));
+        self.jobs.insert(task.id.clone(), RunningJob::spawn(task.id.clone(), log_path, self.events.clone(), research::run(job)));
         info!("started task {}", task.id);
         Ok(format!("开始做：{}", task.title))
     }
@@ -1413,10 +1433,15 @@ impl Agli {
     }
 
     async fn on_job_done(&mut self, o: research::Outcome) -> Result<()> {
-        if self.job.as_ref().is_some_and(|job| job.id == o.task_id) {
-            self.job = None;
-        }
-        let exit = self.exit_flow();
+        let job = self.jobs.remove(&o.task_id);
+        let exit = if self.cfg.runtime.hands.max_jobs == 1 || self.flow.task_id.as_deref() == Some(&o.task_id) {
+            self.exit_flow()
+        } else {
+            crate::mind::flow::Exit {
+                minutes: job.map_or(0, |j| (j.started.elapsed().as_secs() / 60) as i64),
+                pending: BTreeMap::new(),
+            }
+        };
         let note = if let Some(reason) = &o.paused {
             reason.as_str()
         } else if o.clarification.is_some() { "等待主人澄清" } else if o.ok { "" } else { "出错，等主人看" };
@@ -1445,28 +1470,55 @@ impl Agli {
         Ok(())
     }
 
-    async fn stop_job(&mut self) -> Option<String> {
-        let job = self.job.as_ref()?;
+    fn running_jobs(&self) -> String {
+        self.jobs.keys().map(|id| {
+            let mode = if self.flow.task_id.as_ref() == Some(id) { "专注" } else { "后台" };
+            format!("{id}（{mode}）")
+        }).collect::<Vec<_>>().join("、")
+    }
+
+    async fn stop_job_by_id(&mut self, id: &str) -> Option<String> {
+        let job = self.jobs.get(id)?;
         if job.handle.is_finished() || job.terminal_claimed.swap(true, Ordering::AcqRel) { return None }
-        let job = self.job.take().unwrap();
+        let job = self.jobs.remove(id).unwrap();
         job.handle.abort();
         // Wait for delegate's process-tree guard and audit cleanup before changing task state.
         let _ = job.handle.await;
         Some(job.id)
     }
 
+    async fn stop_jobs(&mut self) -> Vec<String> {
+        let ids: Vec<_> = self.jobs.keys().cloned().collect();
+        let mut stopped = Vec::new();
+        for id in ids {
+            if let Some(id) = self.stop_job_by_id(&id).await { stopped.push(id); }
+        }
+        stopped
+    }
+
+    #[cfg(test)]
+    async fn stop_job(&mut self) -> Option<String> {
+        let id = self.jobs.keys().next()?.clone();
+        self.stop_job_by_id(&id).await
+    }
+
     async fn watchdog(&mut self) -> Result<()> {
-        let Some(reason) = self.job.as_mut().and_then(|job| job.overdue(Instant::now(), &self.cfg.runtime.hands)) else { return Ok(()) };
-        let Some(id) = self.stop_job().await else { return Ok(()) };
-        let task = self.board().get(&id).cloned().ok_or_else(|| anyhow::anyhow!("没有任务 {id}"))?;
-        let j = judge::Judgement { verdict: judge::Verdict::Owner, reasons: reason.clone(), fixes: String::new(), urgent: true };
-        let detail = format!("{reason}。已保存断点，任务尚未完成；可用 /run {id} 继续。");
-        let item = judge::file(self.store.as_ref(), ReviewCategory::Act, &task.title, &detail, &j, false,
-            json!({"task_id": id, "watchdog": true}))?;
-        self.on_job_done(research::Outcome {
-            task_id: id, title: task.title, ok: false, clarification: None,
-            paused: Some(reason.clone()), summary: reason, verdict: Some(format!("#{} {}", item.id, j.verdict.zh())),
-        }).await
+        let overdue: Vec<_> = self.jobs.iter_mut().filter_map(|(id, job)| {
+            job.overdue(Instant::now(), &self.cfg.runtime.hands).map(|reason| (id.clone(), reason))
+        }).collect();
+        for (id, reason) in overdue {
+            let Some(id) = self.stop_job_by_id(&id).await else { continue };
+            let task = self.board().get(&id).cloned().ok_or_else(|| anyhow::anyhow!("没有任务 {id}"))?;
+            let j = judge::Judgement { verdict: judge::Verdict::Owner, reasons: reason.clone(), fixes: String::new(), urgent: true };
+            let detail = format!("{reason}。已保存断点，任务尚未完成；可用 /run {id} 继续。");
+            let item = judge::file(self.store.as_ref(), ReviewCategory::Act, &task.title, &detail, &j, false,
+                json!({"task_id": id, "watchdog": true}))?;
+            self.on_job_done(research::Outcome {
+                task_id: id, title: task.title, ok: false, clarification: None,
+                paused: Some(reason.clone()), summary: reason, verdict: Some(format!("#{} {}", item.id, j.verdict.zh())),
+            }).await?;
+        }
+        Ok(())
     }
 
     fn group_ctx(&self, key: &str) -> Option<ChatCtx> {
@@ -1572,7 +1624,7 @@ impl Agli {
             self.extract_due().await?;
         }
         watchlist::render_view(self.store.as_ref(), &self.cfg.mind_dir())?;
-        let watch_due = self.job.is_none() && self.state.revisit_at.is_none()
+        let watch_due = self.jobs.len() < self.cfg.runtime.hands.max_jobs && self.state.revisit_at.is_none()
             && !watchlist::due(self.store.as_ref(), &self.board(), now)?.is_empty();
         let revisit = self.state.revisit_at.is_some_and(|t| t <= now);
         let drive = changes.iter().any(|c| matches!(c, Change::DriveHigh(_)));
@@ -1698,12 +1750,12 @@ impl Agli {
         let owner_known = self.owner_ctx().is_some();
         let quiet_since_owner = self.state.last_owner_contact.is_none_or(|t| now - t >= chrono::Duration::hours(1));
         let may_message_owner = owner_known && quiet_since_owner && self.state.last_proactive.is_none_or(|t| now - t >= gap);
-        let startable: Vec<String> = if self.job.is_some() {
+        let startable: Vec<String> = if self.jobs.len() >= self.cfg.runtime.hands.max_jobs {
             Vec::new()
         } else {
             self.board().tasks().iter().filter(|t| t.status == TaskStatus::Inbox).map(|t| t.id.clone()).collect()
         };
-        let watchlist = if self.job.is_none() { watchlist::due(self.store.as_ref(), &self.board(), now)? } else { vec![] };
+        let watchlist = if self.jobs.len() < self.cfg.runtime.hands.max_jobs { watchlist::due(self.store.as_ref(), &self.board(), now)? } else { vec![] };
         if !may_message_owner && watchlist.is_empty() && startable.is_empty() && self.state.revisit_at.is_none() {
             // Nothing he could do anyway; don't spend a call.
             return Ok(());
@@ -2727,7 +2779,7 @@ mod tests {
         }).to_string()]));
         a.think(now).await.unwrap();
         // Current-thread runtime: abort the queued worker before yielding; no external executor runs.
-        let job = a.job.take().expect("approved watchlist task should start");
+        let job = a.jobs.pop_first().expect("approved watchlist task should start").1;
         job.handle.abort();
         let prompts = a.models.stub_prompts();
         assert_eq!(prompts.len(), 1);
@@ -2780,11 +2832,158 @@ mod tests {
         assert!(!body.contains("report.md"));
     }
 
+    // Use the real admission and focus path, then replace the worker before yielding so
+    // these tests never invoke an external executor.
+    fn start_slot(a: &mut Agli, owner_run: bool) -> crate::work::board::Task {
+        let task = a.board().add("slot", TaskKind::Research, "owner", TaskStatus::Inbox, None).unwrap();
+        assert_eq!(a.start_job_with_owner_slot(&task.id, owner_run).unwrap(), "开始做：slot");
+        let job = a.jobs.remove(&task.id).unwrap();
+        job.handle.abort();
+        a.jobs.insert(task.id.clone(), RunningJob::spawn(task.id.clone(), job.log_path, a.events.clone(), std::future::pending()));
+        task
+    }
+
+    #[tokio::test]
+    async fn default_slots_preserve_second_start_refusal() {
+        let mut test = TestAgli::new("slots-default").await;
+        let a = &mut test.agli;
+        assert_eq!(a.cfg.runtime.hands.max_jobs, 1);
+        let first = start_slot(a, false);
+        let next = a.board().add("next", TaskKind::Research, "owner", TaskStatus::Inbox, None).unwrap();
+        let refusal = format!("正在做 {}，一次只做一件。", first.id);
+        assert_eq!(a.start_job(&next.id).unwrap(), refusal);
+        assert_eq!(a.start_job_with_owner_slot(&next.id, true).unwrap(), refusal);
+        assert_eq!(a.start_job(&first.id).unwrap(), refusal);
+        assert_eq!(a.board().get(&next.id).unwrap().status, TaskStatus::Inbox);
+        assert_eq!(a.flow.task_id.as_ref(), Some(&first.id));
+        a.stop_jobs().await;
+    }
+
+    #[tokio::test]
+    async fn parallel_slots_owner_extra_and_commands() {
+        let mut test = TestAgli::new("slots-owner").await;
+        let a = &mut test.agli;
+        Arc::get_mut(&mut a.cfg).unwrap().runtime.hands.max_jobs = 2;
+        let first = start_slot(a, false);
+        let second = start_slot(a, false);
+        assert_eq!(a.flow.task_id.as_ref(), Some(&first.id));
+        let next = a.board().add("next", TaskKind::Research, "owner", TaskStatus::Inbox, None).unwrap();
+        assert!(a.start_job(&next.id).unwrap().contains("槽位已满"));
+        assert!(a.start_job(&second.id).unwrap().contains("不能重复"));
+        let ctx = a.focus_ctx("telegram", "42", "42").unwrap();
+        let mut non_owner = a.focus_ctx("telegram", "42", "42").unwrap();
+        non_owner.partner = None;
+        assert!(a.run_command("/run", &next.id, &non_owner).await.unwrap().contains("槽位已满"));
+        assert_eq!(a.run_command("/run", &next.id, &ctx).await.unwrap(), "开始做：next");
+        // Cancel before any yield to the newly spawned real worker.
+        a.jobs.get(&next.id).unwrap().handle.abort();
+        assert_eq!(a.jobs.len(), 3);
+        assert!(a.start_job_with_owner_slot("fourth", true).unwrap().contains("槽位已满"));
+        let status = a.run_command("/status", "", &ctx).await.unwrap();
+        for id in [&first.id, &second.id, &next.id] { assert!(status.contains(id)); }
+        assert!(status.contains("专注") && status.contains("后台"));
+        a.stop_jobs().await;
+    }
+
+    #[tokio::test]
+    async fn only_owner_run_refocuses_while_background_work_remains() {
+        let mut test = TestAgli::new("slots-refocus").await;
+        let a = &mut test.agli;
+        Arc::get_mut(&mut a.cfg).unwrap().runtime.hands.max_jobs = 2;
+        a.state.energy.asleep = true;
+        let first = start_slot(a, false);
+        let background = start_slot(a, false);
+        a.stop_job_by_id(&first.id).await.unwrap();
+        a.on_job_done(research::Outcome { task_id: first.id, title: first.title, ok: true,
+            summary: "done".into(), clarification: None, paused: None, verdict: None }).await.unwrap();
+        let automatic = start_slot(a, false);
+        assert!(!a.flow.is_focused());
+        let owner = start_slot(a, true);
+        assert_eq!(a.flow.task_id.as_ref(), Some(&owner.id));
+        assert!(a.jobs.contains_key(&background.id) && a.jobs.contains_key(&automatic.id));
+        a.stop_jobs().await;
+    }
+
+    #[tokio::test]
+    async fn parallel_stop_and_freeze_cancel_every_worker() {
+        for command in ["/stop", "/freeze"] {
+            let mut test = TestAgli::new(&format!("slots-{}", &command[1..])).await;
+            let a = &mut test.agli;
+            Arc::get_mut(&mut a.cfg).unwrap().runtime.hands.max_jobs = 2;
+            let first = start_slot(a, false);
+            let second = start_slot(a, false);
+            let ctx = a.focus_ctx("telegram", "42", "42").unwrap();
+            let reply = a.run_command(command, "", &ctx).await.unwrap();
+            assert!(a.jobs.is_empty() && !a.flow.is_focused());
+            for id in [&first.id, &second.id] {
+                assert_eq!(a.board().get(id).unwrap().status, TaskStatus::Waiting);
+                if command == "/stop" { assert!(reply.contains(id)); }
+            }
+            assert_eq!(a.frozen(), command == "/freeze");
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_completions_keep_focus_independent_and_deliver_once() {
+        for background_first in [false, true] {
+            let mut test = TestAgli::new(&format!("slots-complete-{background_first}")).await;
+            let a = &mut test.agli;
+            Arc::get_mut(&mut a.cfg).unwrap().runtime.hands.max_jobs = 2;
+            a.state.energy.asleep = true;
+            let first = start_slot(a, false);
+            let second = start_slot(a, false);
+            let order = if background_first { [&second, &first] } else { [&first, &second] };
+            let (tx, mut rx) = mpsc::channel(2);
+            for (i, task) in order.iter().enumerate() {
+                let old = a.jobs.remove(&task.id).unwrap();
+                old.handle.abort();
+                let outcome = research::Outcome { task_id: task.id.clone(), title: task.title.clone(), ok: true,
+                    summary: "done".into(), clarification: None, paused: None, verdict: None };
+                a.jobs.insert(task.id.clone(), RunningJob::spawn(task.id.clone(), old.log_path, tx.clone(), async { outcome }));
+                let Some(Event::JobDone(o)) = rx.recv().await else { panic!("missing completion") };
+                a.on_job_done(o).await.unwrap();
+                assert_eq!(a.jobs.len(), 1 - i);
+                assert_eq!(a.deliveries.len(), i + 1);
+                assert_eq!(a.flow.is_focused(), background_first && i == 0);
+            }
+            assert!(rx.try_recv().is_err());
+            assert_ne!(a.deliveries[0].task_id, a.deliveries[1].task_id);
+            a.store.kv_set("owner_last_chat", json!({"platform": "telegram", "chat_id": "42"})).unwrap();
+            a.store.kv_set("frozen", json!(true)).unwrap();
+            a.test_chat = Some(TestChat::new(&["完成一", "完成二"], &[Outcome::Sent, Outcome::Sent]));
+            wake(a).await;
+            wake(a).await;
+            assert!(a.deliveries.is_empty());
+            assert_eq!(a.test_chat.as_ref().unwrap().turns.len(), 2);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parallel_watchdog_times_out_jobs_individually() {
+        let mut test = TestAgli::new("slots-watchdog").await;
+        let a = &mut test.agli;
+        Arc::get_mut(&mut a.cfg).unwrap().runtime.hands.max_jobs = 2;
+        a.state.energy.asleep = true;
+        let first = start_slot(a, false);
+        tokio::time::advance(Duration::from_secs(10 * 60)).await;
+        let second = start_slot(a, false);
+        tokio::time::advance(Duration::from_secs(10 * 60)).await;
+        a.watchdog().await.unwrap();
+        assert!(!a.flow.is_focused());
+        assert!(!a.jobs.contains_key(&first.id) && a.jobs.contains_key(&second.id));
+        tokio::time::advance(Duration::from_secs(10 * 60)).await;
+        a.watchdog().await.unwrap();
+        a.watchdog().await.unwrap();
+        assert!(a.jobs.is_empty());
+        assert_eq!(a.store.reviews().unwrap().len(), 2);
+        for id in [&first.id, &second.id] { assert_eq!(a.board().get(id).unwrap().status, TaskStatus::Waiting); }
+    }
+
     fn fake_job(a: &mut Agli) -> crate::work::board::Task {
         let task = a.board().add("watchdog", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
         let log_path = a.board().task_dir(&task.id).join("log.md");
         a.flow.enter(Namespace::Project(task.id.clone()), &task.id, &task.title, Utc::now());
-        a.job = Some(RunningJob::spawn(task.id.clone(), log_path, a.events.clone(), std::future::pending()));
+        a.jobs.insert(task.id.clone(), RunningJob::spawn(task.id.clone(), log_path, a.events.clone(), std::future::pending()));
         a.state.energy.asleep = true;
         task
     }
@@ -2801,7 +3000,7 @@ mod tests {
         }
         let cleaned = Arc::new(AtomicBool::new(false));
         let guard = Cleanup(cleaned.clone());
-        let job = a.job.as_mut().unwrap();
+        let job = a.jobs.values_mut().next().unwrap();
         job.handle.abort();
         job.handle = tokio::spawn(async move {
             let _guard = guard;
@@ -2810,14 +3009,14 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(20 * 60 - 1)).await;
         a.watchdog().await.unwrap();
-        assert!(a.job.is_some());
+        assert!(!a.jobs.is_empty());
         tokio::time::advance(Duration::from_secs(1)).await;
         a.store.kv_set("frozen", json!(true)).unwrap();
         a.store.kv_set("owner_last_chat", json!({"platform": "telegram", "chat_id": "42"})).unwrap();
         a.test_chat = Some(TestChat::new(&[], &[Outcome::Sent]));
         wake(a).await; // Exercise the actual tick and existing wake delivery path.
         assert!(cleaned.load(Ordering::Acquire));
-        assert!(a.job.is_none() && !a.flow.is_focused());
+        assert!(a.jobs.is_empty() && !a.flow.is_focused());
         let saved = a.board().get(&task.id).unwrap().clone();
         assert_eq!(saved.status, TaskStatus::Waiting);
         assert!(saved.note.contains("20 分钟没有增长"));
@@ -2846,11 +3045,11 @@ mod tests {
             }).unwrap();
             a.watchdog().await.unwrap();
             if minute < 90 {
-                assert!(a.job.is_some());
+                assert!(!a.jobs.is_empty());
                 assert!(a.deliveries.is_empty());
             }
         }
-        assert!(a.job.is_none());
+        assert!(a.jobs.is_empty());
         assert!(a.deliveries.is_empty());
         let reviews = a.store.reviews().unwrap();
         assert_eq!(reviews.len(), 1);
@@ -2874,11 +3073,11 @@ mod tests {
             tokio::time::advance(Duration::from_secs(10 * 60)).await;
             a.watchdog().await.unwrap();
             if !missing {
-                assert!(a.job.is_some());
+                assert!(!a.jobs.is_empty());
                 tokio::time::advance(Duration::from_secs(10 * 60)).await;
                 a.watchdog().await.unwrap();
             }
-            assert!(a.job.is_none());
+            assert!(a.jobs.is_empty());
             assert!(a.deliveries.is_empty());
             let reviews = a.store.reviews().unwrap();
             assert_eq!(reviews.len(), 1);
@@ -2898,16 +3097,16 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(1);
             if blocked_send { tx.try_send(Event::Tick).unwrap() }
             let (finish, result) = tokio::sync::oneshot::channel();
-            a.job = Some(RunningJob::spawn(task.id.clone(), log_path.clone(), tx, async { result.await.unwrap() }));
+            a.jobs.insert(task.id.clone(), RunningJob::spawn(task.id.clone(), log_path.clone(), tx, async { result.await.unwrap() }));
             tokio::time::advance(Duration::from_secs(90 * 60)).await;
             // Completion wins after timeout detection, before the cancellation claim.
-            assert!(a.job.as_mut().unwrap().overdue(Instant::now(), &a.cfg.runtime.hands).is_some());
+            assert!(a.jobs.values_mut().next().unwrap().overdue(Instant::now(), &a.cfg.runtime.hands).is_some());
             finish.send(research::Outcome {
                 task_id: task.id.clone(), title: task.title, ok: true, clarification: None,
                 paused: None, summary: "完成".into(), verdict: None,
             }).unwrap();
             tokio::task::yield_now().await;
-            assert_eq!(a.job.as_ref().unwrap().handle.is_finished(), !blocked_send);
+            assert_eq!(a.jobs.values().next().unwrap().handle.is_finished(), !blocked_send);
             assert!(a.stop_job().await.is_none());
             a.watchdog().await.unwrap();
             assert_eq!(a.board().get(&task.id).unwrap().status, TaskStatus::Active);
@@ -2918,7 +3117,7 @@ mod tests {
             a.state.energy.asleep = true;
             a.on_job_done(o).await.unwrap();
             a.watchdog().await.unwrap();
-            assert!(a.job.is_none());
+            assert!(a.jobs.is_empty());
             assert_eq!(a.board().get(&task.id).unwrap().status, TaskStatus::Done);
             assert_eq!(a.deliveries.len(), 1);
             assert!(a.deliveries[0].paused.is_none());
@@ -2936,7 +3135,7 @@ mod tests {
         a.watchdog().await.unwrap();
         assert_eq!(std::fs::read_to_string(log_path).unwrap(), before);
         assert_eq!(a.board().get(&task.id).unwrap().status, TaskStatus::Waiting);
-        assert!(a.job.is_none() && a.deliveries.is_empty());
+        assert!(a.jobs.is_empty() && a.deliveries.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

@@ -310,6 +310,8 @@ pub enum DelegateTool {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct HandsCfg {
+    #[serde(default = "default_max_jobs", deserialize_with = "positive_max_jobs")]
+    pub max_jobs: usize,
     #[serde(default)]
     pub research: DelegateTool,
     pub code: DelegateTool,
@@ -323,6 +325,14 @@ pub struct HandsCfg {
     pub stall_minutes: u64,
     #[serde(default = "default_total_budget_minutes")]
     pub total_budget_minutes: u64,
+}
+
+fn default_max_jobs() -> usize { 1 }
+
+fn positive_max_jobs<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<usize, D::Error> {
+    let value = usize::deserialize(deserializer)?;
+    if value == 0 { return Err(serde::de::Error::custom("hands.max_jobs must be >= 1")) }
+    Ok(value)
 }
 
 fn default_stall_minutes() -> u64 { 20 }
@@ -557,6 +567,16 @@ mod tests {
             "min_ms: 0", "min_ms: 7000", "max_ms: 10001", "cap_ms: 0"] {
             let cfg: DebounceCfg = serde_yaml::from_str(yaml).unwrap();
             assert!(cfg.validate().is_err(), "{yaml}");
+        }
+    }
+
+    #[test]
+    fn hands_slots_default_and_positive_validation() {
+        let yaml = "code: off\ncodex_model: test\ntimeout_min: 1\n";
+        assert_eq!(serde_yaml::from_str::<HandsCfg>(yaml).unwrap().max_jobs, 1);
+        assert_eq!(serde_yaml::from_str::<HandsCfg>(&format!("{yaml}max_jobs: 3")).unwrap().max_jobs, 3);
+        for invalid in ["0", "-1", "1.5"] {
+            assert!(serde_yaml::from_str::<HandsCfg>(&format!("{yaml}max_jobs: {invalid}")).is_err());
         }
     }
 
