@@ -1,22 +1,45 @@
 ---
 id: "n-agli-asm-dsh-apikeyenv"
-title: "DSH model providers read their key from a profile-configurable apiKeyEnv"
+title: "The agli profile's Bailian provider entry reads its key only from DSH_BAILIAN_API_KEY"
 kind: "assumption"
-state: "proposed"
+state: "adopted"
 relations: [{"type": "assumes", "target": "ticket:46"}, {"type": "assumes", "target": "ticket:25"}, {"type": "relates", "target": "note:n-agli-q-dsh-tokens"}, {"type": "relates", "target": "note:n-agli-q-dsh-search"}]
-abstract_zh: "待核实：Astra 静态查看已安装的 DSH CLI 0.2.1-rc.5 后认为，模型服务商的 key 变量名可在 profile 里用 apiKeyEnv 配置。#46 据此让 AGLI 把 AGLI_DSH_BAILIAN_API_KEY 改名为 DSH_BAILIAN_API_KEY 只传给 DSH，agli profile 的百炼服务商写 apiKeyEnv: DSH_BAILIAN_API_KEY。尚未实际运行验证。"
-abstract_en: "To verify: from static inspection of the installed DSH CLI 0.2.1-rc.5, Astra concluded that a model provider's key variable is configurable per profile via apiKeyEnv. #46 relies on it: AGLI renames AGLI_DSH_BAILIAN_API_KEY to DSH_BAILIAN_API_KEY for the dsh child only, and the agli profile's Bailian provider sets apiKeyEnv: DSH_BAILIAN_API_KEY. Not exercised live."
+abstract_zh: "前提：agli profile 里百炼 provider 条目（qwen-token-plan-cn）设 apiKeyEnv: DSH_BAILIAN_API_KEY 后，DSH 只从子进程环境的这个名字取 key，缺键即失败而不回退。已由 2026-11-02 对 0.2.1-rc.5 的假 key 实测支持（n-ev-dsh-apikeyenv-live）。前提是 agli 基于 headless、不挂 credentials 服务；DSH 升级或 profile 基座变化时重验。"
+abstract_en: "Premise: with apiKeyEnv: DSH_BAILIAN_API_KEY on the agli profile's Bailian provider entry, DSH reads the key only from that child-env name and fails rather than falling back. Supported by 2026-11-02 fake-key runs on 0.2.1-rc.5, assuming a headless base with no credentials service; re-verify on DSH upgrades or base changes."
+adopted_digest: "ff643ebbe3d56c6cfd1152fdbb06c48e6805e9b94c287239d572aa4f62fbf579"
 ---
-Source: Astra's #46 implementation report (2026-11-01), static reading of the installed CLI and a disposable-DSH_HOME config dump; no live DSH run, no key involved.
+Claim: in the `agli` profile, the Bailian provider entry `llm-pi-ai.providers.qwen-token-plan-cn`
+sets `apiKeyEnv: DSH_BAILIAN_API_KEY`. DSH then authenticates that route only from
+`DSH_BAILIAN_API_KEY` in its launch environment, and a missing key fails the run with
+`MISSING_CREDENTIAL`; it never falls back to `BAILIAN_API_KEY`, the ambient default
+`QWEN_TOKEN_PLAN_CN_API_KEY`, or another provider. Profile text: docs/DSH.md, ticket 46 section.
 
-What depends on it:
-- #46 maps AGLI_DSH_BAILIAN_API_KEY (in AGLI's .env, LocalOnly to AGLI except for the dsh executor) to DSH_BAILIAN_API_KEY in the dsh child's environment.
-- The proposed agli profile (docs/DSH.md) sets the Bailian provider's `apiKeyEnv: DSH_BAILIAN_API_KEY`, so it never reads AGLI's own BAILIAN_API_KEY.
-- Search is separate: DEEPSEEK_API_KEY for deepseek-official web_search (n-agli-q-dsh-search) is assumed to be read under that fixed name.
+Scope: only the model key. Search reading `DEEPSEEK_API_KEY` is configuration in stock
+`dsh-base` (docs/DSH.md), not part of this premise; see n-agli-q-dsh-search.
 
-How to verify (before enabling hands.research: dsh):
-1. `dsh --profile agli --dump-config` (disposable DSH_HOME if dumps write) shows the Bailian provider with apiKeyEnv: DSH_BAILIAN_API_KEY and the model in use is that provider.
-2. A minimal live headless run with only DSH_BAILIAN_API_KEY and DEEPSEEK_API_KEY in the child env (AGLI's BAILIAN_API_KEY absent) succeeds; with DSH_BAILIAN_API_KEY removed it fails with a missing-key error, not by silently falling back to another variable or provider.
-3. The --json usage events attribute the run to the Bailian provider.
+What depends on it: #46 forwards `AGLI_DSH_BAILIAN_API_KEY` as `DSH_BAILIAN_API_KEY` to the dsh
+child only and keeps AGLI's own `BAILIAN_API_KEY` LocalOnly.
 
-If refuted: fall back to the provider's default variable name and make the rename in #46 target it, keeping the key Providers{dsh}-only.
+Conditions (each was true in the supporting runs; changing one reopens this note):
+- Verified binary: `C:/dev/DSH/resources/runtime/cli/bin/dsh.cmd`, 0.2.1-rc.5, 2026-11-02.
+  `AGLI_DSH_BIN` must point there, or the note is re-verified against the actual launcher.
+- The profile is based on `headless`, where `credentials` (dsh-credentials-local) is disabled.
+  If mounted, a record stored under `DSH_BAILIAN_API_KEY` in `$DSH_HOME/.credentials.yaml`
+  would win over the child env, and the "key exists only in the child env" isolation no longer holds.
+- `.env` files cannot supply the key: DSH rejects `DSH_*` names in project and home `.env`.
+
+Evidence: n-ev-dsh-apikeyenv-live (fake-key runs A–D and static resolution order).
+
+How to re-verify (no real key needed): with a disposable DSH_HOME holding the `agli` profile,
+run `dsh --profile agli --json -` under `env -i` (1) with decoy `BAILIAN_API_KEY` and
+`QWEN_TOKEN_PLAN_CN_API_KEY` but no target, expecting `MISSING_CREDENTIAL` naming
+`DSH_BAILIAN_API_KEY`; (2) with a fake target, expecting Bailian 401. `--dump-config` must show
+the patch and `credentials` disabled. `--json` events carry no provider, so attribution comes
+from the error, not usage events.
+
+If refuted (for example an upgrade drops `apiKeyEnv` or reinstates ambient fallback): treat it as
+a key-isolation failure, not just a rename. Retarget #46 to the provider's ambient name
+(currently `QWEN_TOKEN_PLAN_CN_API_KEY`). The delegate starts from an empty environment, so an
+ambient copy is already dropped; keep that name out of `DELEGATE_ENV_ALLOWLIST`, extend the #46
+tests so only the dedicated source populates it, and keep a test that a missing
+dedicated key fails the DSH run instead of succeeding on another key.
