@@ -8,6 +8,7 @@ mod social;
 mod store;
 mod work;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,11 +17,26 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use agli::{Agli, Event};
+use agli::{Agli, Event, WorkItem, next_work};
 use channels::Outlets;
 use channels::telegram::Telegram;
 use config::Config;
 use mind::models::Models;
+
+async fn recv_work(events: &mut mpsc::Receiver<Event>, queued: &mut VecDeque<Event>, acl: &config::AclCfg) -> Option<WorkItem> {
+    let ev = match queued.pop_front() {
+        Some(ev) => ev,
+        None => events.recv().await?,
+    };
+    let inbound = matches!(ev, Event::Inbound(_));
+    queued.push_front(ev);
+    if inbound {
+        while let Ok(ev) = events.try_recv() {
+            queued.push_back(ev);
+        }
+    }
+    next_work(queued, acl)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -91,12 +107,13 @@ async fn main() -> Result<()> {
     }
 
     let mut agli = Agli::new(cfg.clone(), store, models, outlets, events_tx)?;
+    let mut queued = VecDeque::new();
     info!("AGLI is up");
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            ev = events.recv() => match ev {
-                Some(ev) => agli.handle(ev).await,
+            work = recv_work(&mut events, &mut queued, &cfg.acl) => match work {
+                Some(work) => agli.handle(work).await,
                 None => break,
             },
         }

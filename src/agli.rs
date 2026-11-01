@@ -5,7 +5,7 @@
 //! privacy-filtered recall → speak → store. Ticks advance state and wake `decide` only when
 //! something changed; nothing-changed ticks make no model calls.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::channels::{Envelope, Outlets};
-use crate::config::Config;
+use crate::config::{AclCfg, Config};
 use crate::mind::context::{RecapLine, build_l1, build_l2, read_opt, tail, user_turn};
 use crate::mind::decide::{self, Action, Situation};
 use crate::mind::flow::{Bucket, Flow};
@@ -40,6 +40,40 @@ pub enum Event {
     Inbound(Envelope),
     Tick,
     JobDone(research::Outcome),
+}
+
+pub enum WorkItem {
+    Messages(Vec<Envelope>),
+    Tick,
+    JobDone(research::Outcome),
+}
+
+fn owner_command(acl: &AclCfg, env: &Envelope) -> bool {
+    !env.is_group && env.text.trim_start().starts_with('/') && identify(acl, env).is_owner
+}
+
+/// Take the next consecutive chat batch, leaving every boundary in arrival order.
+pub fn next_work(events: &mut VecDeque<Event>, acl: &AclCfg) -> Option<WorkItem> {
+    Some(match events.pop_front()? {
+        Event::Inbound(first) => {
+            let mut messages = Vec::new();
+            if !owner_command(acl, &first) {
+                while let Some(Event::Inbound(next)) = events.front() {
+                    if next.platform != first.platform || next.chat_id != first.chat_id
+                        || next.is_group != first.is_group || owner_command(acl, next)
+                    {
+                        break;
+                    }
+                    let Some(Event::Inbound(next)) = events.pop_front() else { unreachable!() };
+                    messages.push(next);
+                }
+            }
+            messages.insert(0, first);
+            WorkItem::Messages(messages)
+        }
+        Event::Tick => WorkItem::Tick,
+        Event::JobDone(o) => WorkItem::JobDone(o),
+    })
 }
 
 /// What a reply asked the runtime to do, parsed out of the text.
@@ -101,6 +135,15 @@ struct ChatCtx {
     is_group: bool,
     /// The person addressed in a private chat.
     partner: Option<Who>,
+}
+
+#[derive(Default)]
+struct ReplyBatch {
+    ctx: Option<ChatCtx>,
+    lines: Vec<String>,
+    current: usize,
+    speak: bool,
+    consider: bool,
 }
 
 impl ChatCtx {
@@ -211,11 +254,11 @@ impl Agli {
         self.store.kv_get("frozen").ok().flatten().and_then(|v| v.as_bool()).unwrap_or(false)
     }
 
-    pub async fn handle(&mut self, ev: Event) {
+    pub async fn handle(&mut self, ev: WorkItem) {
         let result = match ev {
-            Event::Inbound(env) => self.on_message(env).await,
-            Event::Tick => self.on_tick().await,
-            Event::JobDone(o) => self.on_job_done(o).await,
+            WorkItem::Messages(messages) => self.on_messages(messages).await,
+            WorkItem::Tick => self.on_tick().await,
+            WorkItem::JobDone(o) => self.on_job_done(o).await,
         };
         if let Err(e) = result {
             error!("{e:#}");
@@ -227,7 +270,32 @@ impl Agli {
 
     // ---------------------------------------------------------------- messages
 
-    async fn on_message(&mut self, env: Envelope) -> Result<()> {
+    async fn prepare_messages(&mut self, messages: Vec<Envelope>) -> ReplyBatch {
+        let mut batch = ReplyBatch::default();
+        for env in messages {
+            if let Err(e) = self.on_message(env, &mut batch).await {
+                error!("{e:#}");
+            }
+        }
+        batch
+    }
+
+    async fn on_messages(&mut self, messages: Vec<Envelope>) -> Result<()> {
+        let batch = self.prepare_messages(messages).await;
+        let Some(ctx) = batch.ctx else { return Ok(()) };
+        if batch.speak {
+            if ctx.is_group {
+                self.converse_group(&ctx, false).await?;
+            } else {
+                self.converse(&ctx, batch.lines.join("\n"), batch.current, false).await?;
+            }
+        } else if batch.consider {
+            self.consider_group(&ctx).await?;
+        }
+        Ok(())
+    }
+
+    async fn on_message(&mut self, env: Envelope, batch: &mut ReplyBatch) -> Result<()> {
         let now = Utc::now();
         let who = identify(&self.cfg.acl, &env);
         let group_key = env.group_key();
@@ -297,7 +365,7 @@ impl Agli {
         if who.is_owner && !env.is_group {
             self.store.kv_set("owner_last_chat", json!({"platform": env.platform, "chat_id": env.chat_id}))?;
             self.state.talked_with_owner(now);
-            if env.text.trim_start().starts_with('/') {
+            if owner_command(&self.cfg.acl, &env) {
                 let reply = self.command(env.text.trim(), &ctx).await;
                 return self.send_plain(&ctx, &reply).await;
             }
@@ -310,7 +378,14 @@ impl Agli {
         let asleep = self.state.energy.asleep;
         let line = format!("{}：{}", self.people.name_of(&who.person_id), env.text);
 
+        // Store and account for each message first; reply once using the last message's thread.
+        batch.current += 1;
+        batch.ctx = Some(ctx);
+        let ctx = batch.ctx.as_ref().unwrap();
+
         if !ctx.is_group {
+            let label = if who.is_owner { "主人".to_string() } else { self.people.name_of(&who.person_id) };
+            batch.lines.push(format!("{label}：{}", env.text));
             if asleep && !who.is_owner {
                 // Nobody wakes him but the owner; the message is kept for his memory.
                 info!("asleep: not replying to {} now", who.person_id);
@@ -320,8 +395,8 @@ impl Agli {
                 info!("reply cap reached for {} in {}", who.person_id, ctx.key);
                 return Ok(());
             }
-            let label = if who.is_owner { "主人".to_string() } else { self.people.name_of(&who.person_id) };
-            return self.converse(&ctx, format!("{label}：{}", env.text), 1, false).await;
+            batch.speak = true;
+            return Ok(());
         }
 
         self.unseen.entry(ctx.key.clone()).or_default().push(line);
@@ -330,12 +405,12 @@ impl Agli {
         match self.floor.on_group_message(&self.cfg.social, &ctx.key, addressed, busy, now) {
             FloorDecision::Speak => {
                 if self.floor.allow_reply(&self.cfg.social, &ctx.key, &who.person_id, who.is_agent, now) {
-                    self.converse_group(&ctx, false).await?;
+                    batch.speak = true;
                 } else {
                     info!("reply cap reached for {} in {}", who.person_id, ctx.key);
                 }
             }
-            FloorDecision::Consider => self.consider_group(&ctx).await?,
+            FloorDecision::Consider => batch.consider = true,
             FloorDecision::Silent(_) => {}
         }
         Ok(())
@@ -943,6 +1018,242 @@ impl Agli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn acl() -> AclCfg {
+        let mut acl: AclCfg = serde_yaml::from_str(include_str!("../config/acl.yaml")).unwrap();
+        acl.owner.telegram_user_id = 42;
+        acl.owner.qq_user_id = 42;
+        acl.known_agents.clear();
+        acl
+    }
+
+    fn inbound(chat: &str, text: &str, id: &str) -> Event {
+        Event::Inbound(Envelope {
+            platform: "telegram", chat_id: chat.into(), message_id: Some(id.into()),
+            sender_id: "42".into(), sender_name: "主人".into(), sender_is_bot: false,
+            is_group: false, mentions_me: false, text: text.into(),
+        })
+    }
+
+    fn messages(work: WorkItem) -> Vec<Envelope> {
+        let WorkItem::Messages(messages) = work else { panic!("expected messages") };
+        messages
+    }
+
+    fn texts(work: WorkItem) -> Vec<String> {
+        messages(work).into_iter().map(|m| m.text).collect()
+    }
+
+    #[test]
+    fn batching_preserves_interleaved_chats_and_platforms() {
+        let mut other_platform = inbound("42", "qq", "5");
+        if let Event::Inbound(env) = &mut other_platform {
+            env.platform = "qq";
+        }
+        let mut queue = VecDeque::from([
+            inbound("42", "a1", "1"), inbound("42", "a2", "2"),
+            inbound("7", "b", "3"), inbound("42", "a3", "4"), other_platform,
+        ]);
+        let acl = acl();
+        for expected in [vec!["a1", "a2"], vec!["b"], vec!["a3"], vec!["qq"]] {
+            assert_eq!(texts(next_work(&mut queue, &acl).unwrap()), expected);
+        }
+        assert!(next_work(&mut queue, &acl).is_none());
+    }
+
+    #[test]
+    fn batching_keeps_owner_commands_separate_in_arrival_order() {
+        let mut queue = VecDeque::from([
+            inbound("42", "before", "1"), inbound("42", "  /status", "2"),
+            inbound("42", "/tasks", "3"), inbound("42", "after", "4"), inbound("42", "also", "5"),
+        ]);
+        let acl = acl();
+        for expected in [vec!["before"], vec!["  /status"], vec!["/tasks"], vec!["after", "also"]] {
+            assert_eq!(texts(next_work(&mut queue, &acl).unwrap()), expected);
+        }
+        assert!(queue.is_empty());
+        let Event::Inbound(mut env) = inbound("42", "/status", "6") else { unreachable!() };
+        env.sender_is_bot = true;
+        assert!(!owner_command(&acl, &env));
+        env.sender_is_bot = false;
+        env.is_group = true;
+        assert!(!owner_command(&acl, &env)); // Group slash text was never a command.
+    }
+
+    #[test]
+    fn batching_preserves_tick_and_job_done_boundaries() {
+        let outcome = research::Outcome {
+            task_id: "task-1".into(), title: "done".into(), ok: true,
+            summary: "result".into(), verdict: None,
+        };
+        let mut queue = VecDeque::from([
+            inbound("42", "before tick", "1"), Event::Tick, inbound("42", "after tick", "2"),
+            Event::JobDone(outcome), inbound("42", "after job", "3"),
+        ]);
+        let acl = acl();
+        assert_eq!(texts(next_work(&mut queue, &acl).unwrap()), ["before tick"]);
+        assert!(matches!(next_work(&mut queue, &acl), Some(WorkItem::Tick)));
+        assert_eq!(texts(next_work(&mut queue, &acl).unwrap()), ["after tick"]);
+        let Some(WorkItem::JobDone(o)) = next_work(&mut queue, &acl) else { panic!("lost job result") };
+        assert_eq!((o.task_id.as_str(), o.summary.as_str()), ("task-1", "result"));
+        assert_eq!(texts(next_work(&mut queue, &acl).unwrap()), ["after job"]);
+        assert!(queue.is_empty());
+    }
+
+    struct TestAgli {
+        agli: Agli,
+        dir: std::path::PathBuf,
+    }
+
+    impl TestAgli {
+        async fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("aglibot-test-batch-{name}-{}", std::process::id()));
+            let mut cfg = Config {
+                root: dir.clone(), acl: acl(),
+                models: serde_yaml::from_str(include_str!("../config/models.yaml")).unwrap(),
+                scenarios: serde_yaml::from_str(include_str!("../config/scenarios.yaml")).unwrap(),
+                channels: serde_yaml::from_str(include_str!("../config/channels.yaml")).unwrap(),
+                social: serde_yaml::from_str(include_str!("../config/social.yaml")).unwrap(),
+                runtime: serde_yaml::from_str(include_str!("../config/runtime.yaml")).unwrap(),
+            };
+            cfg.runtime.mind_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("mind");
+            cfg.runtime.data_dir = "data".into();
+            cfg.runtime.work_dir = "work".into();
+            cfg.social.groups = vec!["telegram:-7".into()];
+            cfg.social.floor.check_every = 3;
+            cfg.social.human_limit.max_replies = 10;
+            cfg.social.human_limit.window_min = 10;
+            // Preparation never calls a model. No credentials, probes or live providers are used.
+            cfg.models.providers = std::collections::BTreeMap::from([("test".into(), crate::config::ProviderCfg {
+                kind: crate::config::ProviderKind::OpenaiCompat, base_url: None,
+                base_url_env: None, api_key_env: None,
+            })]);
+            cfg.models.models.truncate(1);
+            let m = &mut cfg.models.models[0];
+            m.provider = "test".into();
+            m.local = false;
+            m.q = 100.0;
+            let store = Arc::new(crate::store::jsonl::JsonlStore::open(&cfg.data_dir()).unwrap());
+            let models = Arc::new(Models::new(&cfg, store.clone()).await.unwrap());
+            let (tx, _) = mpsc::channel(16);
+            let mut agli = Agli::new(Arc::new(cfg), store, models, Outlets::default(), tx).unwrap();
+            agli.state.energy.asleep = false;
+            Self { agli, dir }
+        }
+    }
+
+    impl Drop for TestAgli {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn three_queued_owner_messages_prepare_one_turn_and_keep_individual_records() {
+        let mut test = TestAgli::new("owner").await;
+        let a = &mut test.agli;
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut queue = VecDeque::new();
+        tx.try_send(inbound("42", "earlier turn", "0")).unwrap();
+        let in_flight = crate::recv_work(&mut rx, &mut queue, &a.cfg.acl).await.unwrap();
+        assert_eq!(texts(in_flight), ["earlier turn"]);
+        // While that turn is handled, these three messages arrive without another receive.
+        for ev in [inbound("42", "先查方案 A", "1"), inbound("42", "再对比方案 B", "2"), inbound("42", "给我结论", "3")] {
+            tx.try_send(ev).unwrap();
+        }
+        drop(tx);
+        let work = crate::recv_work(&mut rx, &mut queue, &a.cfg.acl).await.unwrap();
+        let batch = a.prepare_messages(messages(work)).await;
+        assert!(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl).await.is_none());
+        assert!(queue.is_empty());
+        assert!(batch.speak && !batch.consider);
+        assert_eq!(batch.current, 3);
+        assert_eq!(batch.lines.join("\n"), "主人：先查方案 A\n主人：再对比方案 B\n主人：给我结论");
+        let ctx = batch.ctx.unwrap();
+        assert_eq!(ctx.thread_ref().message_id.as_deref(), Some("3"));
+        let saved = a.store.recent_in_ns(&ctx.ns, 10).unwrap();
+        assert_eq!(saved.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["先查方案 A", "再对比方案 B", "给我结论"]);
+        assert!(saved.iter().all(|m| !m.outgoing));
+        assert!(a.people.get("owner").is_some());
+        assert!(a.state.last_owner_contact.is_some());
+        assert_eq!(a.store.kv_get("owner_last_chat").unwrap().unwrap()["chat_id"], "42");
+        let (frame, _) = a.frame(&ctx, batch.current, "").unwrap();
+        assert!(!frame.contains("先查方案 A") && !frame.contains("给我结论"));
+        let task = a.board().add("研究", TaskKind::Research, "owner", TaskStatus::Inbox, Some(ctx.thread_ref())).unwrap();
+        let mut intent = parse_intent(&format!("<补充 任务=\"{}\">补充条件</补充>", task.id));
+        attach_followups(&mut a.board(), &ctx, &mut intent);
+        assert_eq!(a.board().get(&task.id).unwrap().origin, Some(ctx.thread_ref()));
+        assert_eq!(a.board().get(&task.id).unwrap().threads, [ctx.thread_ref()]);
+    }
+
+    #[tokio::test]
+    async fn newly_arrived_messages_join_the_next_queued_batch_after_a_boundary() {
+        let acl = acl();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut queue = VecDeque::new();
+        for ev in [inbound("42", "first", "1"), Event::Tick, inbound("42", "second", "2")] {
+            tx.try_send(ev).unwrap();
+        }
+        assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl).await.unwrap()), ["first"]);
+        tx.try_send(inbound("42", "third", "3")).unwrap();
+        drop(tx);
+        assert!(matches!(crate::recv_work(&mut rx, &mut queue, &acl).await, Some(WorkItem::Tick)));
+        assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl).await.unwrap()), ["second", "third"]);
+        assert!(crate::recv_work(&mut rx, &mut queue, &acl).await.is_none());
+    }
+
+    fn group_messages(texts: &[&str], mention_first: bool) -> Vec<Envelope> {
+        texts.iter().enumerate().map(|(i, text)| {
+            let Event::Inbound(mut env) = inbound("-7", text, &i.to_string()) else { unreachable!() };
+            env.is_group = true;
+            env.sender_id = (100 + i).to_string();
+            env.sender_name = format!("member-{i}");
+            env.mentions_me = mention_first && i == 0;
+            env
+        }).collect()
+    }
+
+    #[tokio::test]
+    async fn group_batch_observes_every_speaker_and_keeps_an_earlier_mention() {
+        let mut test = TestAgli::new("group").await;
+        let a = &mut test.agli;
+        let batch = a.prepare_messages(group_messages(&["hello", "context", "question"], true)).await;
+        assert!(batch.speak);
+        let ctx = batch.ctx.unwrap();
+        assert_eq!(ctx.message_id.as_deref(), Some("2"));
+        assert_eq!(a.unseen[&ctx.key], ["member-0：hello", "member-1：context", "member-2：question"]);
+        assert_eq!(a.store.recent_in_ns(&ctx.ns, 10).unwrap().len(), 3);
+        assert_eq!(a.speakers[&ctx.key], ["telegram:100", "telegram:101", "telegram:102"]);
+        for id in &a.speakers[&ctx.key] {
+            assert!(a.people.get(id).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn group_lurking_counter_sees_each_message_in_each_batch() {
+        let mut test = TestAgli::new("lurking").await;
+        let a = &mut test.agli;
+        let first = a.prepare_messages(group_messages(&["one", "two"], false)).await;
+        assert!(!first.speak && !first.consider);
+        let second = a.prepare_messages(group_messages(&["three", "four"], false)).await;
+        assert!(!second.speak && second.consider);
+        assert_eq!(a.unseen["telegram:-7"].len(), 4);
+    }
+
+    #[tokio::test]
+    async fn reply_caps_still_run_per_message_without_losing_batch_text() {
+        let mut test = TestAgli::new("cap").await;
+        let a = &mut test.agli;
+        Arc::make_mut(&mut a.cfg).social.human_limit.max_replies = 1;
+        let mut queue = VecDeque::from([inbound("42", "one", "1"), inbound("42", "two", "2"), inbound("42", "three", "3")]);
+        let batch = a.prepare_messages(messages(next_work(&mut queue, &a.cfg.acl).unwrap())).await;
+        assert!(batch.speak);
+        assert_eq!(batch.lines, ["主人：one", "主人：two", "主人：three"]);
+        let Event::Inbound(next) = inbound("42", "four", "4") else { unreachable!() };
+        let next = a.prepare_messages(vec![next]).await;
+        assert!(!next.speak);
+        assert_eq!(a.store.recent_in_ns(&next.ctx.unwrap().ns, 10).unwrap().len(), 4);
+    }
 
     fn owner_chat() -> ChatCtx {
         ChatCtx {
