@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -16,6 +16,7 @@ use super::board::{Board, Task, TaskKind, TaskStatus};
 use super::resume::{self, Uncertain};
 use crate::config::{DelegateTool, HandsCfg};
 use crate::hands::delegate;
+use crate::mind::decide::{self, Reflection, ReflectionAction};
 use crate::mind::judge::{self, Verdict};
 use crate::mind::models::Models;
 use crate::ns::ProcessingPolicy;
@@ -37,6 +38,8 @@ pub struct Outcome {
     pub ok: bool,
     /// A successful planning pause, not a failed or completed research task.
     pub clarification: Option<String>,
+    /// A successful flow switch, with work saved for a later run.
+    pub paused: Option<String>,
     /// Plain facts for the owner; the mind rephrases them in his voice.
     pub summary: String,
     pub verdict: Option<String>,
@@ -44,7 +47,7 @@ pub struct Outcome {
 
 impl Outcome {
     pub fn status(&self) -> TaskStatus {
-        if self.ok && self.clarification.is_none() { TaskStatus::Done } else { TaskStatus::Waiting }
+        if self.ok && self.clarification.is_none() && self.paused.is_none() { TaskStatus::Done } else { TaskStatus::Waiting }
     }
 }
 
@@ -86,6 +89,7 @@ pub async fn run(job: Job) -> Outcome {
                 title: job.task.title.clone(),
                 ok: false,
                 clarification: None,
+                paused: None,
                 summary: format!("任务没做完，卡在：{e:#}"),
                 verdict: None,
             }
@@ -102,6 +106,7 @@ fn waiting_for_owner(store: &dyn Store, task: &Task, reason: &str) -> Result<Out
         title: task.title.clone(),
         ok: false,
         clarification: None,
+        paused: None,
         summary: format!("恢复前核实未完成，已停止并等待主人决定：{reason}"),
         verdict: Some(format!("#{} {}", item.id, j.verdict.zh())),
     })
@@ -130,6 +135,7 @@ fn clarification_outcome(task: &Task, plan: &str) -> Option<Outcome> {
         title: task.title.clone(),
         ok: true,
         clarification: Some(questions.into()),
+        paused: None,
         summary: format!("任务 {} 暂停研究，等待主人澄清：{questions}\n请回复时注明任务编号，补充后可用 /run {} 继续。", task.id, task.id),
         verdict: None,
     })
@@ -151,9 +157,11 @@ enum FollowupAction {
     Replan,
     Gather,
     Limit,
+    Switch(String),
+    Exit(String),
 }
 
-/// The step-boundary seam for future reflection; no goal classifier or decide() call here.
+/// Runtime bounds still apply when reflection chooses continue or merge.
 fn boundary_decision(boundary: Boundary, replans: usize, gathers: usize, has_new: bool) -> FollowupAction {
     if !has_new {
         FollowupAction::Continue
@@ -170,11 +178,17 @@ fn boundary_decision(boundary: Boundary, replans: usize, gathers: usize, has_new
 #[derive(Default)]
 struct Followups {
     consumed: usize,
+    reflected: usize,
     instructions: String,
     pending: bool,
+    pending_instructions: String,
 }
 
 impl Followups {
+    fn reflection_input<'a>(&self, snapshot: &'a str) -> Result<&'a str> {
+        snapshot.get(self.consumed.max(self.reflected)..).context("followups.md changed before the reflected position")
+    }
+
     fn unread<'a>(&self, snapshot: &'a str) -> Result<&'a str> {
         snapshot.get(self.consumed..).context("followups.md changed before the consumed position")
     }
@@ -188,6 +202,9 @@ impl Followups {
     fn at_boundary(&mut self, snapshot: &str, step: Boundary, replans: usize, gathers: usize) -> Result<FollowupAction> {
         let action = boundary_decision(step, replans, gathers, !self.unread(snapshot)?.trim().is_empty());
         if matches!(action, FollowupAction::Replan | FollowupAction::Gather) {
+            if action == FollowupAction::Gather {
+                self.pending_instructions.push_str(self.unread(snapshot)?);
+            }
             self.consume(snapshot)?;
             self.pending = action == FollowupAction::Gather;
         }
@@ -209,12 +226,83 @@ fn followup_snapshot(job: &Job) -> Result<String> {
     read_followups(&board.task_dir(&job.task.id))
 }
 
-fn boundary(job: &Job, followups: &mut Followups, step: Boundary, replans: usize, gathers: usize) -> Result<FollowupAction> {
+struct RunProgress {
+    started: Instant,
+    spent_at_start: f64,
+}
+
+struct BoundaryContext {
+    step: Boundary,
+    replans: usize,
+    gathers: usize,
+    pending_urgent: bool,
+}
+
+async fn reflect_boundary<F, Fut>(
+    followups: &mut Followups,
+    snapshot: &str,
+    context: BoundaryContext,
+    decide: F,
+) -> Result<(FollowupAction, Option<String>)>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Reflection>>,
+{
+    let has_new = !followups.reflection_input(snapshot)?.trim().is_empty();
+    if !has_new && !context.pending_urgent {
+        return Ok((FollowupAction::Continue, None));
+    }
+    let (choice, reason) = match decide().await {
+        Ok(r) if !r.reason.trim().is_empty() => (r.action, r.reason),
+        result => {
+            let error = match result {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => "反思理由为空".into(),
+            };
+            (ReflectionAction::Continue, format!("即时反思失败，沿用原边界行为：{error}"))
+        }
+    };
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    followups.reflected = snapshot.len();
+    let log = format!("断点：{:?} → {}（{reason}）", context.step, choice.as_str());
+    let action = match choice {
+        ReflectionAction::Continue | ReflectionAction::Merge => {
+            followups.at_boundary(snapshot, context.step, context.replans, context.gathers)?
+        }
+        ReflectionAction::Switch => FollowupAction::Switch(reason),
+        ReflectionAction::Exit => FollowupAction::Exit(reason),
+    };
+    Ok((action, Some(log)))
+}
+
+async fn boundary(
+    job: &Job,
+    followups: &mut Followups,
+    step: Boundary,
+    replans: usize,
+    gathers: usize,
+    progress: &RunProgress,
+) -> Result<FollowupAction> {
     let snapshot = followup_snapshot(job)?;
-    let new = followups.unread(&snapshot)?;
-    let action = followups.at_boundary(&snapshot, step, replans, gathers)?;
+    let new = followups.reflection_input(&snapshot)?;
+    // For now all task follow-ups are owner input. Keep urgency separate for future signals.
+    let pending_urgent = !new.trim().is_empty();
+    let (spent, limit) = job.models.spent_today();
+    let situation = format!(
+        "任务：{}\n刚完成：{step:?}\n本次已用时：{} 秒\n重规划：{replans}/{MAX_REPLANS}；取证：{gathers}/{MAX_GATHERS}\n\
+         本次运行期间模型记账增量（含并发调用，不含未计价 hands）：${:.6}\n今日模型预算：${spent:.6}/${limit:.6}\n\
+         pending_urgent：{pending_urgent}\n本边界新补充：\n{new}",
+        job.task.title, progress.started.elapsed().as_secs(), (spent - progress.spent_at_start).max(0.0),
+    );
+    let (action, log) = reflect_boundary(
+        followups, &snapshot, BoundaryContext { step, replans, gathers, pending_urgent },
+        || decide::reflect(&job.models, &ProcessingPolicy::Any, &job.l1, &situation),
+    ).await?;
+    if let Some(line) = log {
+        job.log(&line);
+    }
     let decision = match action {
-        FollowupAction::Continue => return Ok(action),
+        FollowupAction::Continue | FollowupAction::Switch(_) | FollowupAction::Exit(_) => return Ok(action),
         FollowupAction::Replan => "重新规划（re-plan）",
         FollowupAction::Gather => "传给下一轮 gather，追加一轮取证和审查",
         // Deliver what exists rather than discard the finished gathers; the outcome names the rest.
@@ -225,6 +313,36 @@ fn boundary(job: &Job, followups: &mut Followups, step: Boundary, replans: usize
     };
     job.log(&format!("{step:?} 边界消费补充 → {decision}：\n{new}"));
     Ok(action)
+}
+
+fn switch_outcome(task: &Task, reason: String) -> Outcome {
+    Outcome {
+        task_id: task.id.clone(),
+        title: task.title.clone(),
+        ok: true,
+        clarification: None,
+        summary: format!("任务 {} 已保存断点并暂挂，等待后续继续：{reason}", task.id),
+        paused: Some(reason),
+        verdict: None,
+    }
+}
+
+fn exit_after_plan(task: &Task, dir: &Path, unprocessed: &str, reason: &str) -> Outcome {
+    let report = read(dir, "report.md");
+    let available = if report.trim().is_empty() {
+        format!("仅有计划，尚未取证或审查：{}", dir.join("plan.md").display())
+    } else {
+        format!("已有报告（本轮未更新或重新审查）：{}", dir.join("report.md").display())
+    };
+    Outcome {
+        task_id: task.id.clone(),
+        title: task.title.clone(),
+        ok: true,
+        clarification: None,
+        paused: None,
+        summary: format!("即时反思决定结束：{reason}\n{available}\n未处理的补充留在 followups.md：\n{unprocessed}"),
+        verdict: None,
+    }
 }
 
 fn with_followups(prompt: &str, instructions: &str) -> String {
@@ -444,6 +562,7 @@ fn plan_prompt(title: &str, brief: &str, existing_plan: &str, instructions: &str
 }
 
 async fn research(job: &Job) -> Result<Outcome> {
+    let progress = RunProgress { started: Instant::now(), spent_at_start: job.models.spent_today().0 };
     let dir = job.dir();
     let snapshot = resume::inspect(&dir, &job.task, job.store.as_ref()).await?;
     let brief = snapshot.brief();
@@ -466,10 +585,15 @@ async fn research(job: &Job) -> Result<Outcome> {
             job.log(if replans == 0 { "计划写好了" } else { "已按补充重新规划，覆盖 plan.md" });
             plan
         };
-        if boundary(job, &mut followups, Boundary::Plan, replans, 0)? != FollowupAction::Replan {
-            break plan;
+        match boundary(job, &mut followups, Boundary::Plan, replans, 0, &progress).await? {
+            FollowupAction::Replan => replans += 1,
+            FollowupAction::Switch(reason) => return Ok(switch_outcome(&job.task, reason)),
+            FollowupAction::Exit(reason) => {
+                let snapshot = followup_snapshot(job)?;
+                return Ok(exit_after_plan(&job.task, &dir, followups.unread(&snapshot)?.trim(), &reason));
+            }
+            _ => break plan,
         }
-        replans += 1;
     };
 
     if let Some(outcome) = clarification_outcome(&job.task, &plan) {
@@ -481,18 +605,28 @@ async fn research(job: &Job) -> Result<Outcome> {
     let mut fixes = None;
     let mut gathers = 0;
     let mut can_revise = job.hands.research != DelegateTool::Off;
+    let mut exit_reason = None;
     let (gist, j) = loop {
         let subject = with_followups(&job.task.title, &followups.instructions);
         let gist = gather(job, &dir, &plan, fixes.as_deref(), &followups.instructions, &mut session).await?;
         gathers += 1;
         followups.pending = false;
-        boundary(job, &mut followups, Boundary::Gather, replans, gathers)?;
+        followups.pending_instructions.clear();
+        match boundary(job, &mut followups, Boundary::Gather, replans, gathers, &progress).await? {
+            FollowupAction::Switch(reason) => return Ok(switch_outcome(&job.task, reason)),
+            FollowupAction::Exit(reason) => exit_reason = Some(reason),
+            _ => {}
+        }
         let evidence =
             format!("{}\n\n## report.md\n{}\n\n## claims.yaml\n{}", rule_checks(&dir), read(&dir, "report.md"), read(&dir, "claims.yaml"));
         let j = judge::review(&job.models, ReviewCategory::Verify, &subject, &evidence).await?;
         job.log(&format!("审查（第 {gathers} 轮）：{}（{}）", j.verdict.zh(), j.reasons));
-        boundary(job, &mut followups, Boundary::Review, replans, gathers)?;
-        if !gather_again(j.verdict, followups.pending, gathers, can_revise) {
+        match boundary(job, &mut followups, Boundary::Review, replans, gathers, &progress).await? {
+            FollowupAction::Switch(reason) => return Ok(switch_outcome(&job.task, reason)),
+            FollowupAction::Exit(reason) => exit_reason = Some(reason),
+            _ => {}
+        }
+        if exit_reason.is_some() || !gather_again(j.verdict, followups.pending, gathers, can_revise) {
             break (gist, j);
         }
         fixes = if j.verdict == Verdict::Revise {
@@ -516,17 +650,22 @@ async fn research(job: &Job) -> Result<Outcome> {
         v => format!("\n审稿意见（{}）：{}", v.zh(), j.reasons),
     };
     let snapshot = followup_snapshot(job)?;
-    let unprocessed = followups.unread(&snapshot)?.trim();
-    let caveat = if unprocessed.is_empty() {
+    let unprocessed = format!("{}{}", followups.pending_instructions, followups.unread(&snapshot)?);
+    let caveat = if unprocessed.trim().is_empty() {
         caveat
     } else {
         format!("{caveat}\n这些补充没来得及处理，留在 followups.md：\n{unprocessed}")
+    };
+    let caveat = match exit_reason {
+        Some(reason) => format!("{caveat}\n即时反思决定结束：{reason}"),
+        None => caveat,
     };
     Ok(Outcome {
         task_id: job.task.id.clone(),
         title: job.task.title.clone(),
         ok: true,
         clarification: None,
+        paused: None,
         summary: format!("{}\n完整报告：{}{caveat}", gist.trim(), dir.join("report.md").display()),
         verdict: Some(format!("#{} {}", item.id, j.verdict.zh())),
     })
@@ -565,6 +704,7 @@ async fn code(job: &Job) -> Result<Outcome> {
         title: job.task.title.clone(),
         ok: true,
         clarification: None,
+        paused: None,
         summary: format!("{}\n产出在：{}", text.trim(), dir.display()),
         verdict: Some(format!("#{} {}", item.id, j.verdict.zh())),
     })
@@ -573,6 +713,139 @@ async fn code(job: &Job) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn boundary_context(step: Boundary, replans: usize, gathers: usize) -> BoundaryContext {
+        BoundaryContext { step, replans, gathers, pending_urgent: false }
+    }
+
+    #[tokio::test]
+    async fn reflection_skips_unchanged_boundaries_but_runs_for_urgent_input() {
+        let mut f = Followups::default();
+        f.consume("old input").unwrap();
+        for step in [Boundary::Plan, Boundary::Gather, Boundary::Review] {
+            let (action, log) = reflect_boundary(&mut f, "old input", boundary_context(step, 0, 1), || async {
+                panic!("unchanged boundary must not call the model");
+            }).await.unwrap();
+            assert_eq!(action, FollowupAction::Continue);
+            assert!(log.is_none());
+        }
+        let mut context = boundary_context(Boundary::Gather, 0, 1);
+        context.pending_urgent = true;
+        let (action, log) = reflect_boundary(&mut f, "old input", context, || async {
+            Ok(Reflection { action: ReflectionAction::Switch, reason: "urgent".into() })
+        }).await.unwrap();
+        assert_eq!(action, FollowupAction::Switch("urgent".into()));
+        assert_eq!(log.as_deref(), Some("断点：Gather → switch（urgent）"));
+    }
+
+    #[tokio::test]
+    async fn reflection_continue_and_merge_keep_followup_rules_and_limits() {
+        for choice in [ReflectionAction::Continue, ReflectionAction::Merge] {
+            for (step, replans, gathers, expected) in [
+                (Boundary::Plan, 0, 0, FollowupAction::Replan),
+                (Boundary::Plan, MAX_REPLANS, 0, FollowupAction::Gather),
+                (Boundary::Gather, 0, 1, FollowupAction::Gather),
+                (Boundary::Review, 0, 1, FollowupAction::Gather),
+                (Boundary::Review, 0, MAX_GATHERS, FollowupAction::Limit),
+            ] {
+                let mut f = Followups::default();
+                let (action, log) = reflect_boundary(&mut f, "new input", boundary_context(step, replans, gathers), || async {
+                    Ok(Reflection { action: choice, reason: "because\nnew input".into() })
+                }).await.unwrap();
+                assert_eq!(action, expected);
+                assert_eq!(log.unwrap(), format!("断点：{step:?} → {}（because new input）", choice.as_str()));
+                assert_eq!(f.unread("new input").unwrap(), if expected == FollowupAction::Limit { "new input" } else { "" });
+                if expected == FollowupAction::Gather {
+                    assert!(f.pending);
+                    assert_eq!(f.pending_instructions, "new input");
+                    assert!(with_followups("next step", &f.instructions).ends_with("new input"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reflection_switch_and_exit_preserve_unprocessed_input() {
+        for step in [Boundary::Plan, Boundary::Gather, Boundary::Review] {
+            for choice in [ReflectionAction::Switch, ReflectionAction::Exit] {
+                let mut f = Followups::default();
+                let (action, log) = reflect_boundary(&mut f, "new input", boundary_context(step, 0, 1), || async {
+                    Ok(Reflection { action: choice, reason: "stop here".into() })
+                }).await.unwrap();
+                let expected = if choice == ReflectionAction::Switch {
+                    FollowupAction::Switch("stop here".into())
+                } else {
+                    FollowupAction::Exit("stop here".into())
+                };
+                assert_eq!(action, expected);
+                assert!(log.is_some());
+                assert_eq!(f.unread("new input").unwrap(), "new input");
+                assert_eq!(f.reflection_input("new input").unwrap(), "");
+                assert_eq!(f.reflection_input("new input\nlater").unwrap(), "\nlater");
+                // A retained follow-up must not trigger another reflection during final review.
+                let (_, log) = reflect_boundary(&mut f, "new input", boundary_context(Boundary::Review, 0, 1), || async {
+                    panic!("already reflected input");
+                }).await.unwrap();
+                assert!(log.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reflection_failures_log_and_default_to_existing_boundary_behavior() {
+        for reply in ["not JSON", r#"{"action":"unknown","reason":"r"}"#, r#"{"action":"exit","reason":" "}"#] {
+            let mut f = Followups::default();
+            let (action, log) = reflect_boundary(&mut f, "new input", boundary_context(Boundary::Plan, 0, 0), || async {
+                Ok(serde_json::from_str::<Reflection>(reply)?)
+            }).await.unwrap();
+            assert_eq!(action, FollowupAction::Replan);
+            assert_eq!(f.instructions, "new input");
+            let log = log.unwrap();
+            assert!(log.contains("→ continue") && log.contains("即时反思失败"));
+        }
+        let mut f = Followups::default();
+        let (action, log) = reflect_boundary(&mut f, "new input", boundary_context(Boundary::Gather, 0, MAX_GATHERS), || async {
+            anyhow::bail!("model unavailable")
+        }).await.unwrap();
+        assert_eq!(action, FollowupAction::Limit);
+        assert!(log.unwrap().contains("model unavailable"));
+        assert_eq!(f.unread("new input").unwrap(), "new input");
+    }
+
+    #[test]
+    fn reflection_exit_after_plan_delivers_only_existing_material() {
+        let root = std::env::temp_dir().join(format!("agli-reflection-exit-{}", std::process::id()));
+        let mut board = Board::load(&root).unwrap();
+        let task = board.add("research", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
+        let dir = board.task_dir(&task.id);
+        std::fs::write(dir.join("plan.md"), "saved plan").unwrap();
+        let outcome = exit_after_plan(&task, &dir, "unprocessed input", "enough for now");
+        assert!(outcome.ok);
+        assert_eq!(outcome.status(), TaskStatus::Done);
+        assert!(outcome.verdict.is_none() && outcome.clarification.is_none() && outcome.paused.is_none());
+        assert!(outcome.summary.contains("仅有计划，尚未取证或审查"));
+        assert!(outcome.summary.contains("unprocessed input") && outcome.summary.contains("enough for now"));
+        assert!(!dir.join("report.md").exists());
+        std::fs::write(dir.join("report.md"), "saved report").unwrap();
+        let outcome = exit_after_plan(&task, &dir, "", "enough for now");
+        assert!(outcome.summary.contains("本轮未更新或重新审查"));
+        assert_eq!(read(&dir, "report.md"), "saved report");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reflection_switch_is_successful_waiting_without_clarification() {
+        let root = std::env::temp_dir().join(format!("agli-reflection-switch-{}", std::process::id()));
+        let mut board = Board::load(&root).unwrap();
+        let task = board.add("research", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
+        let outcome = switch_outcome(&task, "other work first".into());
+        assert!(outcome.ok);
+        assert_eq!(outcome.status(), TaskStatus::Waiting);
+        assert_eq!(outcome.paused.as_deref(), Some("other work first"));
+        assert!(outcome.clarification.is_none() && outcome.verdict.is_none());
+        assert!(outcome.summary.contains("other work first"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn clarification_requires_a_final_verdict_with_one_or_two_questions() {

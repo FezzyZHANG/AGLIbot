@@ -942,7 +942,9 @@ impl Agli {
             self.job = None;
         }
         let exit = self.flow.exit(Utc::now());
-        let note = if o.clarification.is_some() { "等待主人澄清" } else if o.ok { "" } else { "出错，等主人看" };
+        let note = if let Some(reason) = &o.paused {
+            reason.as_str()
+        } else if o.clarification.is_some() { "等待主人澄清" } else if o.ok { "" } else { "出错，等主人看" };
         self.board().set_status(&o.task_id, o.status(), note)?;
         self.audit("owner", "delegate_result", true, &o.task_id, if o.ok { Outcome::Sent } else { Outcome::Failed })?;
         self.state.finished_work();
@@ -1011,7 +1013,10 @@ impl Agli {
             warn!("task {} finished but the owner has never messaged; nowhere to report", o.task_id);
             return Ok(());
         };
-        let body = if let Some(questions) = &o.clarification {
+        let body = if o.paused.is_some() {
+            format!("（这不是主人的消息。任务 {}：{}，已保存断点并暂挂，尚未完成。\n{}\n用自己的语气简短告诉主人暂停原因，可用 /run {} 继续。）",
+                o.task_id, o.title, o.summary, o.task_id)
+        } else if let Some(questions) = &o.clarification {
             format!(
                 "（这不是主人的消息。任务 {}：{}，已暂停并等待主人澄清，还没开始本轮取证。\n\
                  用你自己的语气向主人问清以下问题，保留任务编号，告诉他回复时注明编号即可：\n{questions}\n\
@@ -1537,7 +1542,7 @@ mod tests {
         assert!(poll_once(recv.as_mut()).is_pending());
         tokio::time::advance(Duration::from_secs(1)).await;
         for event in [Event::Tick, inbound("7", "other chat", "2"), Event::JobDone(research::Outcome {
-            task_id: "task-1".into(), title: "done".into(), ok: true, clarification: None, summary: "result".into(), verdict: None,
+            task_id: "task-1".into(), title: "done".into(), ok: true, clarification: None, paused: None, summary: "result".into(), verdict: None,
         }), inbound("42", "second", "3")] {
             tx.try_send(event).unwrap();
         }
@@ -1639,6 +1644,7 @@ mod tests {
         let outcome = research::Outcome {
             task_id: "task-1".into(), title: "done".into(), ok: true,
             clarification: None,
+            paused: None,
             summary: "result".into(), verdict: None,
         };
         let mut queue = WorkQueue::from([
@@ -1704,6 +1710,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reflection_switch_parks_work_and_wakes_the_mind_without_failure() {
+        let mut test = TestAgli::new("reflection-switch").await;
+        let a = &mut test.agli;
+        a.state.energy.asleep = true; // Queue delivery without a model or network call.
+        let task = a.board().add("研究版本", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
+        a.flow.enter("project/research".parse().unwrap(), &task.id, &task.title, Utc::now());
+        let reason = "先处理主人的紧急事务";
+        a.on_job_done(research::Outcome {
+            task_id: task.id.clone(), title: task.title, ok: true,
+            clarification: None, paused: Some(reason.into()), summary: reason.into(), verdict: None,
+        }).await.unwrap();
+        let board = a.board();
+        let saved = board.get(&task.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Waiting);
+        assert_eq!(saved.note, reason);
+        drop(board);
+        assert!(!a.flow.is_focused() && a.wake_decide);
+        let audits = a.store.audits().unwrap();
+        let result = audits.iter().find(|record| record.tool == "delegate_result").unwrap();
+        assert_eq!(result.outcome, Outcome::Sent);
+        assert!(a.store.reviews().unwrap().is_empty());
+        assert_eq!(a.deliveries[0].paused.as_deref(), Some(reason));
+    }
+
+    #[tokio::test]
     async fn clarification_completion_waits_without_failure_or_judge_review() {
         let mut test = TestAgli::new("clarification").await;
         let a = &mut test.agli;
@@ -1712,7 +1743,7 @@ mod tests {
         let questions = "研究 A 还是 B？";
         a.on_job_done(research::Outcome {
             task_id: task.id.clone(), title: task.title, ok: true,
-            clarification: Some(questions.into()), summary: questions.into(), verdict: None,
+            clarification: Some(questions.into()), paused: None, summary: questions.into(), verdict: None,
         }).await.unwrap();
         let board = a.board();
         let saved = board.get(&task.id).unwrap();
