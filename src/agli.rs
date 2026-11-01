@@ -6,8 +6,10 @@
 //! something changed; nothing-changed ticks make no model calls.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
@@ -19,7 +21,7 @@ use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 use crate::channels::{Envelope, Outlets};
-use crate::config::{AclCfg, Config, DebounceCfg, SessionCfg};
+use crate::config::{AclCfg, Config, DebounceCfg, HandsCfg, SessionCfg};
 use crate::mind::context::{RecapLine, build_l1, build_l2, read_opt, tail, user_turn};
 use crate::mind::decide::{self, Action, Situation};
 use crate::mind::flow::{Bucket, Flow, TAG_SYSTEM};
@@ -370,6 +372,60 @@ struct Chime {
     reason: String,
 }
 
+struct RunningJob {
+    id: String,
+    handle: JoinHandle<()>,
+    // Completion and cancellation compete for this claim before either publishes a result.
+    terminal_claimed: Arc<AtomicBool>,
+    started: Instant,
+    last_growth: Instant,
+    log_path: PathBuf,
+    last_log: Option<(u64, Option<SystemTime>)>,
+}
+
+fn log_stamp(path: &Path) -> Option<(u64, Option<SystemTime>)> {
+    std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()))
+}
+
+impl RunningJob {
+    fn spawn(id: String, log_path: PathBuf, tx: mpsc::Sender<Event>,
+        work: impl std::future::Future<Output = research::Outcome> + Send + 'static) -> Self {
+        let started = Instant::now();
+        let last_log = log_stamp(&log_path);
+        let terminal_claimed = Arc::new(AtomicBool::new(false));
+        let finished = terminal_claimed.clone();
+        let handle = tokio::spawn(async move {
+            let outcome = work.await;
+            if !finished.swap(true, Ordering::AcqRel) {
+                let _ = tx.send(Event::JobDone(outcome)).await;
+            }
+        });
+        Self { id, handle, terminal_claimed, started, last_growth: started, log_path, last_log }
+    }
+
+    fn overdue(&mut self, now: Instant, cfg: &HandsCfg) -> Option<String> {
+        if self.handle.is_finished() || self.terminal_claimed.load(Ordering::Acquire) { return None }
+        // Owner follow-ups also append to log.md and count as activity.
+        if let Some(stamp) = log_stamp(&self.log_path) && Some(stamp) != self.last_log {
+            self.last_log = Some(stamp);
+            self.last_growth = now;
+        }
+        if now.duration_since(self.started) >= Duration::from_secs(cfg.total_budget_minutes.saturating_mul(60)) {
+            Some(format!("看门狗暂停：总运行时长已达 {} 分钟预算", cfg.total_budget_minutes))
+        } else if now.duration_since(self.last_growth) >= Duration::from_secs(cfg.stall_minutes.saturating_mul(60)) {
+            Some(format!("看门狗暂停：log.md 已 {} 分钟没有增长或更新", cfg.stall_minutes))
+        } else { None }
+    }
+}
+
+fn delivery_preview(text: &str) -> String {
+    const LIMIT: usize = 600;
+    if text.chars().count() <= LIMIT { return text.to_string() }
+    let mut preview: String = text.chars().take(LIMIT - 1).collect();
+    preview.push('…');
+    preview
+}
+
 pub struct Agli {
     cfg: Arc<Config>,
     store: Arc<dyn Store>,
@@ -382,7 +438,7 @@ pub struct Agli {
     flow: Flow,
     state: MindState,
     board: Arc<Mutex<Board>>,
-    job: Option<(String, JoinHandle<()>)>,
+    job: Option<RunningJob>,
     /// Group lines he has not yet "read" into his session, per chat key.
     unseen: HashMap<String, Vec<String>>,
     /// Recent speakers per group chat key, for the audience and recall.
@@ -966,9 +1022,8 @@ impl Agli {
                 format!("记下了：{}", t.id)
             }
             "/run" if !arg.is_empty() => self.start_job(arg)?,
-            "/stop" => match self.job.take() {
-                Some((id, handle)) => {
-                    handle.abort();
+            "/stop" => match self.stop_job().await {
+                Some(id) => {
                     self.board().set_status(&id, TaskStatus::Waiting, "主人让我停下")?;
                     self.flow.exit(Utc::now());
                     format!("停了：{id}")
@@ -977,8 +1032,7 @@ impl Agli {
             },
             "/freeze" => {
                 self.store.kv_set("frozen", json!(true))?;
-                if let Some((id, handle)) = self.job.take() {
-                    handle.abort();
+                if let Some(id) = self.stop_job().await {
                     self.board().set_status(&id, TaskStatus::Waiting, "冻结")?;
                     self.flow.exit(Utc::now());
                 }
@@ -1050,8 +1104,8 @@ impl Agli {
         if self.frozen() {
             return Ok("冻结中，不开始任务。".into());
         }
-        if let Some((running, _)) = &self.job {
-            return Ok(format!("正在做 {running}，一次只做一件。"));
+        if let Some(running) = &self.job {
+            return Ok(format!("正在做 {}，一次只做一件。", running.id));
         }
         let task = self.board().get(task_id).cloned().ok_or_else(|| anyhow::anyhow!("没有任务 {task_id}"))?;
         if task.status != TaskStatus::Inbox && task.status != TaskStatus::Waiting {
@@ -1069,18 +1123,14 @@ impl Agli {
             hands: self.cfg.runtime.hands.clone(),
             task: task.clone(),
         };
-        let tx = self.events.clone();
-        let handle = tokio::spawn(async move {
-            let outcome = research::run(job).await;
-            let _ = tx.send(Event::JobDone(outcome)).await;
-        });
-        self.job = Some((task.id.clone(), handle));
+        let log_path = self.board().task_dir(&task.id).join("log.md");
+        self.job = Some(RunningJob::spawn(task.id.clone(), log_path, self.events.clone(), research::run(job)));
         info!("started task {}", task.id);
         Ok(format!("开始做：{}", task.title))
     }
 
     async fn on_job_done(&mut self, o: research::Outcome) -> Result<()> {
-        if self.job.as_ref().is_some_and(|(id, _)| id == &o.task_id) {
+        if self.job.as_ref().is_some_and(|job| job.id == o.task_id) {
             self.job = None;
         }
         let exit = self.flow.exit(Utc::now());
@@ -1105,6 +1155,26 @@ impl Agli {
         }
         self.wake_decide = true;
         Ok(())
+    }
+
+    async fn stop_job(&mut self) -> Option<String> {
+        let job = self.job.as_ref()?;
+        if job.handle.is_finished() || job.terminal_claimed.swap(true, Ordering::AcqRel) { return None }
+        let job = self.job.take().unwrap();
+        job.handle.abort();
+        // Wait for delegate's process-tree guard and audit cleanup before changing task state.
+        let _ = job.handle.await;
+        Some(job.id)
+    }
+
+    async fn watchdog(&mut self) -> Result<()> {
+        let Some(reason) = self.job.as_mut().and_then(|job| job.overdue(Instant::now(), &self.cfg.runtime.hands)) else { return Ok(()) };
+        let Some(id) = self.stop_job().await else { return Ok(()) };
+        let task = self.board().get(&id).cloned().ok_or_else(|| anyhow::anyhow!("没有任务 {id}"))?;
+        self.on_job_done(research::Outcome {
+            task_id: id, title: task.title, ok: false, clarification: None,
+            paused: Some(reason.clone()), summary: reason, verdict: None,
+        }).await
     }
 
     fn group_ctx(&self, key: &str) -> Option<ChatCtx> {
@@ -1159,8 +1229,9 @@ impl Agli {
         };
         let body = if o.paused.is_some() {
             format!("（这不是主人的消息。任务 {}：{}，已保存断点并暂挂，尚未完成。\n{}\n用自己的语气简短告诉主人暂停原因，可用 /run {} 继续。）",
-                o.task_id, o.title, o.summary, o.task_id)
+                o.task_id, o.title, delivery_preview(&o.summary), o.task_id)
         } else if let Some(questions) = &o.clarification {
+            let questions = delivery_preview(questions);
             format!(
                 "（这不是主人的消息。任务 {}：{}，已暂停并等待主人澄清，还没开始本轮取证。\n\
                  用你自己的语气向主人问清以下问题，保留任务编号，告诉他回复时注明编号即可：\n{questions}\n\
@@ -1168,10 +1239,13 @@ impl Agli {
                 o.task_id, o.title, o.task_id, o.task_id
             )
         } else {
+            let board = self.board();
+            let dir = board.task_dir(&o.task_id);
+            let report = if board.get(&o.task_id).is_some_and(|t| t.kind == TaskKind::Code) { dir.join("scratch") } else { dir.join("report.md") };
             format!(
-                "（这不是主人的消息。你刚做完主人交代的事：{}。\n结果：\n{}\n审查：{}\n用你自己的话简短告诉主人结论，附上报告位置；没做完就直说卡在哪。）",
-                o.title,
-                o.summary,
+                "（这不是主人的消息。任务 {}：{}。\n结果预览：\n{}\n报告/产出位置（若已生成）：{}\n审查：{}\n用你自己的话简短告诉主人结论，附上报告位置；没做完就直说卡在哪。）",
+                o.task_id, o.title,
+                delivery_preview(&o.summary), report.display(),
                 o.verdict.clone().unwrap_or_else(|| "无".into())
             )
         };
@@ -1181,6 +1255,7 @@ impl Agli {
     // ---------------------------------------------------------------- inner life
 
     async fn on_tick(&mut self) -> Result<()> {
+        self.watchdog().await?;
         let now = Utc::now();
         let changes = self.state.tick(now, &self.cfg.runtime.routine);
         for c in &changes {
@@ -1857,6 +1932,223 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.dir).unwrap();
         }
+    }
+
+    #[test]
+    fn delivery_preview_caps_unicode_including_ellipsis() {
+        for text in ["".to_string(), "短摘要".into(), "中🦀".repeat(300)] {
+            assert_eq!(delivery_preview(&text), text);
+        }
+        let long = format!("{}尾", "中🦀".repeat(300));
+        let preview = delivery_preview(&long);
+        assert_eq!(preview.chars().count(), 600);
+        assert_eq!(preview, format!("{}中…", "中🦀".repeat(299)));
+    }
+
+    #[tokio::test]
+    async fn delivery_cards_keep_paths_verdicts_and_cap_all_branches() {
+        let mut test = TestAgli::new("delivery-cards").await;
+        let a = &mut test.agli;
+        a.store.kv_set("owner_last_chat", json!({"platform": "telegram", "chat_id": "42"})).unwrap();
+        a.test_chat = Some(TestChat::new(&["[沉默]", "[沉默]", "[沉默]", "[沉默]"], &[]));
+        let long = format!("{}不得注入的尾部", "中文🦀".repeat(300));
+        let preview = delivery_preview(&long);
+        let mut o = research::Outcome {
+            task_id: "task-card".into(), title: "研究".into(), ok: true,
+            clarification: None, paused: None, summary: long.clone(), verdict: Some("#7 需主人确认".into()),
+        };
+        let report = a.board().task_dir(&o.task_id).join("report.md");
+        a.deliver(o.clone()).await.unwrap();
+        let body = &a.test_chat.as_ref().unwrap().turns[0].1;
+        assert!(body.contains(&preview) && body.contains(&report.display().to_string()));
+        assert!(body.contains("#7 需主人确认") && body.contains("task-card"));
+        o.clarification = Some(long.clone());
+        a.deliver(o.clone()).await.unwrap();
+        o.clarification = None;
+        o.paused = Some(long);
+        a.deliver(o.clone()).await.unwrap();
+        for (_, body, _) in &a.test_chat.as_ref().unwrap().turns {
+            assert!(body.contains(&preview));
+            assert!(!body.contains("不得注入的尾部"));
+        }
+        let task = a.board().add("代码产出", TaskKind::Code, "owner", TaskStatus::Done, None).unwrap();
+        o.task_id = task.id.clone();
+        o.paused = None;
+        o.summary = "短结果".into();
+        a.deliver(o).await.unwrap();
+        let body = &a.test_chat.as_ref().unwrap().turns[3].1;
+        assert!(body.contains("短结果"));
+        assert!(body.contains(&a.board().task_dir(&task.id).join("scratch").display().to_string()));
+        assert!(!body.contains("report.md"));
+    }
+
+    fn fake_job(a: &mut Agli) -> crate::work::board::Task {
+        let task = a.board().add("watchdog", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
+        let log_path = a.board().task_dir(&task.id).join("log.md");
+        a.flow.enter(Namespace::Project(task.id.clone()), &task.id, &task.title, Utc::now());
+        a.job = Some(RunningJob::spawn(task.id.clone(), log_path, a.events.clone(), std::future::pending()));
+        a.state.energy.asleep = true;
+        task
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_tick_stalls_waits_for_cancellation_and_delivers_once() {
+        let mut test = TestAgli::new("watchdog-stall").await;
+        let a = &mut test.agli;
+        let task = fake_job(a);
+        // A dropped worker stands in for delegate's process-tree guard.
+        struct Cleanup(Arc<AtomicBool>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+        }
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let guard = Cleanup(cleaned.clone());
+        let job = a.job.as_mut().unwrap();
+        job.handle.abort();
+        job.handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(20 * 60 - 1)).await;
+        a.watchdog().await.unwrap();
+        assert!(a.job.is_some());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        a.store.kv_set("frozen", json!(true)).unwrap();
+        a.store.kv_set("owner_last_chat", json!({"platform": "telegram", "chat_id": "42"})).unwrap();
+        a.test_chat = Some(TestChat::new(&["任务卡住，已暂停。"], &[Outcome::Sent]));
+        wake(a).await; // Exercise the actual tick and existing wake delivery path.
+        assert!(cleaned.load(Ordering::Acquire));
+        assert!(a.job.is_none() && !a.flow.is_focused());
+        let saved = a.board().get(&task.id).unwrap().clone();
+        assert_eq!(saved.status, TaskStatus::Waiting);
+        assert!(saved.note.contains("20 分钟没有增长"));
+        let log_path = a.board().task_dir(&task.id).join("log.md");
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains(&saved.note));
+        wake(a).await;
+        assert_eq!(a.test_chat.as_ref().unwrap().turns.len(), 1);
+        assert_eq!(std::fs::read_to_string(log_path).unwrap(), log);
+        assert!(a.deliveries.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_growth_and_followups_reset_stall_but_not_total_budget() {
+        let mut test = TestAgli::new("watchdog-total").await;
+        let a = &mut test.agli;
+        let task = fake_job(a);
+        for minute in [15, 30, 45, 60, 75, 90] {
+            tokio::time::advance(Duration::from_secs(15 * 60)).await;
+            a.board().follow_up(&task.id, "继续", ThreadRef {
+                platform: "telegram".into(), chat_id: "42".into(), message_id: None,
+            }).unwrap();
+            a.watchdog().await.unwrap();
+            if minute < 90 {
+                assert!(a.job.is_some());
+                assert!(a.deliveries.is_empty());
+            }
+        }
+        assert!(a.job.is_none());
+        assert_eq!(a.deliveries.len(), 1);
+        let saved = a.board().get(&task.id).unwrap().clone();
+        assert_eq!(saved.status, TaskStatus::Waiting);
+        assert!(saved.note.contains("总运行时长已达 90 分钟"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_stalls_after_last_growth_and_with_missing_log() {
+        for missing in [false, true] {
+            let mut test = TestAgli::new(&format!("watchdog-log-{missing}")).await;
+            let a = &mut test.agli;
+            let task = fake_job(a);
+            tokio::time::advance(Duration::from_secs(10 * 60)).await;
+            let log_path = a.board().task_dir(&task.id).join("log.md");
+            if missing { std::fs::remove_file(&log_path).unwrap() }
+            else { a.board().log(&task.id, "进度").unwrap() }
+            a.watchdog().await.unwrap();
+            tokio::time::advance(Duration::from_secs(10 * 60)).await;
+            a.watchdog().await.unwrap();
+            if !missing {
+                assert!(a.job.is_some());
+                tokio::time::advance(Duration::from_secs(10 * 60)).await;
+                a.watchdog().await.unwrap();
+            }
+            assert!(a.job.is_none());
+            assert_eq!(a.deliveries.len(), 1);
+            assert!(a.deliveries[0].summary.contains("没有增长"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_leaves_completed_and_pending_completion_events_alone() {
+        for blocked_send in [false, true] {
+            let mut test = TestAgli::new(&format!("watchdog-completed-{blocked_send}")).await;
+            let a = &mut test.agli;
+            let task = a.board().add("completed", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
+            let log_path = a.board().task_dir(&task.id).join("log.md");
+            let before = std::fs::read_to_string(&log_path).unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            if blocked_send { tx.try_send(Event::Tick).unwrap() }
+            let (finish, result) = tokio::sync::oneshot::channel();
+            a.job = Some(RunningJob::spawn(task.id.clone(), log_path.clone(), tx, async { result.await.unwrap() }));
+            tokio::time::advance(Duration::from_secs(90 * 60)).await;
+            // Completion wins after timeout detection, before the cancellation claim.
+            assert!(a.job.as_mut().unwrap().overdue(Instant::now(), &a.cfg.runtime.hands).is_some());
+            finish.send(research::Outcome {
+                task_id: task.id.clone(), title: task.title, ok: true, clarification: None,
+                paused: None, summary: "完成".into(), verdict: None,
+            }).unwrap();
+            tokio::task::yield_now().await;
+            assert_eq!(a.job.as_ref().unwrap().handle.is_finished(), !blocked_send);
+            assert!(a.stop_job().await.is_none());
+            a.watchdog().await.unwrap();
+            assert_eq!(a.board().get(&task.id).unwrap().status, TaskStatus::Active);
+            assert_eq!(std::fs::read_to_string(log_path).unwrap(), before);
+            assert!(a.deliveries.is_empty());
+            if blocked_send { assert!(matches!(rx.recv().await, Some(Event::Tick))) }
+            let Some(Event::JobDone(o)) = rx.recv().await else { panic!("lost completion") };
+            a.state.energy.asleep = true;
+            a.on_job_done(o).await.unwrap();
+            a.watchdog().await.unwrap();
+            assert!(a.job.is_none());
+            assert_eq!(a.board().get(&task.id).unwrap().status, TaskStatus::Done);
+            assert_eq!(a.deliveries.len(), 1);
+            assert!(a.deliveries[0].paused.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_without_running_job_does_nothing() {
+        let mut test = TestAgli::new("watchdog-idle").await;
+        let a = &mut test.agli;
+        let task = a.board().add("waiting", TaskKind::Research, "owner", TaskStatus::Waiting, None).unwrap();
+        let log_path = a.board().task_dir(&task.id).join("log.md");
+        let before = std::fs::read_to_string(&log_path).unwrap();
+        tokio::time::advance(Duration::from_secs(100 * 60)).await;
+        a.watchdog().await.unwrap();
+        assert_eq!(std::fs::read_to_string(log_path).unwrap(), before);
+        assert_eq!(a.board().get(&task.id).unwrap().status, TaskStatus::Waiting);
+        assert!(a.job.is_none() && a.deliveries.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_claim_suppresses_late_completion() {
+        let mut test = TestAgli::new("watchdog-late-completion").await;
+        let a = &mut test.agli;
+        let task = fake_job(a);
+        a.stop_job().await.unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let (finish, result) = tokio::sync::oneshot::channel();
+        let job = RunningJob::spawn(task.id.clone(), a.board().task_dir(&task.id).join("log.md"), tx,
+            async { result.await.unwrap() });
+        // A worker already in its final synchronous poll can return after stop claims it.
+        assert!(!job.terminal_claimed.swap(true, Ordering::AcqRel));
+        finish.send(research::Outcome {
+            task_id: task.id, title: task.title, ok: true, clarification: None,
+            paused: None, summary: "late result".into(), verdict: None,
+        }).unwrap();
+        job.handle.await.unwrap();
+        assert!(rx.recv().await.is_none());
     }
 
     fn private_message(sender: &str, text: &str) -> Envelope {
