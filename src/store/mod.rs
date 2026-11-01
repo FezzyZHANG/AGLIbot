@@ -1,7 +1,10 @@
-//! Storage behind a trait: JSONL now, MongoDB later (docs/DESIGN.md 2b).
-//! Collections mirror the planned Mongo layout so the switch is a new `Store` impl, not a redesign.
+//! Storage behind a synchronous trait: MongoDB when configured, JSONL otherwise (DESIGN 2b).
 
 pub mod jsonl;
+pub mod mongo;
+
+#[cfg(test)]
+mod tests;
 
 use std::collections::BTreeMap;
 
@@ -11,6 +14,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ns::{Namespace, Scope};
+
+pub fn open(cfg: &crate::config::MongoCfg, data_dir: &std::path::Path) -> Result<std::sync::Arc<dyn Store>> {
+    match &cfg.url {
+        Some(url) => Ok(std::sync::Arc::new(mongo::MongoStore::open(url, &cfg.database)?)),
+        None => Ok(std::sync::Arc::new(jsonl::JsonlStore::open(data_dir)?)),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageRecord {

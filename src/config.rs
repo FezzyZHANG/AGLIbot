@@ -226,6 +226,48 @@ pub struct RuntimeCfg {
     pub memory: MemoryCfg,
     pub hands: HandsCfg,
     pub judge: JudgeCfg,
+    #[serde(default)]
+    pub mongo: MongoCfg,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default)]
+pub struct MongoCfg {
+    pub url_env: String,
+    pub database_env: String,
+    #[serde(skip)]
+    pub url: Option<String>,
+    #[serde(skip)]
+    pub database: String,
+}
+
+impl Default for MongoCfg {
+    fn default() -> Self {
+        Self {
+            url_env: "MONGO_URL".into(),
+            database_env: "MONGO_DATABASE".into(),
+            url: None,
+            database: "aglibot".into(),
+        }
+    }
+}
+
+impl std::fmt::Debug for MongoCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MongoCfg")
+            .field("url_env", &self.url_env)
+            .field("database_env", &self.database_env)
+            .field("url", &self.url.as_ref().map(|_| "[redacted]"))
+            .field("database", &self.database)
+            .finish()
+    }
+}
+
+impl MongoCfg {
+    fn resolve_env(&mut self, value: impl Fn(&str) -> Option<String>) {
+        self.url = value(&self.url_env);
+        self.database = value(&self.database_env).unwrap_or_else(|| "aglibot".into());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +322,7 @@ impl Config {
         let qq = &mut self.channels.qq;
         qq.url = env_value(&qq.url_env);
         qq.token = env_value(&qq.token_env);
+        self.runtime.mongo.resolve_env(env_value);
         Ok(())
     }
 
@@ -317,6 +360,31 @@ fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mongo_defaults_and_env_overrides() {
+        let mut mongo: MongoCfg = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(mongo.url_env, "MONGO_URL");
+        assert_eq!(mongo.database_env, "MONGO_DATABASE");
+        assert_eq!(mongo.database, "aglibot");
+        mongo.resolve_env(|_| None);
+        assert!(mongo.url.is_none());
+        assert_eq!(mongo.database, "aglibot");
+        mongo.resolve_env(|key| match key {
+            "MONGO_URL" => Some("mongodb://user:secret@localhost".into()),
+            "MONGO_DATABASE" => Some("test_db".into()),
+            _ => None,
+        });
+        assert_eq!(mongo.database, "test_db");
+        assert!(mongo.url.is_some());
+        assert!(!format!("{mongo:?}").contains("secret"));
+        assert!(!format!("{mongo:?}").contains("mongodb://"));
+
+        let mut custom: MongoCfg = serde_yaml::from_str("url_env: CUSTOM_URL\ndatabase_env: CUSTOM_DB").unwrap();
+        custom.resolve_env(|key| (key == "CUSTOM_URL").then(|| "mongodb://localhost".into()));
+        assert_eq!(custom.url.as_deref(), Some("mongodb://localhost"));
+        assert_eq!(custom.database, "aglibot");
+    }
 
     #[test]
     fn repo_config_loads() {
