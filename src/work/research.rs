@@ -98,7 +98,7 @@ pub async fn run(job: Job) -> Outcome {
 }
 
 fn waiting_for_owner(store: &dyn Store, task: &Task, reason: &str) -> Result<Outcome> {
-    let j = judge::Judgement { verdict: Verdict::Owner, reasons: reason.into(), fixes: String::new() };
+    let j = judge::Judgement { verdict: Verdict::Owner, reasons: reason.into(), fixes: String::new(), urgent: true };
     let item = judge::file(store, ReviewCategory::Act, &task.title, reason, &j, false, json!({"task_id": task.id}))?;
     // Approving this review does not replay anything.
     Ok(Outcome {
@@ -1002,6 +1002,7 @@ mod tests {
         let reviews = store.reviews().unwrap();
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].status, ReviewStatus::Open);
+        assert!(reviews[0].urgent);
         assert_eq!(reviews[0].category, ReviewCategory::Act);
         assert_eq!(reviews[0].payload["task_id"], task.id);
         assert!(reviews[0].detail.contains("owner must check receipt"));

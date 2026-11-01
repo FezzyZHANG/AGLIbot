@@ -113,6 +113,18 @@ impl Models {
         self.stub.as_ref().unwrap().lock().unwrap().cost_usd = cost;
     }
 
+    #[cfg(test)]
+    fn stub_reply(&self, scenario: &str, policy: &ProcessingPolicy, user: &str) -> Result<String> {
+        let mut stub = self.stub.as_ref().unwrap().lock().unwrap();
+        stub.prompts.push((scenario.into(), policy.clone(), user.into()));
+        self.store.append_model_call(&ModelCallRecord {
+            ts: Utc::now(), scenario: scenario.into(), model_id: "stub".into(), session_id: scenario.into(),
+            uncached_input: 0, cached_input: 0, cache_write: 0, output: 0, latency_ms: 0,
+            cost_usd: stub.cost_usd, ok: true, error: None, escalated_from: None,
+        })?;
+        Ok(stub.replies.pop_front().expect("unexpected model call"))
+    }
+
     pub fn router(&self) -> &Router {
         &self.router
     }
@@ -209,6 +221,8 @@ impl Models {
 
     /// A cheap side call with no retry/escalation; the caller owns the fallback.
     pub async fn ask_once(&self, scenario: &str, policy: &ProcessingPolicy, system: &str, user: &str) -> Result<String> {
+        #[cfg(test)]
+        if self.stub.is_some() { return self.stub_reply(scenario, policy, user) }
         let model = self.pick(scenario, policy)?;
         let turns = [Turn::User(user.to_string())];
         let effort = self.effort(scenario);
@@ -251,15 +265,8 @@ impl Models {
             anyhow::ensure!(!limit.exhausted(self.store.as_ref())?, "read-only reflection cost budget exhausted");
         }
         #[cfg(test)]
-        if let Some(stub) = &self.stub {
-            let mut stub = stub.lock().unwrap();
-            stub.prompts.push((scenario.into(), policy.clone(), user.into()));
-            self.store.append_model_call(&ModelCallRecord {
-                ts: Utc::now(), scenario: scenario.into(), model_id: "stub".into(), session_id: scenario.into(),
-                uncached_input: 0, cached_input: 0, cache_write: 0, output: 0, latency_ms: 0,
-                cost_usd: stub.cost_usd, ok: true, error: None, escalated_from: None,
-            })?;
-            return extract_json(&stub.replies.pop_front().expect("unexpected model call"));
+        if self.stub.is_some() {
+            return extract_json(&self.stub_reply(scenario, policy, user)?);
         }
         if limit.is_some() {
             return extract_json(&self.ask_once(scenario, policy, system, user).await?);

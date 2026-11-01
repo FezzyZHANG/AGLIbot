@@ -29,7 +29,7 @@ use crate::mind::judge;
 use crate::mind::models::Models;
 use crate::mind::{reflect, watchlist};
 use crate::mind::speak::Speaker;
-use crate::mind::state::{Change, MindState};
+use crate::mind::state::{Change, ConversationAppraisals, MindState};
 use crate::ns::{Audience, Namespace, ProcessingPolicy, Scope};
 use crate::social::floor::{Floor, FloorDecision};
 use crate::social::identity::{Who, identify};
@@ -463,6 +463,7 @@ pub struct Agli {
     floor: Floor,
     flow: Flow,
     state: MindState,
+    appraisals: ConversationAppraisals,
     board: Arc<Mutex<Board>>,
     job: Option<RunningJob>,
     /// Group lines he has not yet "read" into his session, per chat key.
@@ -497,6 +498,7 @@ impl Agli {
             floor: Floor::default(),
             flow,
             state,
+            appraisals: ConversationAppraisals::default(),
             board: Arc::new(Mutex::new(board)),
             job: None,
             unseen: HashMap::new(),
@@ -530,6 +532,9 @@ impl Agli {
         };
         if let Err(e) = result {
             error!("{e:#}");
+        }
+        if let Err(e) = self.push_urgent().await {
+            warn!("urgent review delivery failed: {e:#}");
         }
         if let Err(e) = self.state.save(&self.cfg.data_dir()).and_then(|_| self.flow.save(&self.cfg.data_dir())) {
             warn!("saving state failed: {e:#}");
@@ -942,6 +947,7 @@ impl Agli {
         if let Some(req) = &intent.relay {
             let requester = ctx.partner.as_ref().map(|w| w.person_id.clone()).unwrap_or_else(|| ctx.key.clone());
             self.relay_request(&requester, req)?;
+            self.push_urgent().await?;
         }
         attach_followups(&mut self.board(), ctx, &mut intent);
         if intent.silent {
@@ -958,6 +964,14 @@ impl Agli {
             self.audit("me", "group_chime_in", true, &ctx.key, outcome)?;
         }
         anyhow::ensure!(outcome == Outcome::Sent, "reply delivery in {}: {outcome:?}", ctx.key);
+        if current > 0 && self.cfg.social.reflects_normally(&ctx.ns) {
+            for message in self.store.recent_in_ns(&ctx.ns, current)? {
+                if !message.outgoing && message.platform == ctx.platform && message.chat_id == ctx.chat_id
+                    && message.scope.permits(&ctx.audience) {
+                    self.appraisals.record(message.text, policy.clone());
+                }
+            }
+        }
         self.store.append_message(&MessageRecord {
             ts: Utc::now(),
             platform: ctx.platform.into(),
@@ -1025,6 +1039,13 @@ impl Agli {
     }
 
     async fn send_plain(&self, ctx: &ChatCtx, text: &str) -> Result<()> {
+        #[cfg(test)]
+        if let Some(test) = &self.test_chat {
+            test.sent_texts.lock().unwrap().push(text.to_string());
+            let outcome = test.sends.lock().unwrap().pop_front().expect("unexpected plain send");
+            anyhow::ensure!(outcome == Outcome::Sent, "plain delivery: {outcome:?}");
+            return Ok(());
+        }
         self.outlets.send(ctx.platform, &ctx.chat_id, text).await
     }
 
@@ -1042,7 +1063,8 @@ impl Agli {
     /// Someone other than the owner asked for something only the owner can authorise.
     fn relay_request(&self, requester: &str, request: &str) -> Result<()> {
         self.audit(requester, "relay_to_owner", false, "requester is not the owner", Outcome::Denied)?;
-        let j = judge::Judgement { verdict: judge::Verdict::Owner, reasons: "请求者不是主人，按权限规则转交".into(), fixes: String::new() };
+        let j = judge::Judgement { verdict: judge::Verdict::Owner, reasons: "请求者不是主人，按权限规则转交".into(), fixes: String::new(),
+            urgent: judge::deadline_today(request, Local::now().date_naive()) };
         judge::file(
             self.store.as_ref(),
             ReviewCategory::Act,
@@ -1213,10 +1235,14 @@ impl Agli {
         self.audit("owner", "delegate_result", true, &o.task_id, if o.ok { Outcome::Sent } else { Outcome::Failed })?;
         self.state.finished_work();
         reflect::note_today(self.store.as_ref(), &format!("专心做了 {} 分钟：{}（{}）", exit.minutes, o.title, if o.status() == TaskStatus::Done { "完成" } else { "没做完" }))?;
-        if self.state.energy.asleep {
-            self.deliveries.push(o);
-        } else {
-            self.deliver(o).await?;
+        self.push_urgent().await?;
+        // A watchdog pause has its own persisted review alert, including the reason and id.
+        if o.paused.is_none() || o.verdict.is_none() {
+            if self.state.energy.asleep {
+                self.deliveries.push(o);
+            } else {
+                self.deliver(o).await?;
+            }
         }
         // Work through what piled up, one namespace at a time.
         let held: Vec<String> = self.unseen.keys().cloned().collect();
@@ -1243,9 +1269,13 @@ impl Agli {
         let Some(reason) = self.job.as_mut().and_then(|job| job.overdue(Instant::now(), &self.cfg.runtime.hands)) else { return Ok(()) };
         let Some(id) = self.stop_job().await else { return Ok(()) };
         let task = self.board().get(&id).cloned().ok_or_else(|| anyhow::anyhow!("没有任务 {id}"))?;
+        let j = judge::Judgement { verdict: judge::Verdict::Owner, reasons: reason.clone(), fixes: String::new(), urgent: true };
+        let detail = format!("{reason}。已保存断点，任务尚未完成；可用 /run {id} 继续。");
+        let item = judge::file(self.store.as_ref(), ReviewCategory::Act, &task.title, &detail, &j, false,
+            json!({"task_id": id, "watchdog": true}))?;
         self.on_job_done(research::Outcome {
             task_id: id, title: task.title, ok: false, clarification: None,
-            paused: Some(reason.clone()), summary: reason, verdict: None,
+            paused: Some(reason.clone()), summary: reason, verdict: Some(format!("#{} {}", item.id, j.verdict.zh())),
         }).await
     }
 
@@ -1330,6 +1360,8 @@ impl Agli {
         self.watchdog().await?;
         let now = Utc::now();
         let changes = self.state.tick(now, &self.cfg.runtime.routine);
+        self.push_urgent().await?;
+        self.appraisals.apply(&self.models, &mut self.state).await;
         for c in &changes {
             match c {
                 Change::FellAsleep => self.nightly().await?,
@@ -1374,6 +1406,25 @@ impl Agli {
                 }
             };
             self.audit("me", "daily_digest", true, "", outcome)?;
+        }
+        Ok(())
+    }
+
+    async fn push_urgent(&self) -> Result<()> {
+        let Some(ctx) = self.owner_ctx() else { return Ok(()) };
+        while let Some(mut item) = judge::claim_urgent(self.store.as_ref(), self.state.energy.asleep)? {
+            let outcome = match self.send_plain(&ctx, &judge::urgent_message(&item)).await {
+                Ok(()) => {
+                    item.pushed = true;
+                    self.store.save_review(&item)?;
+                    Outcome::Sent
+                }
+                Err(e) => {
+                    warn!(id = item.id, "urgent review send failed: {e:#}");
+                    Outcome::Unknown
+                }
+            };
+            self.audit("me", "urgent_review", true, &item.id.to_string(), outcome)?;
         }
         Ok(())
     }
@@ -2277,7 +2328,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         a.store.kv_set("frozen", json!(true)).unwrap();
         a.store.kv_set("owner_last_chat", json!({"platform": "telegram", "chat_id": "42"})).unwrap();
-        a.test_chat = Some(TestChat::new(&["任务卡住，已暂停。"], &[Outcome::Sent]));
+        a.test_chat = Some(TestChat::new(&[], &[Outcome::Sent]));
         wake(a).await; // Exercise the actual tick and existing wake delivery path.
         assert!(cleaned.load(Ordering::Acquire));
         assert!(a.job.is_none() && !a.flow.is_focused());
@@ -2288,7 +2339,11 @@ mod tests {
         let log = std::fs::read_to_string(&log_path).unwrap();
         assert!(log.contains(&saved.note));
         wake(a).await;
-        assert_eq!(a.test_chat.as_ref().unwrap().turns.len(), 1);
+        assert!(a.test_chat.as_ref().unwrap().turns.is_empty());
+        assert_eq!(a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().len(), 1);
+        let reviews = a.store.reviews().unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert!(reviews[0].urgent && reviews[0].pushed && !reviews[0].notified);
         assert_eq!(std::fs::read_to_string(log_path).unwrap(), log);
         assert!(a.deliveries.is_empty());
     }
@@ -2310,7 +2365,10 @@ mod tests {
             }
         }
         assert!(a.job.is_none());
-        assert_eq!(a.deliveries.len(), 1);
+        assert!(a.deliveries.is_empty());
+        let reviews = a.store.reviews().unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert!(reviews[0].urgent && !reviews[0].pushed);
         let saved = a.board().get(&task.id).unwrap().clone();
         assert_eq!(saved.status, TaskStatus::Waiting);
         assert!(saved.note.contains("总运行时长已达 90 分钟"));
@@ -2335,8 +2393,11 @@ mod tests {
                 a.watchdog().await.unwrap();
             }
             assert!(a.job.is_none());
-            assert_eq!(a.deliveries.len(), 1);
-            assert!(a.deliveries[0].summary.contains("没有增长"));
+            assert!(a.deliveries.is_empty());
+            let reviews = a.store.reviews().unwrap();
+            assert_eq!(reviews.len(), 1);
+            assert!(reviews[0].urgent && !reviews[0].pushed);
+            assert!(reviews[0].detail.contains("没有增长"));
         }
     }
 
@@ -2442,6 +2503,89 @@ mod tests {
         a.wake_decide = false;
         a.on_tick().await.unwrap();
         assert!(!a.state.energy.asleep);
+    }
+
+    #[tokio::test]
+    async fn urgent_relay_pushes_immediately_while_frozen_and_only_once() {
+        let mut test = TestAgli::new("urgent-relay").await;
+        let a = &mut test.agli;
+        a.store.kv_set("frozen", json!(true)).unwrap();
+        a.store.kv_set("owner_last_chat", json!({"platform":"telegram", "chat_id":"42"})).unwrap();
+        a.test_chat = Some(TestChat::new(&["<转告主人>今天 18 点前完成报告</转告主人>收到。"], &[Outcome::Sent, Outcome::Sent]));
+        a.handle(WorkItem::Messages(vec![private_message("7", "请转告主人：今天 18 点前完成报告")])).await;
+        let items = a.store.reviews().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].urgent && items[0].pushed && !items[0].notified);
+        a.push_urgent().await.unwrap();
+        let sent = a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2); // One owner alert, one reply to the sender; no tick needed.
+        assert!(sent[0].contains("有件急事") && sent[0].contains("#1"));
+        assert_eq!(sent[1], "收到。");
+        assert!(judge::digest(a.store.as_ref()).unwrap().unwrap().contains("已单独推送"));
+        a.relay_request("telegram:7", "下周截止").unwrap();
+        assert!(!a.store.reviews().unwrap()[1].urgent);
+    }
+
+    #[tokio::test]
+    async fn urgent_alerts_wait_for_owner_route_and_wake_and_do_not_retry_failed_sends() {
+        let mut test = TestAgli::new("urgent-wake").await;
+        let a = &mut test.agli;
+        a.relay_request("telegram:7", "deadline today").unwrap();
+        a.push_urgent().await.unwrap(); // No route: do not claim the item.
+        a.store.kv_set("owner_last_chat", json!({"platform":"telegram", "chat_id":"42"})).unwrap();
+        a.store.kv_set("frozen", json!(true)).unwrap();
+        a.state.energy.asleep = true;
+        a.test_chat = Some(TestChat::new(&[], &[Outcome::Sent, Outcome::Unknown]));
+        a.push_urgent().await.unwrap();
+        assert!(!a.store.reviews().unwrap()[0].pushed);
+        assert!(a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().is_empty());
+        wake(a).await;
+        assert!(a.store.reviews().unwrap()[0].pushed);
+        wake(a).await;
+        a.relay_request("telegram:7", "今天截止的另一件事").unwrap();
+        a.push_urgent().await.unwrap(); // Unknown result must not be retried.
+        a.push_urgent().await.unwrap();
+        let reopened = crate::store::jsonl::JsonlStore::open(&a.cfg.data_dir()).unwrap();
+        assert!(judge::claim_urgent(&reopened, false).unwrap().is_none());
+        let items = reopened.reviews().unwrap();
+        assert!(items[0].pushed && !items[1].pushed);
+        assert_eq!(a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().len(), 2);
+        let digest = judge::digest(&reopened).unwrap().unwrap();
+        assert!(digest.contains("#1") && digest.contains("#2"));
+        assert_eq!(digest.matches("已单独推送").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn replied_conversations_appraise_once_per_tick_and_skip_read_only_groups() {
+        let mut test = TestAgli::new("appraisal-tick").await;
+        let a = &mut test.agli;
+        a.models = Arc::new(Models::stub(a.store.clone(), vec![
+            r#"{"dp":0.03,"da":0.02,"dd":-0.01,"why":"friendly conversation"}"#.into(),
+        ]));
+        a.test_chat = Some(TestChat::new(&["hello", "hi", "[沉默]", "failed"], &[Outcome::Sent, Outcome::Sent, Outcome::Failed]));
+        a.store.kv_set("frozen", json!(true)).unwrap();
+        let before = (a.state.mood.pleasure, a.state.mood.arousal, a.state.mood.dominance);
+        a.on_messages(vec![private_message("7", "private input")]).await.unwrap();
+        a.on_messages(group_messages(&["allowed input"], true)).await.unwrap();
+        a.on_messages(vec![private_message("8", "silent input")]).await.unwrap();
+        assert!(a.on_messages(vec![private_message("9", "failed input")]).await.is_err());
+        let mut readonly = group_messages(&["readonly input"], true);
+        readonly[0].chat_id = "-8".into();
+        a.on_messages(readonly).await.unwrap();
+        assert!(a.models.stub_prompts().is_empty());
+        wake(a).await;
+        let prompts = a.models.stub_prompts();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].0, "triage");
+        assert!(prompts[0].2.contains("private input") && prompts[0].2.contains("allowed input"));
+        for excluded in ["readonly input", "silent input", "failed input"] {
+            assert!(!prompts[0].2.contains(excluded));
+        }
+        assert!((a.state.mood.pleasure - before.0 - 0.03).abs() < 1e-6);
+        assert!((a.state.mood.arousal - before.1 - 0.02).abs() < 1e-6);
+        assert!((a.state.mood.dominance - before.2 + 0.01).abs() < 1e-6);
+        wake(a).await;
+        assert_eq!(a.models.stub_prompts().len(), 1);
     }
 
     #[tokio::test]

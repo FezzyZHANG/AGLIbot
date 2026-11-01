@@ -366,6 +366,8 @@ mod tests {
             status: ReviewStatus::Open,
             payload: Value::Null,
             notified: false,
+            urgent: false,
+            pushed: false,
         };
         store.save_review(&r).unwrap();
         r.status = ReviewStatus::Approved;
