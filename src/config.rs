@@ -351,6 +351,16 @@ impl HandsCfg {
         self.dsh_home = std::path::absolute(root.join(&self.dsh_home)).context("resolving AGLI DSH home")?;
         Ok(())
     }
+
+    /// Fail at load time rather than when the first task starts.
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.code != DelegateTool::Dsh, "hands.code: dsh is not supported; DSH is research-only (use codex or off)");
+        for (name, minutes) in [("timeout_min", self.timeout_min), ("stall_minutes", self.stall_minutes),
+            ("total_budget_minutes", self.total_budget_minutes)] {
+            anyhow::ensure!(minutes > 0, "hands.{name} must be > 0");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -474,6 +484,7 @@ impl Config {
     fn validate(&self) -> Result<()> {
         self.runtime.session.debounce.validate()?;
         self.runtime.memory.validate()?;
+        self.runtime.hands.validate()?;
         for m in &self.models.models {
             if !self.models.providers.contains_key(&m.provider) {
                 bail!("model `{}` references unknown provider `{}`", m.id, m.provider);
@@ -507,6 +518,25 @@ fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hands_validation_rejects_dsh_code_and_zero_minutes() {
+        let base = "research: dsh
+code: codex
+codex_model: m
+timeout_min: 30
+";
+        let hands: HandsCfg = serde_yaml::from_str(base).unwrap();
+        hands.validate().unwrap();
+        let hands: HandsCfg = serde_yaml::from_str(&base.replace("code: codex", "code: dsh")).unwrap();
+        assert!(hands.validate().unwrap_err().to_string().contains("research-only"));
+        for key in ["timeout_min: 0", "stall_minutes: 0", "total_budget_minutes: 0"] {
+            let yaml = if key.starts_with("timeout") { base.replace("timeout_min: 30", key) } else { format!("{base}{key}
+") };
+            let hands: HandsCfg = serde_yaml::from_str(&yaml).unwrap();
+            assert!(hands.validate().is_err(), "{key}");
+        }
+    }
 
     #[test]
     fn memory_decay_defaults_overrides_and_validation() {

@@ -158,7 +158,7 @@ memory:
 | `hands` | 对象 | 必填 | 委派设置 |
 | `hands.max_jobs` | usize | 1 | **可选、当前未写（#37）**；必须 >= 1。大于 1 时只有一个心流焦点，其他任务后台运行；主人手动 /run 可额外占一个槽。等于 1 时无额外槽 |
 | `hands.research` | `codex` / `dsh` / `off` | `codex` | 可选；**当前显式设为 dsh**。研究资料搜集执行器，off 关闭外部搜集，不等于关闭所有研究规划模型调用 |
-| `hands.code` | 同上枚举 | 必填 | 当前编码仅支持 codex / off；dsh 虽可解析，执行时会报错 |
+| `hands.code` | 同上枚举 | 必填 | 编码仅支持 codex / off；写 dsh 会在加载配置时报错 |
 | `hands.codex_model` | 字符串 | 必填 | 固定 Codex 模型，不跟随其用户配置默认值；研究走 dsh 时仍是必填项 |
 | `hands.dsh_profile` | 字符串 | `agli` | **可选、当前未写**；DSH profile 名称，模型与工具权限由该 profile 管理 |
 | `hands.dsh_home` | 路径 | `data/dsh-home` | **可选、当前未写**；启动时相对项目根解析为绝对路径，供 DSH_HOME 使用；不跟随 data_dir 自动变化 |
@@ -318,6 +318,6 @@ http_proxy https_proxy all_proxy no_proxy
 
 - social.yaml 的旧白名单注释、scenarios.yaml 的 review/effort 注释均不能完整反映实现；实际行为见上表。
 - daily_budget_usd 对一般模型路由是降档阈值，不是 DESIGN 所说的全局硬预算；只读反思金额上限也是按记录准入，可能被最后一次调用越过。
-- hands.code 接受 dsh 枚举但执行时拒绝；timeout_min / stall_minutes / total_budget_minutes 不作正数校验。facts_in_context 实际按人限制。
+- （已修正）hands.code: dsh 与 timeout_min / stall_minutes / total_budget_minutes 为 0 现在在加载配置时报错。facts_in_context 实际按人限制。
 - embedding 的 provider 能力不在启动时验证；tools 的缓存参数仅供观测，新名称部分覆盖也不继承协议策略。
 - Config 的多数结构未启用 deny_unknown_fields，拼错键或给 serde(skip) 内部字段赋值可能被忽略。请使用本文列出的键，不依赖“能解析”证明生效。
