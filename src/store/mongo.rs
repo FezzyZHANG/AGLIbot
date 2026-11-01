@@ -22,6 +22,7 @@ const COLLECTIONS: &[&str] =
     &["messages", "model_calls", "episodes", "persons", "lessons", "audit", "reviews", "kv", "relations", "groups"];
 
 pub struct MongoStore {
+    cache: super::cache::Cache,
     db: Database,
     writes: Mutex<()>,
 }
@@ -97,7 +98,7 @@ impl MongoStore {
             options.connect_timeout.get_or_insert(Duration::from_secs(5));
             let client = Client::with_options(options)
                 .map_err(|_| anyhow!("MongoDB startup: invalid client options (URL redacted); no JSONL fallback"))?;
-            let store = Self { db: client.database(database), writes: Mutex::new(()) };
+            let store = Self { db: client.database(database), writes: Mutex::new(()), cache: Default::default() };
             store.db.run_command(doc! { "ping": 1 }).run()
                 .map_err(|_| anyhow!("MongoDB startup: connection/authentication failed; check MONGO_URL, MONGO_DATABASE and server availability; no JSONL fallback"))?;
             if !read_only {
@@ -246,50 +247,75 @@ impl Store for MongoStore {
         self.append("model_calls", c, model_call_fields(c))
     }
 
+    fn model_calls_between(&self, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Vec<ModelCallRecord>> {
+        let calls: Vec<ModelCallRecord> = self.scan("model_calls", time_filter(since))?;
+        Ok(calls.into_iter().filter(|c| c.ts >= since && c.ts < until).collect())
+    }
+
     fn spent_since(&self, since: DateTime<Utc>) -> Result<f64> {
         let calls: Vec<ModelCallRecord> = self.scan("model_calls", time_filter(since))?;
         Ok(calls.iter().filter(|c| c.ts >= since).map(|c| c.cost_usd).sum())
     }
 
     fn append_episode(&self, e: &Episode) -> Result<()> {
-        self.append("episodes", e, doc! { "ns": e.ns.to_string(), "ts": timestamp(e.ts) })
+        self.cache.write(|| {
+            self.append("episodes", e, doc! { "ns": e.ns.to_string(), "ts": timestamp(e.ts) })
+        })
     }
 
     fn save_embedding(&self, embedding: &EpisodeEmbedding) -> Result<()> {
-        self.save("embeddings", &embedding.episode_id, embedding, false)
+        self.cache.write(|| {
+            self.save("embeddings", &embedding.episode_id, embedding, false)
+        })
     }
 
     fn load_embeddings(&self, model_id: &str) -> Result<BTreeMap<String, Vec<f32>>> {
-        let all: BTreeMap<String, EpisodeEmbedding> = self.keyed_snapshot("embeddings")?;
+        let all = self.cache.read("embeddings", |d| &mut d.embeddings, || self.keyed_snapshot("embeddings"))?;
         Ok(all.into_iter().filter(|(_, e)| e.model_id == model_id).map(|(id, e)| (id, e.vector)).collect())
     }
 
     fn all_episodes(&self) -> Result<Vec<Episode>> {
-        self.scan("episodes", doc! {})
+        self.cache.read("episodes", |d| &mut d.episodes, || {
+            self.scan("episodes", doc! {})
+        })
+    }
+
+    fn episodes(&self) -> Result<Vec<Episode>> {
+        self.cache.read("active_episodes", |d| &mut d.active_episodes, || {
+            Ok(super::active_episodes(self.scan("episodes", doc! {})?))
+        })
     }
 
     fn archive_episode(&self, archive: &Episode) -> Result<()> {
-        blocking(|| {
-            let _guard = self.writes.lock().unwrap_or_else(|e| e.into_inner());
-            if super::archive_needed(&self.all_episodes()?, archive)? {
-                let fields = doc! { "_id": &archive.id, "_order": self.next_order()?,
-                    "ns": archive.ns.to_string(), "ts": timestamp(archive.ts) };
-                self.collection("episodes").insert_one(record(archive, fields)?).run()?;
-            }
-            Ok(())
+        self.cache.write(|| {
+            blocking(|| {
+                let _guard = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+                if super::archive_needed(&self.scan("episodes", doc! {})?, archive)? {
+                    let fields = doc! { "_id": &archive.id, "_order": self.next_order()?,
+                        "ns": archive.ns.to_string(), "ts": timestamp(archive.ts) };
+                    self.collection("episodes").insert_one(record(archive, fields)?).run()?;
+                }
+                Ok(())
+            })
         })
     }
 
     fn persons(&self) -> Result<BTreeMap<String, Person>> {
-        Ok(self.scan::<Person>("persons", doc! {})?.into_iter().map(|p| (p.person_id.clone(), p)).collect())
+        self.cache.read("persons", |d| &mut d.persons, || {
+            Ok(self.scan::<Person>("persons", doc! {})?.into_iter().map(|p| (p.person_id.clone(), p)).collect())
+        })
     }
 
     fn save_person(&self, p: &Person) -> Result<()> {
-        self.save("persons", &p.person_id, p, false)
+        self.cache.write(|| {
+            self.save("persons", &p.person_id, p, false)
+        })
     }
 
     fn append_lesson(&self, l: &Lesson) -> Result<()> {
-        self.append("lessons", l, doc! { "ts": timestamp(l.ts) })
+        self.cache.write(|| {
+            self.append("lessons", l, doc! { "ts": timestamp(l.ts) })
+        })
     }
 
     fn group(&self, chat_id: &str) -> Result<Option<Group>> {
@@ -310,7 +336,9 @@ impl Store for MongoStore {
     }
 
     fn lessons(&self) -> Result<Vec<Lesson>> {
-        self.scan("lessons", doc! {})
+        self.cache.read("lessons", |d| &mut d.lessons, || {
+            self.scan("lessons", doc! {})
+        })
     }
 
     fn append_audit(&self, a: &AuditRecord) -> Result<()> {

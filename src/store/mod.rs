@@ -1,5 +1,6 @@
 //! Storage behind a synchronous trait: MongoDB when configured, JSONL otherwise (DESIGN 2b).
 
+mod cache;
 pub mod import;
 pub mod jsonl;
 pub mod mongo;
@@ -285,6 +286,8 @@ pub trait Store: Send + Sync {
     fn active_namespaces(&self, after: DateTime<Utc>) -> Result<Vec<Namespace>>;
 
     fn append_model_call(&self, c: &ModelCallRecord) -> Result<()>;
+    /// Calls in the half-open focus window [since, until).
+    fn model_calls_between(&self, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Vec<ModelCallRecord>>;
     fn spent_since(&self, since: DateTime<Utc>) -> Result<f64>;
 
     fn append_episode(&self, e: &Episode) -> Result<()>;

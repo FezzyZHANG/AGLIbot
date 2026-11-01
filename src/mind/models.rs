@@ -18,6 +18,7 @@ use crate::ns::ProcessingPolicy;
 use crate::store::{ModelCallRecord, Store};
 
 pub struct Models {
+    pub focus_cache: super::flow_metrics::FocusCache,
     embedding: Option<super::embedding::EmbeddingCfg>,
     embedding_warned: AtomicBool,
     router: Router,
@@ -97,6 +98,7 @@ impl Models {
         });
         info!(enabled = embedding.is_some(), model = ?embedding.as_ref().map(|e| e.model_id()), "semantic recall startup");
         Ok(Models {
+            focus_cache: super::flow_metrics::FocusCache::new(cfg)?,
             embedding, embedding_warned: AtomicBool::new(false),
             router, llm, store, budget: Mutex::new(budget), has_local,
             #[cfg(test)]
@@ -107,6 +109,7 @@ impl Models {
     #[cfg(test)]
     pub fn stub(store: Arc<dyn Store>, replies: Vec<String>) -> Self {
         Self {
+            focus_cache: Default::default(),
             embedding: None, embedding_warned: AtomicBool::new(false),
             router: Router::new(vec![], Default::default()),
             llm: LlmClient::new(Default::default()).unwrap(), store,
@@ -221,7 +224,9 @@ impl Models {
         session_id: &str,
         escalated_from: Option<&str>,
     ) -> Result<Reply> {
+        self.focus_cache.resumed(model, session_id, Utc::now());
         let outcome = self.llm.complete(model, prompt).await;
+        self.focus_cache.completed(model, session_id, Utc::now());
         let (usage, latency, error) = match &outcome {
             Ok(r) if !r.text.trim().is_empty() => (r.usage.clone(), r.latency, None),
             Ok(r) => (r.usage.clone(), r.latency, Some("empty reply".to_string())),

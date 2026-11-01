@@ -29,14 +29,18 @@ const REVIEWS: &str = "reviews.json";
 const KV: &str = "kv.json";
 
 pub struct JsonlStore {
+    cache: super::cache::Cache,
     dir: PathBuf,
     lock: Mutex<()>,
 }
 
 impl JsonlStore {
+    #[cfg(test)]
+    pub(crate) fn recall_cache_counts(&self) -> (u64, u64) { self.cache.counts() }
+
     pub(super) fn import_snapshot(dir: &Path) -> Result<super::import::Snapshot> {
         anyhow::ensure!(dir.is_dir(), "source must be an existing data directory");
-        let store = Self { dir: dir.to_path_buf(), lock: Mutex::new(()) };
+        let store = Self { dir: dir.to_path_buf(), lock: Mutex::new(()), cache: Default::default() };
         let snapshot = super::import::Snapshot {
             messages: store.scan_mode(MESSAGES, true)?,
             model_calls: store.scan_mode(MODEL_CALLS, true)?,
@@ -55,7 +59,7 @@ impl JsonlStore {
 
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        Ok(JsonlStore { dir: dir.to_path_buf(), lock: Mutex::new(()) })
+        Ok(JsonlStore { dir: dir.to_path_buf(), lock: Mutex::new(()), cache: Default::default() })
     }
 
     fn guard(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -161,53 +165,78 @@ impl Store for JsonlStore {
         self.append(MODEL_CALLS, c)
     }
 
+    fn model_calls_between(&self, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Vec<ModelCallRecord>> {
+        let calls: Vec<ModelCallRecord> = self.scan(MODEL_CALLS)?;
+        Ok(calls.into_iter().filter(|c| c.ts >= since && c.ts < until).collect())
+    }
+
     fn spent_since(&self, since: DateTime<Utc>) -> Result<f64> {
         let calls: Vec<ModelCallRecord> = self.scan(MODEL_CALLS)?;
         Ok(calls.iter().filter(|c| c.ts >= since).map(|c| c.cost_usd).sum())
     }
 
     fn append_episode(&self, e: &Episode) -> Result<()> {
-        self.append(EPISODES, e)
+        self.cache.write(|| {
+            self.append(EPISODES, e)
+        })
     }
 
     fn save_embedding(&self, embedding: &EpisodeEmbedding) -> Result<()> {
-        self.update_doc("embeddings.json", |doc: &mut BTreeMap<String, EpisodeEmbedding>| {
-            doc.insert(embedding.episode_id.clone(), embedding.clone());
+        self.cache.write(|| {
+            self.update_doc("embeddings.json", |doc: &mut BTreeMap<String, EpisodeEmbedding>| {
+                doc.insert(embedding.episode_id.clone(), embedding.clone());
+            })
         })
     }
 
     fn load_embeddings(&self, model_id: &str) -> Result<BTreeMap<String, Vec<f32>>> {
-        let _g = self.guard();
-        let all: BTreeMap<String, EpisodeEmbedding> = self.read_doc("embeddings.json")?;
+        let all = self.cache.read("embeddings", |d| &mut d.embeddings, || self.read_doc("embeddings.json"))?;
         Ok(all.into_iter().filter(|(_, e)| e.model_id == model_id).map(|(id, e)| (id, e.vector)).collect())
     }
 
     fn all_episodes(&self) -> Result<Vec<Episode>> {
-        let _g = self.guard();
-        self.scan(EPISODES)
+        self.cache.read("episodes", |d| &mut d.episodes, || {
+            let _g = self.guard();
+            self.scan(EPISODES)
+        })
+    }
+
+    fn episodes(&self) -> Result<Vec<Episode>> {
+        self.cache.read("active_episodes", |d| &mut d.active_episodes, || {
+            let _g = self.guard();
+            Ok(super::active_episodes(self.scan(EPISODES)?))
+        })
     }
 
     fn archive_episode(&self, archive: &Episode) -> Result<()> {
-        let _g = self.guard();
-        if super::archive_needed(&self.scan_mode(EPISODES, true)?, archive)? {
-            self.append_unlocked(EPISODES, archive)?;
-        }
-        Ok(())
+        self.cache.write(|| {
+            let _g = self.guard();
+            if super::archive_needed(&self.scan_mode(EPISODES, true)?, archive)? {
+                self.append_unlocked(EPISODES, archive)?;
+            }
+            Ok(())
+        })
     }
 
     fn persons(&self) -> Result<BTreeMap<String, Person>> {
-        let _g = self.guard();
-        self.read_doc(PERSONS)
+        self.cache.read("persons", |d| &mut d.persons, || {
+            let _g = self.guard();
+            self.read_doc(PERSONS)
+        })
     }
 
     fn save_person(&self, p: &Person) -> Result<()> {
-        self.update_doc(PERSONS, |doc: &mut BTreeMap<String, Person>| {
-            doc.insert(p.person_id.clone(), p.clone());
+        self.cache.write(|| {
+            self.update_doc(PERSONS, |doc: &mut BTreeMap<String, Person>| {
+                doc.insert(p.person_id.clone(), p.clone());
+            })
         })
     }
 
     fn append_lesson(&self, l: &Lesson) -> Result<()> {
-        self.append(LESSONS, l)
+        self.cache.write(|| {
+            self.append(LESSONS, l)
+        })
     }
 
     fn group(&self, chat_id: &str) -> Result<Option<Group>> {
@@ -235,7 +264,9 @@ impl Store for JsonlStore {
     }
 
     fn lessons(&self) -> Result<Vec<Lesson>> {
-        self.scan(LESSONS)
+        self.cache.read("lessons", |d| &mut d.lessons, || {
+            self.scan(LESSONS)
+        })
     }
 
     fn append_audit(&self, a: &AuditRecord) -> Result<()> {

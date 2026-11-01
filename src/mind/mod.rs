@@ -3,6 +3,7 @@ pub mod context;
 pub mod decide;
 pub mod embedding;
 pub mod flow;
+pub mod flow_metrics;
 pub mod judge;
 pub mod knowledge;
 pub mod llm;
