@@ -3,6 +3,7 @@ pub mod context;
 pub mod decide;
 pub mod flow;
 pub mod judge;
+pub mod knowledge;
 pub mod llm;
 pub mod models;
 pub mod reflect;
