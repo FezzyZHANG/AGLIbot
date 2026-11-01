@@ -18,6 +18,7 @@ use tracing::info;
 use super::models::Models;
 use super::{commitments, judge};
 use crate::ns::{Namespace, ProcessingPolicy, Scope};
+use crate::social::groups;
 use crate::social::people::People;
 use crate::store::{Episode, Fact, Lesson, ReviewCategory, Store};
 
@@ -47,6 +48,8 @@ struct RawLesson {
 
 #[derive(Deserialize)]
 struct Extracted {
+    #[serde(flatten)]
+    social: groups::Extracted,
     #[serde(flatten)]
     agenda: commitments::Extracted,
     #[serde(default)]
@@ -105,10 +108,18 @@ pub async fn extract_ns(models: &Models, store: &dyn Store, people: &mut People,
          \"facts\": [{{\"person\": \"\", \"text\": \"\"}}], \"lessons\": [{{\"text\": \"\", \"shareable\": false}}]}}，没有就给空数组。\n\n{transcript}"
     );
     let (agenda, policy) = commitments::extraction_context(store, ns, &msgs)?;
-    let raw: Extracted = models.ask_json("extract", &policy, system, &format!("{user}\n{agenda}")).await?;
+    // Existing agenda items are also model input; a restricted one must not taint a group card.
+    let social_allowed = matches!(ns, Namespace::Group(_)) && commitments::load(store)?.iter()
+        .filter(|c| c.ns == *ns && c.status == commitments::Status::Open)
+        .all(|c| c.scope == scope);
+    let social = if social_allowed { groups::extraction_prompt(ns) } else { "" };
+    let raw: Extracted = models.ask_json("extract", &policy, system, &format!("{user}\n{agenda}{social}")).await?;
 
     let now = Utc::now();
     commitments::apply(store, ns, &msgs, raw.agenda, now)?;
+    if social_allowed {
+        groups::apply(store, ns, &msgs, raw.social)?;
+    }
     let mut out = ExtractOutcome { messages: msgs.len(), ..Default::default() };
     let mut episode_ids = Vec::new();
     for (i, e) in raw.episodes.into_iter().enumerate() {

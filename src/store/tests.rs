@@ -52,6 +52,8 @@ pub(super) fn contract(store: &dyn Store) {
     assert!(store.active_namespaces(ts).unwrap().is_empty());
     assert_eq!(store.spent_since(ts).unwrap(), 0.0);
     assert!(store.persons().unwrap().is_empty());
+    assert!(store.group("telegram:-7").unwrap().is_none());
+    assert!(store.relations(&Namespace::Group("telegram:-7".into())).unwrap().is_empty());
     assert!(store.episodes().unwrap().is_empty());
     assert!(store.lessons().unwrap().is_empty());
     assert!(store.reviews().unwrap().is_empty());
@@ -147,6 +149,42 @@ pub(super) fn contract(store: &dyn Store) {
         &BTreeMap::from([(other.person_id.clone(), other), (person.person_id.clone(), person)]),
     );
 
+    let mut group = Group {
+        chat_id: "telegram:-7".into(), members: vec!["a".into(), "b".into()],
+        norms: vec!["old".into()], topics: vec!["Rust".into()], my_role: "observer".into(),
+        activity_stats: ActivityStats { messages: u64::MAX, first_seen: ts, last_seen: ts },
+        ns: Namespace::Group("telegram:-7".into()), scope: Scope::Group { id: "telegram:-7".into() },
+    };
+    store.save_group(&group).unwrap();
+    group.norms = vec!["new".into()];
+    store.save_group(&group).unwrap();
+    same(&store.group(&group.chat_id).unwrap(), &Some(group.clone()));
+    let mut other_group = group.clone();
+    other_group.chat_id = "qq:-7".into();
+    other_group.ns = Namespace::Group(other_group.chat_id.clone());
+    other_group.scope = Scope::Group { id: other_group.chat_id.clone() };
+    other_group.norms.clear();
+    store.save_group(&other_group).unwrap();
+    same(&store.group(&group.chat_id).unwrap(), &Some(group.clone()));
+    same(&store.group(&other_group.chat_id).unwrap(), &Some(other_group.clone()));
+    assert!(store.group("missing").unwrap().is_none());
+
+    let mut relation = Relation {
+        a: "$a.with.dots".into(), b: "b".into(), kind: "helps".into(), evidence: vec![ts],
+        strength: 0.5, ns: group.ns.clone(), scope: group.scope.clone(),
+    };
+    store.save_relation(&relation).unwrap();
+    let mut other_relation = relation.clone();
+    other_relation.ns = other_group.ns.clone();
+    other_relation.scope = other_group.scope.clone();
+    store.save_relation(&other_relation).unwrap();
+    relation.strength = 0.9;
+    relation.evidence.push(ts + Duration::nanoseconds(1));
+    store.save_relation(&relation).unwrap();
+    same(&store.relations(&group.ns).unwrap(), &vec![relation]);
+    same(&store.relations(&other_group.ns).unwrap(), &vec![other_relation]);
+    assert!(store.relations(&Namespace::Person("a".into())).unwrap().is_empty());
+
     let mut review = ReviewItem {
         id: 9,
         ts,
@@ -204,6 +242,15 @@ pub(super) fn persisted(store: &dyn Store) {
     assert_eq!(store.episodes().unwrap().len(), 2);
     assert_eq!(store.lessons().unwrap().len(), 2);
     assert_eq!(store.persons().unwrap()["p.z"].name, "new");
+    let group = store.group("telegram:-7").unwrap().unwrap();
+    assert_eq!(group.norms, ["new"]);
+    assert_eq!(group.activity_stats.messages, u64::MAX);
+    assert_eq!(group.activity_stats.last_seen, time());
+    assert!(store.group("qq:-7").unwrap().unwrap().norms.is_empty());
+    let relations = store.relations(&group.ns).unwrap();
+    assert_eq!(relations.len(), 1);
+    assert_eq!(relations[0].strength, 0.9);
+    assert_eq!(relations[0].evidence, [time(), time() + Duration::nanoseconds(1)]);
     let reviews = store.reviews().unwrap();
     assert_eq!(reviews.iter().map(|r| r.id).collect::<Vec<_>>(), [9, 2]);
     assert_eq!(reviews[0].status, ReviewStatus::Approved);

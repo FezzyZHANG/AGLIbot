@@ -19,6 +19,8 @@ pub(super) struct Snapshot {
     pub model_calls: Vec<ModelCallRecord>,
     pub episodes: Vec<Episode>,
     pub persons: BTreeMap<String, Person>,
+    pub groups: BTreeMap<String, Group>,
+    pub relations: BTreeMap<String, Relation>,
     pub lessons: Vec<Lesson>,
     pub audit: Vec<AuditRecord>,
     pub reviews: Vec<ReviewItem>,
@@ -36,6 +38,8 @@ impl Snapshot {
             ("model_calls", records(&self.model_calls)?),
             ("episodes", records(&self.episodes)?),
             ("persons", records(&self.persons)?),
+            ("groups", records(&self.groups)?),
+            ("relations", records(&self.relations)?),
             ("lessons", records(&self.lessons)?),
             ("audit", records(&self.audit)?),
             ("reviews", records(&self.reviews)?),
@@ -49,6 +53,8 @@ impl Snapshot {
             "persons: key differs from person_id"
         );
         let ids: std::collections::BTreeSet<_> = self.reviews.iter().map(|r| r.id).collect();
+        ensure!(self.groups.iter().all(|(key, g)| key == &g.chat_id), "groups: key differs from chat_id");
+        ensure!(self.relations.iter().all(|(key, r)| key == &r.key()), "relations: key differs from source edge");
         ensure!(ids.len() == self.reviews.len(), "reviews: duplicate ids");
         ensure!(!ids.contains(&u64::MAX), "reviews: next_review_id would overflow");
         Ok(())
@@ -79,6 +85,16 @@ impl Snapshot {
             "lessons" => {
                 for item in &self.lessons {
                     target.append_lesson(item)?;
+                }
+            }
+            "groups" => {
+                for item in self.groups.values() {
+                    target.save_group(item)?;
+                }
+            }
+            "relations" => {
+                for item in self.relations.values() {
+                    target.save_relation(item)?;
                 }
             }
             "audit" => {
@@ -237,7 +253,7 @@ mod tests {
             })
             .collect();
         let empty_plan = plan(&source, &Snapshot::default())?;
-        assert_eq!(empty_plan.len(), 8);
+        assert_eq!(empty_plan.len(), 10);
         assert!(empty_plan.iter().all(|p| p.written > 0 && p.skipped == 0));
         let reread = JsonlStore::import_snapshot(&fixture.0)?;
         assert!(plan(&source, &reread)?.iter().all(|p| p.written == 0 && p.skipped > 0));
