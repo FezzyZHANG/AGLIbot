@@ -21,6 +21,9 @@ pub struct Envelope {
     /// Someone @-ed him or replied to one of his messages.
     pub mentions_me: bool,
     pub text: String,
+    /// When the channel received it. Messages can wait in the event queue while a reply is
+    /// generated; the debounce window measures gaps from arrival, not from dequeueing.
+    pub arrived: Option<tokio::time::Instant>,
 }
 
 impl Envelope {

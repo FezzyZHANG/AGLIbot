@@ -8,7 +8,6 @@ mod social;
 mod store;
 mod work;
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,25 +16,33 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use agli::{Agli, Event, WorkItem, next_work};
+use agli::{Agli, Event, WorkItem, WorkQueue, next_work};
 use channels::Outlets;
 use channels::telegram::Telegram;
 use config::Config;
 use mind::models::Models;
 
-async fn recv_work(events: &mut mpsc::Receiver<Event>, queued: &mut VecDeque<Event>, acl: &config::AclCfg) -> Option<WorkItem> {
-    let ev = match queued.pop_front() {
-        Some(ev) => ev,
-        None => events.recv().await?,
-    };
-    let inbound = matches!(ev, Event::Inbound(_));
-    queued.push_front(ev);
-    if inbound {
-        while let Ok(ev) = events.try_recv() {
-            queued.push_back(ev);
+async fn recv_work(events: &mut mpsc::Receiver<Event>, queued: &mut WorkQueue, acl: &config::AclCfg, session: &config::SessionCfg) -> Option<WorkItem> {
+    if queued.is_empty() {
+        queued.push(events.recv().await?, &session.debounce);
+    }
+    // Drain only the current backlog, so a busy producer cannot postpone Ctrl+C or the cap.
+    for _ in 0..events.len() {
+        if let Ok(ev) = events.try_recv() {
+            queued.push(ev, &session.debounce);
         }
     }
-    next_work(queued, acl)
+    while let Some(deadline) = queued.deadline(acl, session) {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => break,
+            ev = events.recv() => match ev {
+                Some(ev) => queued.push(ev, &session.debounce),
+                None => break,
+            },
+        }
+    }
+    next_work(queued, acl, session)
 }
 
 #[tokio::main]
@@ -109,13 +116,13 @@ async fn main() -> Result<()> {
         });
     }
 
+    let mut queued = WorkQueue::with_store(store.clone());
     let mut agli = Agli::new(cfg.clone(), store, models, outlets, events_tx)?;
-    let mut queued = VecDeque::new();
     info!("AGLI is up");
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            work = recv_work(&mut events, &mut queued, &cfg.acl) => match work {
+            work = recv_work(&mut events, &mut queued, &cfg.acl, &cfg.runtime.session) => match work {
                 Some(work) => agli.handle(work).await,
                 None => break,
             },

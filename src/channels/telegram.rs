@@ -131,6 +131,7 @@ fn parse_message(msg: &Value, me_id: i64, me_username: &str) -> Option<Envelope>
     let replied_to_me = me_id != 0 && msg.pointer("/reply_to_message/from/id").and_then(Value::as_i64) == Some(me_id);
     let mentioned = !me_username.is_empty() && text.contains(&format!("@{me_username}"));
     Some(Envelope {
+        arrived: Some(tokio::time::Instant::now()),
         platform: "telegram",
         chat_id: chat.get("id")?.as_i64()?.to_string(),
         message_id: msg.get("message_id").and_then(Value::as_i64).map(|id| id.to_string()),

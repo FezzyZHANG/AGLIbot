@@ -247,6 +247,7 @@ fn parse_event(v: &Value, shared: &Shared) -> Option<Envelope> {
         .unwrap_or_default()
         .to_string();
     Some(Envelope {
+        arrived: Some(tokio::time::Instant::now()),
         platform: "qq",
         chat_id,
         message_id: v.get("message_id").filter(|id| !id.is_null()).map(id_string),

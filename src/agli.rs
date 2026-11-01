@@ -11,14 +11,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 use crate::channels::{Envelope, Outlets};
-use crate::config::{AclCfg, Config};
+use crate::config::{AclCfg, Config, DebounceCfg, SessionCfg};
 use crate::mind::context::{RecapLine, build_l1, build_l2, read_opt, tail, user_turn};
 use crate::mind::decide::{self, Action, Situation};
 use crate::mind::flow::{Bucket, Flow};
@@ -52,22 +53,182 @@ fn owner_command(acl: &AclCfg, env: &Envelope) -> bool {
     !env.is_group && env.text.trim_start().starts_with('/') && identify(acl, env).is_owner
 }
 
-/// Take the next consecutive chat batch, leaving every boundary in arrival order.
-pub fn next_work(events: &mut VecDeque<Event>, acl: &AclCfg) -> Option<WorkItem> {
-    Some(match events.pop_front()? {
-        Event::Inbound(first) => {
-            let mut messages = Vec::new();
-            if !owner_command(acl, &first) {
-                while let Some(Event::Inbound(next)) = events.front() {
-                    if next.platform != first.platform || next.chat_id != first.chat_id
-                        || next.is_group != first.is_group || owner_command(acl, next)
-                    {
-                        break;
+#[derive(Default)]
+pub struct WorkQueue {
+    // Keep receive times and window snapshots with events: cancellation must not resample gaps.
+    events: VecDeque<QueuedEvent>,
+    chats: HashMap<String, ChatTiming>,
+    store: Option<Arc<dyn Store>>,
+}
+
+struct QueuedEvent {
+    event: Event,
+    received: Instant,
+    window: QuietWindow,
+}
+
+#[derive(Default)]
+struct ChatTiming {
+    estimate: GapEstimate,
+    last: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
+struct GapEstimate {
+    ewma_ms: f64,
+    samples: u64,
+}
+
+impl GapEstimate {
+    fn with_gap(self, gap: Duration, cfg: &DebounceCfg) -> Self {
+        if gap > Duration::from_millis(cfg.cap_ms) { return self }
+        let gap_ms = gap.as_secs_f64() * 1000.0;
+        Self {
+            ewma_ms: if self.samples == 0 { gap_ms } else { cfg.alpha * gap_ms + (1.0 - cfg.alpha) * self.ewma_ms },
+            samples: self.samples.saturating_add(1),
+        }
+    }
+
+    fn load(store: &dyn Store, key: &str) -> Self {
+        match store.kv_get(key) {
+            Ok(Some(value)) => serde_json::from_value::<Self>(value).ok()
+                .filter(|e| e.samples > 0 && e.ewma_ms.is_finite() && e.ewma_ms >= 0.0).unwrap_or_default(),
+            Ok(None) => Self::default(),
+            Err(e) => { warn!(key, "loading debounce estimate: {e:#}"); Self::default() }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct QuietWindow {
+    ms: u64,
+    ewma_ms: Option<f64>,
+    clamped: bool,
+}
+
+impl QuietWindow {
+    fn for_estimate(estimate: GapEstimate, cfg: &DebounceCfg) -> Self {
+        if cfg.quiet_ms == 0 || !cfg.adaptive || estimate.samples == 0 {
+            return Self { ms: cfg.quiet_ms, ..Self::default() };
+        }
+        let raw = cfg.factor * estimate.ewma_ms;
+        let bounded = raw.clamp(cfg.min_ms as f64, cfg.max_ms as f64);
+        Self { ms: bounded.round() as u64, ewma_ms: Some(estimate.ewma_ms), clamped: raw != bounded }
+    }
+}
+
+struct Batch {
+    end: usize,
+    deadline: Option<Instant>,
+    window: QuietWindow,
+    cap_ended: bool,
+}
+
+impl WorkQueue {
+    #[cfg(test)]
+    pub fn new() -> Self { Self::default() }
+
+    pub fn with_store(store: Arc<dyn Store>) -> Self { Self { store: Some(store), ..Self::default() } }
+
+    pub fn is_empty(&self) -> bool { self.events.is_empty() }
+
+    pub fn push(&mut self, event: Event, cfg: &DebounceCfg) {
+        let now = Instant::now();
+        let received = match &event {
+            Event::Inbound(env) => env.arrived.map_or(now, |t| t.min(now)),
+            _ => now,
+        };
+        let mut window = QuietWindow::for_estimate(GapEstimate::default(), cfg);
+        if let Event::Inbound(env) = &event && cfg.quiet_ms != 0 && cfg.adaptive {
+            let key = format!("debounce:{}:{}", env.platform, env.chat_id);
+            let timing = self.chats.entry(key.clone()).or_insert_with(|| ChatTiming {
+                estimate: self.store.as_ref().map(|s| GapEstimate::load(s.as_ref(), &key)).unwrap_or_default(),
+                last: None,
+            });
+            if let Some(last) = timing.last {
+                let updated = timing.estimate.with_gap(received.saturating_duration_since(last), cfg);
+                if updated != timing.estimate {
+                    timing.estimate = updated;
+                    if let Some(store) = &self.store && let Err(e) = store.kv_set(&key, json!(updated)) {
+                        warn!(key, "saving debounce estimate: {e:#}");
                     }
-                    let Some(Event::Inbound(next)) = events.pop_front() else { unreachable!() };
-                    messages.push(next);
                 }
             }
+            timing.last = Some(received);
+            window = QuietWindow::for_estimate(timing.estimate, cfg);
+        }
+        self.events.push_back(QueuedEvent { event, received, window });
+    }
+
+    pub fn deadline(&self, acl: &AclCfg, session: &SessionCfg) -> Option<Instant> {
+        self.batch(acl, session).deadline
+    }
+
+    fn batch(&self, acl: &AclCfg, session: &SessionCfg) -> Batch {
+        let mut batch = Batch { end: 1, deadline: None, window: QuietWindow::default(), cap_ended: false };
+        let Some(QueuedEvent { event: Event::Inbound(first), received, window }) = self.events.front() else { return batch };
+        if owner_command(acl, first) { return batch }
+        let cfg = &session.debounce;
+        let enabled = cfg.quiet_ms != 0;
+        batch.window = *window;
+        let cap = *received + Duration::from_millis(cfg.cap_ms);
+        let mut deadline = (*received + Duration::from_millis(window.ms)).min(cap);
+        for queued in self.events.iter().skip(1) {
+            if enabled && queued.received >= deadline { break }
+            match &queued.event {
+                Event::Inbound(next) if same_chat(first, next) => {
+                    if owner_command(acl, next) { return batch }
+                    batch.window = queued.window;
+                    deadline = (queued.received + Duration::from_millis(batch.window.ms)).min(cap);
+                }
+                _ if !enabled => break,
+                _ => {}
+            }
+            batch.end += 1;
+        }
+        batch.deadline = enabled.then_some(deadline);
+        batch.cap_ended = enabled && deadline == cap && Instant::now() >= cap;
+        batch
+    }
+}
+
+#[cfg(test)]
+impl<const N: usize> From<[Event; N]> for WorkQueue {
+    fn from(events: [Event; N]) -> Self {
+        let mut queue = Self::new();
+        for event in events { queue.push(event, &DebounceCfg::default()); }
+        queue
+    }
+}
+
+fn same_chat(first: &Envelope, next: &Envelope) -> bool {
+    next.platform == first.platform && next.chat_id == first.chat_id && next.is_group == first.is_group
+}
+
+/// Take the ready chat batch, preserving the arrival order of all deferred events.
+pub fn next_work(queue: &mut WorkQueue, acl: &AclCfg, session: &SessionCfg) -> Option<WorkItem> {
+    let batch = queue.batch(acl, session);
+    Some(match queue.events.pop_front()?.event {
+        Event::Inbound(first) => {
+            let mut messages = Vec::new();
+            let mut deferred = VecDeque::new();
+            for queued in queue.events.drain(..batch.end - 1) {
+                match queued.event {
+                    Event::Inbound(next) if same_chat(&first, &next) => messages.push(next),
+                    _ => deferred.push_back(queued),
+                }
+            }
+            deferred.append(&mut queue.events);
+            queue.events = deferred;
+            let cfg = &session.debounce;
+            let basis = if owner_command(acl, &first) { "command".into() }
+                else if cfg.quiet_ms == 0 { "disabled".into() }
+                else if !cfg.adaptive { "fixed".into() }
+                else if let Some(ewma) = batch.window.ewma_ms {
+                    format!("ewma={ewma:.1} x {} (clamped={})", cfg.factor, batch.window.clamped)
+                } else { "default".into() };
+            info!(chat_key = %format!("{}:{}", first.platform, first.chat_id), messages = messages.len() + 1,
+                window_ms = batch.window.ms, %basis, cap_ended = batch.cap_ended, "reply batch");
             messages.insert(0, first);
             WorkItem::Messages(messages)
         }
@@ -1021,6 +1182,13 @@ impl Agli {
 mod tests {
     use super::*;
 
+    fn session(quiet: u64, cap: u64) -> SessionCfg {
+        SessionCfg {
+            max_turns: 20, idle_minutes: 30, recap_messages: 10,
+            debounce: DebounceCfg { quiet_ms: quiet, cap_ms: cap, adaptive: false, ..DebounceCfg::default() },
+        }
+    }
+
     fn acl() -> AclCfg {
         let mut acl: AclCfg = serde_yaml::from_str(include_str!("../config/acl.yaml")).unwrap();
         acl.owner.telegram_user_id = 42;
@@ -1033,7 +1201,7 @@ mod tests {
         Event::Inbound(Envelope {
             platform: "telegram", chat_id: chat.into(), message_id: Some(id.into()),
             sender_id: "42".into(), sender_name: "主人".into(), sender_is_bot: false,
-            is_group: false, mentions_me: false, text: text.into(),
+            is_group: false, mentions_me: false, text: text.into(), arrived: None,
         })
     }
 
@@ -1046,32 +1214,406 @@ mod tests {
         messages(work).into_iter().map(|m| m.text).collect()
     }
 
+    fn poll_once<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+        future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    fn ready<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> F::Output {
+        let std::task::Poll::Ready(value) = poll_once(future) else { panic!("expected ready") };
+        value
+    }
+
+    struct TestLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TestLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_gaps_use_arrival_time_not_dequeue_time() {
+        let cfg = DebounceCfg::default();
+        let mut events = Vec::new();
+        for i in 0..3 {
+            let Event::Inbound(mut env) = inbound("42", &format!("m{i}"), &i.to_string()) else { unreachable!() };
+            env.arrived = Some(Instant::now());
+            events.push(Event::Inbound(env));
+            tokio::time::advance(Duration::from_millis(1000)).await;
+        }
+        // A reply was being generated meanwhile; all three are dequeued at once.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let mut queue = WorkQueue::new();
+        for ev in events {
+            queue.push(ev, &cfg);
+        }
+        let estimate = queue.chats["debounce:telegram:42"].estimate;
+        assert_eq!(estimate.samples, 2);
+        assert!((estimate.ewma_ms - 1000.0).abs() < 1.0, "{estimate:?}");
+    }
+
+    #[test]
+    fn debounce_ewma_update_and_window_clamping() {
+        let cfg = DebounceCfg::default();
+        let empty = GapEstimate::default();
+        assert_eq!(QuietWindow::for_estimate(empty, &cfg).ms, 2500);
+        assert!(QuietWindow::for_estimate(empty, &cfg).ewma_ms.is_none());
+        let first = empty.with_gap(Duration::from_millis(1000), &cfg);
+        assert_eq!(first, GapEstimate { ewma_ms: 1000.0, samples: 1 });
+        let second = first.with_gap(Duration::from_millis(2000), &cfg);
+        assert_eq!(second, GapEstimate { ewma_ms: 1300.0, samples: 2 });
+        assert_eq!(second.with_gap(Duration::from_millis(10001), &cfg), second);
+        assert_eq!(second.with_gap(Duration::from_millis(10000), &cfg), GapEstimate { ewma_ms: 3910.0, samples: 3 });
+        for (gap, expected, clamped) in [(100, 1200, true), (1000, 2500, false), (4000, 6000, true)] {
+            let estimate = empty.with_gap(Duration::from_millis(gap), &cfg);
+            let window = QuietWindow::for_estimate(estimate, &cfg);
+            assert_eq!((window.ms, window.clamped), (expected, clamped));
+            assert_eq!(window.ewma_ms, Some(gap as f64));
+        }
+        let cfg = DebounceCfg { alpha: 0.5, factor: 3.0, min_ms: 500, max_ms: 3000, cap_ms: 3000, ..cfg };
+        let estimate = empty.with_gap(Duration::from_millis(100), &cfg).with_gap(Duration::from_millis(900), &cfg);
+        assert_eq!(estimate.ewma_ms, 500.0);
+        assert_eq!(QuietWindow::for_estimate(estimate, &cfg).ms, 1500);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_fast_chat_has_shorter_window_than_slow_chat() {
+        let acl = acl();
+        let mut session = session(2500, 10000);
+        session.debounce.adaptive = true;
+        let mut queue = WorkQueue::new();
+        for (chat, gap, window) in [("fast", 200, 1200), ("slow", 2000, 5000)] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let start = Instant::now();
+            tx.try_send(inbound(chat, "first", "1")).unwrap();
+            let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+            assert!(poll_once(recv.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_millis(gap)).await;
+            tx.try_send(inbound(chat, "second", "2")).unwrap();
+            assert!(poll_once(recv.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_millis(window - 1)).await;
+            assert!(poll_once(recv.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert_eq!(texts(ready(recv.as_mut()).unwrap()), ["first", "second"]);
+            drop(recv);
+            assert_eq!(Instant::now() - start, Duration::from_millis(gap + window));
+            assert_eq!(queue.chats[&format!("debounce:telegram:{chat}")].estimate.samples, 1);
+        }
+        assert_eq!(queue.chats["debounce:telegram:fast"].estimate.ewma_ms, 200.0);
+        assert_eq!(queue.chats["debounce:telegram:slow"].estimate.ewma_ms, 2000.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_long_gap_starts_new_burst_without_changing_estimate() {
+        let cfg = DebounceCfg::default();
+        let mut queue = WorkQueue::new();
+        queue.push(inbound("42", "first", "1"), &cfg);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        queue.push(inbound("42", "second", "2"), &cfg);
+        let before = queue.chats["debounce:telegram:42"].estimate;
+        tokio::time::advance(Duration::from_millis(10001)).await;
+        queue.push(inbound("42", "new burst", "3"), &cfg);
+        assert_eq!(queue.chats["debounce:telegram:42"].estimate, before);
+        tokio::time::advance(Duration::from_millis(1000)).await;
+        queue.push(inbound("42", "next", "4"), &cfg);
+        assert_eq!(queue.chats["debounce:telegram:42"].estimate, GapEstimate { ewma_ms: 650.0, samples: 2 });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_estimate_round_trips_through_kv_and_restarts_lazily() {
+        let test = TestAgli::new("debounce-persist").await;
+        let a = &test.agli;
+        let key = "debounce:telegram:42";
+        let mut queue = WorkQueue::with_store(a.store.clone());
+        let (tx, mut rx) = mpsc::channel(16);
+        tx.try_send(inbound("42", "first", "1")).unwrap();
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session));
+        assert!(poll_once(recv.as_mut()).is_pending());
+        drop(recv);
+        assert!(a.store.kv_get(key).unwrap().is_none());
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tx.try_send(inbound("42", "second", "2")).unwrap();
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session));
+        assert!(poll_once(recv.as_mut()).is_pending());
+        drop(recv);
+        assert_eq!(a.store.kv_get(key).unwrap().unwrap(), json!({"ewma_ms": 200.0, "samples": 1}));
+        assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session).await.unwrap()), ["first", "second"]);
+        drop(queue);
+
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        let reopened = Arc::new(crate::store::jsonl::JsonlStore::open(&a.cfg.data_dir()).unwrap());
+        let mut queue = WorkQueue::with_store(reopened.clone());
+        assert!(queue.chats.is_empty());
+        tx.try_send(inbound("42", "after restart", "3")).unwrap();
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session));
+        assert!(poll_once(recv.as_mut()).is_pending());
+        drop(recv);
+        assert_eq!(queue.chats[key].estimate, GapEstimate { ewma_ms: 200.0, samples: 1 });
+        assert_eq!(queue.deadline(&a.cfg.acl, &a.cfg.runtime.session), Some(Instant::now() + Duration::from_millis(1200)));
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tx.try_send(inbound("42", "more", "4")).unwrap();
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session));
+        assert!(poll_once(recv.as_mut()).is_pending());
+        drop(recv);
+        assert_eq!(reopened.kv_get(key).unwrap().unwrap(), json!({"ewma_ms": 170.0, "samples": 2}));
+        // Re-polling a cancelled receive never counts the same gap twice.
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session));
+        assert!(poll_once(recv.as_mut()).is_pending());
+        drop(recv);
+        assert_eq!(reopened.kv_get(key).unwrap().unwrap()["samples"], 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_missing_and_garbled_kv_estimates_fall_back_to_default() {
+        let test = TestAgli::new("debounce-garbled").await;
+        let store = &test.agli.store;
+        for (chat, value) in [("string", json!("bad")), ("negative", json!({"ewma_ms": -1, "samples": 1})),
+            ("zero", json!({"ewma_ms": 1000, "samples": 0})), ("incomplete", json!({"samples": 1})),
+            ("wrong_type", json!({"ewma_ms": "NaN", "samples": "many"}))] {
+            store.kv_set(&format!("debounce:telegram:{chat}"), value).unwrap();
+        }
+        let mut queue = WorkQueue::with_store(store.clone());
+        for chat in ["missing", "string", "negative", "zero", "incomplete", "wrong_type"] {
+            queue.push(inbound(chat, "first", "1"), &DebounceCfg::default());
+            assert_eq!(queue.chats[&format!("debounce:telegram:{chat}")].estimate, GapEstimate::default());
+            assert_eq!(queue.events.back().unwrap().window.ms, 2500);
+        }
+        tokio::time::advance(Duration::from_millis(500)).await;
+        queue.push(inbound("negative", "second", "2"), &DebounceCfg::default());
+        assert_eq!(store.kv_get("debounce:telegram:negative").unwrap().unwrap(), json!({"ewma_ms": 500.0, "samples": 1}));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_adaptive_off_is_fixed_and_quiet_zero_disables_learning() {
+        let test = TestAgli::new("debounce-disabled").await;
+        let a = &test.agli;
+        let saved = json!({"ewma_ms": 4000.0, "samples": 10});
+        a.store.kv_set("debounce:telegram:42", saved.clone()).unwrap();
+        for (quiet, adaptive) in [(2500, false), (0, true)] {
+            let mut session = session(quiet, 10000);
+            session.debounce.adaptive = adaptive;
+            let (tx, mut rx) = mpsc::channel(16);
+            let mut queue = WorkQueue::with_store(a.store.clone());
+            let start = Instant::now();
+            tx.try_send(inbound("42", "one", "1")).unwrap();
+            tx.try_send(inbound("42", "two", "2")).unwrap();
+            assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &session).await.unwrap()), ["one", "two"]);
+            assert_eq!(Instant::now() - start, Duration::from_millis(quiet));
+            assert!(queue.chats.is_empty());
+            assert_eq!(a.store.kv_get("debounce:telegram:42").unwrap().unwrap(), saved);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_three_spaced_owner_messages_prepare_one_reply() {
+        let mut test = TestAgli::new("debounce-owner").await;
+        let a = &mut test.agli;
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut queue = WorkQueue::new();
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session));
+        for (i, text) in ["先查方案 A", "再对比方案 B", "给我结论"].into_iter().enumerate() {
+            if i != 0 { tokio::time::advance(Duration::from_secs(1)).await; }
+            tx.try_send(inbound("42", text, &i.to_string())).unwrap();
+            assert!(poll_once(recv.as_mut()).is_pending());
+        }
+        tokio::time::advance(Duration::from_millis(2499)).await;
+        assert!(poll_once(recv.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let work = ready(recv.as_mut()).unwrap();
+        drop(recv);
+        assert!(queue.is_empty());
+        let batch = a.prepare_messages(messages(work)).await;
+        assert!(batch.speak && !batch.consider);
+        assert_eq!(batch.current, 3);
+        assert_eq!(batch.lines, ["主人：先查方案 A", "主人：再对比方案 B", "主人：给我结论"]);
+        let ctx = batch.ctx.unwrap();
+        assert_eq!(ctx.message_id.as_deref(), Some("2"));
+        assert_eq!(a.store.recent_in_ns(&ctx.ns, 10).unwrap().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_single_message_waits_for_quiet() {
+        let acl = acl();
+        let session = session(2500, 10000);
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut queue = WorkQueue::new();
+        tx.try_send(inbound("42", "hello", "1")).unwrap();
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+        assert!(poll_once(recv.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(2499)).await;
+        assert!(poll_once(recv.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(texts(ready(recv.as_mut()).unwrap()), ["hello"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_steady_stream_stops_at_cap_even_after_cancellation() {
+        let acl = acl();
+        let mut session = session(2500, 10000);
+        session.debounce.adaptive = true;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::INFO).with_writer(move || TestLog(sink.clone())).finish();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut queue = WorkQueue::new();
+        let started = Instant::now();
+        for i in 0..10 {
+            if i != 0 { tokio::time::advance(Duration::from_secs(1)).await; }
+            tx.try_send(inbound("42", &i.to_string(), &i.to_string())).unwrap();
+            // Drop and recreate the future every second: neither deadline may restart.
+            let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+            assert!(poll_once(recv.as_mut()).is_pending());
+        }
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+        assert!(poll_once(recv.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert!(poll_once(recv.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tx.try_send(inbound("42", "next batch", "10")).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(texts(ready(recv.as_mut()).unwrap()), (0..10).map(|i| i.to_string()).collect::<Vec<_>>());
+        });
+        drop(recv);
+        assert_eq!(Instant::now() - started, Duration::from_secs(10));
+        let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        assert_eq!(logged.lines().count(), 1);
+        for field in ["reply batch", "chat_key=telegram:42", "messages=10", "window_ms=2500",
+            "basis=ewma=1000.0 x 2.5 (clamped=false)", "cap_ended=true"] {
+            assert!(logged.contains(field), "{logged}");
+        }
+        assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["next batch"]);
+        assert_eq!(Instant::now() - started, Duration::from_millis(12500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_command_flushes_pending_messages_and_skips_wait() {
+        let acl = acl();
+        let session = session(2500, 10000);
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut queue = WorkQueue::new();
+        tx.try_send(inbound("42", "/status", "0")).unwrap();
+        let started = Instant::now();
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+        assert_eq!(texts(ready(recv.as_mut()).unwrap()), ["/status"]);
+        drop(recv);
+        tx.try_send(inbound("42", "before", "1")).unwrap();
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+        assert!(poll_once(recv.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tx.try_send(inbound("42", " /tasks", "2")).unwrap();
+        tx.try_send(inbound("42", "after", "3")).unwrap();
+        assert_eq!(texts(ready(recv.as_mut()).unwrap()), ["before"]);
+        drop(recv);
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+        assert_eq!(texts(ready(recv.as_mut()).unwrap()), [" /tasks"]);
+        drop(recv);
+        assert_eq!(Instant::now() - started, Duration::from_secs(1));
+        assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["after"]);
+        assert_eq!(Instant::now() - started, Duration::from_millis(3500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_cancellation_preserves_interleaved_events_and_quiet_deadline() {
+        let acl = acl();
+        let session = session(2500, 10000);
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut queue = WorkQueue::new();
+        tx.try_send(inbound("42", "first", "1")).unwrap();
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+        assert!(poll_once(recv.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for event in [Event::Tick, inbound("7", "other chat", "2"), Event::JobDone(research::Outcome {
+            task_id: "task-1".into(), title: "done".into(), ok: true, summary: "result".into(), verdict: None,
+        }), inbound("42", "second", "3")] {
+            tx.try_send(event).unwrap();
+        }
+        assert!(poll_once(recv.as_mut()).is_pending());
+        drop(recv);
+        assert_eq!(queue.events.len(), 5);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+        assert!(poll_once(recv.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(1499)).await;
+        assert!(poll_once(recv.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(texts(ready(recv.as_mut()).unwrap()), ["first", "second"]);
+        drop(recv);
+        let now = Instant::now();
+        assert!(matches!(crate::recv_work(&mut rx, &mut queue, &acl, &session).await, Some(WorkItem::Tick)));
+        assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["other chat"]);
+        let Some(WorkItem::JobDone(o)) = crate::recv_work(&mut rx, &mut queue, &acl, &session).await else { panic!("lost job") };
+        assert_eq!((o.task_id.as_str(), o.summary.as_str()), ("task-1", "result"));
+        assert_eq!(Instant::now(), now);
+        assert!(queue.is_empty());
+        drop(tx);
+        assert!(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_group_messages_keep_every_speaker_and_floor_input() {
+        let mut test = TestAgli::new("debounce-group").await;
+        let a = &mut test.agli;
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut queue = WorkQueue::new();
+        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session));
+        for env in group_messages(&["one", "/status", "three"], false) {
+            tx.try_send(Event::Inbound(env)).unwrap();
+            assert!(poll_once(recv.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        let work = ready(recv.as_mut()).unwrap();
+        drop(recv);
+        let batch = a.prepare_messages(messages(work)).await;
+        assert!(!batch.speak && batch.consider);
+        assert_eq!(batch.current, 3);
+        assert_eq!(a.unseen["telegram:-7"], ["member-0：one", "member-1：/status", "member-2：three"]);
+        assert_eq!(a.speakers["telegram:-7"].len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_zero_disables_wait_and_closed_channel_flushes() {
+        let acl = acl();
+        for session in [session(0, 10000), session(0, 0), session(2500, 10000)] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let mut queue = WorkQueue::new();
+            tx.try_send(inbound("42", "hello", "1")).unwrap();
+            if session.debounce.quiet_ms != 0 { drop(tx); }
+            let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+            assert_eq!(texts(ready(recv.as_mut()).unwrap()), ["hello"]);
+        }
+    }
+
     #[test]
     fn batching_preserves_interleaved_chats_and_platforms() {
         let mut other_platform = inbound("42", "qq", "5");
         if let Event::Inbound(env) = &mut other_platform {
             env.platform = "qq";
         }
-        let mut queue = VecDeque::from([
+        let mut queue = WorkQueue::from([
             inbound("42", "a1", "1"), inbound("42", "a2", "2"),
             inbound("7", "b", "3"), inbound("42", "a3", "4"), other_platform,
         ]);
         let acl = acl();
         for expected in [vec!["a1", "a2"], vec!["b"], vec!["a3"], vec!["qq"]] {
-            assert_eq!(texts(next_work(&mut queue, &acl).unwrap()), expected);
+            assert_eq!(texts(next_work(&mut queue, &acl, &session(0, 0)).unwrap()), expected);
         }
-        assert!(next_work(&mut queue, &acl).is_none());
+        assert!(next_work(&mut queue, &acl, &session(0, 0)).is_none());
     }
 
     #[test]
     fn batching_keeps_owner_commands_separate_in_arrival_order() {
-        let mut queue = VecDeque::from([
+        let mut queue = WorkQueue::from([
             inbound("42", "before", "1"), inbound("42", "  /status", "2"),
             inbound("42", "/tasks", "3"), inbound("42", "after", "4"), inbound("42", "also", "5"),
         ]);
         let acl = acl();
         for expected in [vec!["before"], vec!["  /status"], vec!["/tasks"], vec!["after", "also"]] {
-            assert_eq!(texts(next_work(&mut queue, &acl).unwrap()), expected);
+            assert_eq!(texts(next_work(&mut queue, &acl, &session(0, 0)).unwrap()), expected);
         }
         assert!(queue.is_empty());
         let Event::Inbound(mut env) = inbound("42", "/status", "6") else { unreachable!() };
@@ -1088,17 +1630,17 @@ mod tests {
             task_id: "task-1".into(), title: "done".into(), ok: true,
             summary: "result".into(), verdict: None,
         };
-        let mut queue = VecDeque::from([
+        let mut queue = WorkQueue::from([
             inbound("42", "before tick", "1"), Event::Tick, inbound("42", "after tick", "2"),
             Event::JobDone(outcome), inbound("42", "after job", "3"),
         ]);
         let acl = acl();
-        assert_eq!(texts(next_work(&mut queue, &acl).unwrap()), ["before tick"]);
-        assert!(matches!(next_work(&mut queue, &acl), Some(WorkItem::Tick)));
-        assert_eq!(texts(next_work(&mut queue, &acl).unwrap()), ["after tick"]);
-        let Some(WorkItem::JobDone(o)) = next_work(&mut queue, &acl) else { panic!("lost job result") };
+        assert_eq!(texts(next_work(&mut queue, &acl, &session(0, 0)).unwrap()), ["before tick"]);
+        assert!(matches!(next_work(&mut queue, &acl, &session(0, 0)), Some(WorkItem::Tick)));
+        assert_eq!(texts(next_work(&mut queue, &acl, &session(0, 0)).unwrap()), ["after tick"]);
+        let Some(WorkItem::JobDone(o)) = next_work(&mut queue, &acl, &session(0, 0)) else { panic!("lost job result") };
         assert_eq!((o.task_id.as_str(), o.summary.as_str()), ("task-1", "result"));
-        assert_eq!(texts(next_work(&mut queue, &acl).unwrap()), ["after job"]);
+        assert_eq!(texts(next_work(&mut queue, &acl, &session(0, 0)).unwrap()), ["after job"]);
         assert!(queue.is_empty());
     }
 
@@ -1150,23 +1692,23 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn three_queued_owner_messages_prepare_one_turn_and_keep_individual_records() {
         let mut test = TestAgli::new("owner").await;
         let a = &mut test.agli;
         let (tx, mut rx) = mpsc::channel(16);
-        let mut queue = VecDeque::new();
+        let mut queue = WorkQueue::new();
         tx.try_send(inbound("42", "earlier turn", "0")).unwrap();
-        let in_flight = crate::recv_work(&mut rx, &mut queue, &a.cfg.acl).await.unwrap();
+        let in_flight = crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session).await.unwrap();
         assert_eq!(texts(in_flight), ["earlier turn"]);
         // While that turn is handled, these three messages arrive without another receive.
         for ev in [inbound("42", "先查方案 A", "1"), inbound("42", "再对比方案 B", "2"), inbound("42", "给我结论", "3")] {
             tx.try_send(ev).unwrap();
         }
         drop(tx);
-        let work = crate::recv_work(&mut rx, &mut queue, &a.cfg.acl).await.unwrap();
+        let work = crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session).await.unwrap();
         let batch = a.prepare_messages(messages(work)).await;
-        assert!(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl).await.is_none());
+        assert!(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session).await.is_none());
         assert!(queue.is_empty());
         assert!(batch.speak && !batch.consider);
         assert_eq!(batch.current, 3);
@@ -1192,16 +1734,17 @@ mod tests {
     async fn newly_arrived_messages_join_the_next_queued_batch_after_a_boundary() {
         let acl = acl();
         let (tx, mut rx) = mpsc::channel(16);
-        let mut queue = VecDeque::new();
+        let mut queue = WorkQueue::new();
+        let session = session(0, 0);
         for ev in [inbound("42", "first", "1"), Event::Tick, inbound("42", "second", "2")] {
             tx.try_send(ev).unwrap();
         }
-        assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl).await.unwrap()), ["first"]);
+        assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["first"]);
         tx.try_send(inbound("42", "third", "3")).unwrap();
         drop(tx);
-        assert!(matches!(crate::recv_work(&mut rx, &mut queue, &acl).await, Some(WorkItem::Tick)));
-        assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl).await.unwrap()), ["second", "third"]);
-        assert!(crate::recv_work(&mut rx, &mut queue, &acl).await.is_none());
+        assert!(matches!(crate::recv_work(&mut rx, &mut queue, &acl, &session).await, Some(WorkItem::Tick)));
+        assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["second", "third"]);
+        assert!(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.is_none());
     }
 
     fn group_messages(texts: &[&str], mention_first: bool) -> Vec<Envelope> {
@@ -1247,8 +1790,8 @@ mod tests {
         let mut test = TestAgli::new("cap").await;
         let a = &mut test.agli;
         Arc::make_mut(&mut a.cfg).social.human_limit.max_replies = 1;
-        let mut queue = VecDeque::from([inbound("42", "one", "1"), inbound("42", "two", "2"), inbound("42", "three", "3")]);
-        let batch = a.prepare_messages(messages(next_work(&mut queue, &a.cfg.acl).unwrap())).await;
+        let mut queue = WorkQueue::from([inbound("42", "one", "1"), inbound("42", "two", "2"), inbound("42", "three", "3")]);
+        let batch = a.prepare_messages(messages(next_work(&mut queue, &a.cfg.acl, &a.cfg.runtime.session).unwrap())).await;
         assert!(batch.speak);
         assert_eq!(batch.lines, ["主人：one", "主人：two", "主人：three"]);
         let Event::Inbound(next) = inbound("42", "four", "4") else { unreachable!() };

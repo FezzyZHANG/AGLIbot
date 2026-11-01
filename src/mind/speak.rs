@@ -122,7 +122,9 @@ mod tests {
 
     #[test]
     fn changed_cards_refresh_only_the_affected_session() {
-        let mut s = Speaker::new(String::new(), SessionCfg { max_turns: 20, idle_minutes: 30, recap_messages: 10 });
+        let mut s = Speaker::new(String::new(), SessionCfg {
+            max_turns: 20, idle_minutes: 30, recap_messages: 10, debounce: Default::default(),
+        });
         s.sessions.insert("owner".into(), session());
         s.sessions.insert("group".into(), session());
         s.refresh_tasks("group", "");

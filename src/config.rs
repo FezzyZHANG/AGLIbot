@@ -172,6 +172,42 @@ pub struct SessionCfg {
     pub max_turns: usize,
     pub idle_minutes: i64,
     pub recap_messages: usize,
+    #[serde(default)]
+    pub debounce: DebounceCfg,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DebounceCfg {
+    /// 0 disables both waiting and adaptive learning.
+    pub quiet_ms: u64,
+    pub cap_ms: u64,
+    pub adaptive: bool,
+    pub alpha: f64,
+    pub factor: f64,
+    pub min_ms: u64,
+    pub max_ms: u64,
+}
+
+impl Default for DebounceCfg {
+    fn default() -> Self {
+        Self { quiet_ms: 2500, cap_ms: 10000, adaptive: true, alpha: 0.3, factor: 2.5, min_ms: 1200, max_ms: 6000 }
+    }
+}
+
+impl DebounceCfg {
+    fn validate(&self) -> Result<()> {
+        if self.quiet_ms == 0 { return Ok(()) }
+        anyhow::ensure!(self.cap_ms > 0, "session.debounce.cap_ms must be positive (quiet_ms: 0 disables debouncing)");
+        if self.adaptive {
+            anyhow::ensure!(self.alpha.is_finite() && self.alpha > 0.0 && self.alpha <= 1.0,
+                "session.debounce.alpha must be in (0, 1]");
+            anyhow::ensure!(self.factor.is_finite() && self.factor > 0.0, "session.debounce.factor must be positive and finite");
+            anyhow::ensure!(self.min_ms > 0 && self.min_ms <= self.max_ms && self.max_ms <= self.cap_ms,
+                "session.debounce requires 0 < min_ms <= max_ms <= cap_ms");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -336,6 +372,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        self.runtime.session.debounce.validate()?;
         for m in &self.models.models {
             if !self.models.providers.contains_key(&m.provider) {
                 bail!("model `{}` references unknown provider `{}`", m.id, m.provider);
@@ -369,6 +406,32 @@ fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_debounce_defaults_and_overrides() {
+        let yaml = "max_turns: 20\nidle_minutes: 30\nrecap_messages: 10\n";
+        let session: SessionCfg = serde_yaml::from_str(yaml).unwrap();
+        let d = session.debounce;
+        assert_eq!((d.quiet_ms, d.cap_ms, d.adaptive, d.min_ms, d.max_ms), (2500, 10000, true, 1200, 6000));
+        assert_eq!((d.alpha, d.factor), (0.3, 2.5));
+        d.validate().unwrap();
+        let session: SessionCfg = serde_yaml::from_str(&format!("{yaml}debounce:\n  adaptive: false\n")).unwrap();
+        assert!(!session.debounce.adaptive);
+        assert_eq!(session.debounce.quiet_ms, 2500);
+        let d: DebounceCfg = serde_yaml::from_str("quiet_ms: 0\ncap_ms: 4000\nadaptive: false\nalpha: 0.5\nfactor: 3\nmin_ms: 500\nmax_ms: 3000").unwrap();
+        assert_eq!((d.quiet_ms, d.cap_ms, d.adaptive, d.min_ms, d.max_ms), (0, 4000, false, 500, 3000));
+        assert_eq!((d.alpha, d.factor), (0.5, 3.0));
+        d.validate().unwrap();
+    }
+
+    #[test]
+    fn debounce_rejects_invalid_adaptive_parameters() {
+        for yaml in ["alpha: 0", "alpha: 1.1", "alpha: .nan", "factor: -1", "factor: .inf",
+            "min_ms: 0", "min_ms: 7000", "max_ms: 10001", "cap_ms: 0"] {
+            let cfg: DebounceCfg = serde_yaml::from_str(yaml).unwrap();
+            assert!(cfg.validate().is_err(), "{yaml}");
+        }
+    }
 
     #[test]
     fn hands_defaults_preserve_codex_and_dsh_is_opt_in() {
