@@ -437,7 +437,7 @@ mod tests {
         std::fs::write(dir.join("claims.yaml"), serde_yaml::to_string(&claims).unwrap()).unwrap();
         for id in [1, 2] {
             f.store.save_review(&ReviewItem { id, ts: task.updated, category: ReviewCategory::Verify, subject: task.title.clone(), detail: "report".into(),
-                verdict: format!("verdict {id}"), status: ReviewStatus::Closed, payload: serde_json::json!({"task_id": task.id}), notified: false }).unwrap();
+                verdict: format!("verdict {id}"), status: ReviewStatus::Closed, payload: serde_json::json!({"task_id": task.id}), notified: false, urgent: false, pushed: false }).unwrap();
         }
         process(&f.board, &f.store, &f.output(), stub).await.unwrap();
         let state = f.checkpoint();

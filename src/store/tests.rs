@@ -195,6 +195,8 @@ pub(super) fn contract(store: &dyn Store) {
         status: ReviewStatus::Open,
         payload: json!({"$date": "literal", "a.b": u64::MAX}),
         notified: false,
+        urgent: true,
+        pushed: true,
     };
     store.save_review(&review).unwrap();
     let mut lower = review.clone();

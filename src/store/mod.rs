@@ -220,6 +220,10 @@ pub struct ReviewItem {
     pub payload: Value,
     #[serde(default)]
     pub notified: bool,
+    #[serde(default)]
+    pub urgent: bool,
+    #[serde(default)]
+    pub pushed: bool,
 }
 
 pub trait Store: Send + Sync {
