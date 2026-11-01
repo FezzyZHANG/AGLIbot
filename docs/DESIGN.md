@@ -4,7 +4,7 @@
 `C:\dev\AGLIbot` 目前是空仓库，只有 `.git`，还没有任何提交。目标是做一个运行在本机的 Desktop Agent，它表现得像一个**受过良好教育的人**，而不是助手。它的需求包括：
 - 通过 Telegram 或 QQ 和你联系，将来也会和**你的群友以及其他 agent** 对话；
 - 能接下长期任务和研究型请求，例如“查一下 OpenAI 关于 P vs NP 到底说了什么”；
-- 能调用 Codex、Claude Code、deepseek-harness（下文简称 DSH），并可能出现某种自进化。
+- 以 deepseek-harness（下文简称 DSH）为主要的双手，也能调用 Codex，并可能出现某种自进化。Claude Code 只归主人使用。
 
 本文件回答以下问题：
 1. 这样一个人有哪些认知、行为和社会框架；
@@ -104,7 +104,7 @@ AGLIbot/
 │   │   ├── followups.md          # 任务进行中主人补充的话，步骤边界读取（见 10b）
 │   │   ├── sources/              # 原文快照（URL、时间、哈希）
 │   │   ├── claims.yaml           # 论断台账：出处、一手/二手、置信度
-│   │   ├── scratch/              # codex / cc / DSH 的代码沙箱
+│   │   ├── scratch/              # DSH / codex 的代码沙箱
 │   │   ├── report.md  followup.yaml
 │   ├── projects/                 # 他自己发起的长期项目
 │   └── templates/                # research / coding / writing 模板（可进化）
@@ -168,7 +168,7 @@ AGLIbot/
 - **内驱驱动**：heartbeat tick → 驱力上升、情绪衰减 → 如果状态有明显变化或者有待处理的输入，就唤醒 `decide`；什么都没变的 tick 不调用模型。
 - **行动选择交给模型**：`decide.rs` 不包含固定阈值或效用函数。它的职责是组织决策上下文（人格、状态、承诺、兴趣、分桶后的输入、预算），用便宜模型选择行动，校验结果，然后提交执行。输出只保留几个可检查的字段：`{action, target, reason, deferred[], revisit_when}`。权限和预算由运行时强制执行，不让模型自己判断。心流里的即时反思也调用同一套机制。
 - **工作**：从 `board.yaml` 挑任务，读 `log.md` 断点续做；条件满足时进入**心流**（第 4 节）。
-- **两层分工**：人格主循环只负责对人说话和分派，执行全部交给 hands（codex / cc / DSH）；hands 不直接对人说话，结果回到人格层由他转述。任务和对话之间的绑定见第 10 节。
+- **两层分工**：人格主循环只负责对人说话和分派，执行全部交给 hands（DSH 为主，codex 为辅）；hands 不直接对人说话，结果回到人格层由他转述。任务和对话之间的绑定见第 10 节。
 - **睡眠**：`reflect` 依次做以下几件事：episodes 巩固进 `persons` 和 `relations` 并导出卡片；任务论断写成 `knowledge/notes/`；写日记；生成进化提案。
 
 ### 2d. 反思时的主动脱敏
@@ -251,7 +251,7 @@ AGLIbot/
   - DeepSeek 和 OpenAI 是自动前缀缓存；
   - Anthropic 需要显式设置 `cache_control` 断点，有 5 分钟和 1 小时两档 TTL；
   - TTL 和最小缓存长度以各家文档为准，写进 `config/tools.yaml`，供调度参考。不要求为保持缓存热度而定时调用。
-- 子进程（cc、codex）有各自的缓存。心流期间尽量用 resume 续接同一个会话，而不是每次新开。
+- 子进程（DSH、codex）有各自的缓存。心流期间尽量续接同一个会话（DSH 用 `--session-id`，codex 用 `exec resume`），而不是每次新开。
 
 ---
 
@@ -269,7 +269,7 @@ AGLIbot/
 | `research_plan` | 问题澄清与拆解 | 8 | 质量 | 否 |
 | `verify` | 论断核查、来源比对 | 8 | 质量 | **是** |
 | `synthesize` | 写报告 | 8 | 质量 | 否 |
-| `code` | 常规工作委托给 codex 或 DSH；核心代码只走 Moldloft 工单（见第 6 节） | — | 子 agent 自己选模型，核心代码受写入白名单限制 | 只确认结果 |
+| `code` | 常规工作委托给 DSH（迁移完成前仍可用 codex）；核心代码只走 Moldloft 工单（见第 6 节） | — | 子 agent 自己选模型，核心代码受写入白名单限制 | 只确认结果 |
 | `act` | 有副作用的动作（给新的人发消息、执行工具） | 8 | 质量 | **是** |
 | `evolve` | 自我修改提案 | 9 | 质量 | **是**，之后还要主人审批 |
 
@@ -343,7 +343,9 @@ AGLIbot/
 
 **双手的分层**（见笔记 n-agli-dec-hands）：
 - Claude Code 只归主人使用，AGLI 不调用 `claude`。
-- 常规研究和工作区任务交给 codex。
+- DSH 是主要的可编程对象：常规研究、闲逛浏览和工作区任务都交给它。AGLI 通过 `dsh --profile <AGLI 的 profile> headless` 调用，prompt 走 stdin，用 `--json` 读运行事件，用 `--session-id` 续接；每类任务的工具白名单写在 profile 的补丁层里，并且要验证由 DSH 强制执行，不靠提示词。
+- codex 保留为过渡路径，DSH 覆盖对应任务后再退役；Astra 写核心代码仍经 codex（见下一条）。
+- DSH 用哪个 token 来源、预算多少，由主人管理（见笔记 n-agli-q-dsh-tokens）。
 - 核心代码只有 Astra（gpt-6-astra，经 codex）和 Opus（经主人的 Claude Code）能直接写；deepseek-v4.1-flash-1017 只能做良定义任务，即由 Astra 或 Opus 指导的任务：高级模型写计划、指定文件、接口和判定测试，并在送主人前审查 diff。其他模型只能读和提案。工作规则写在根目录 `AGENTS.md`；白名单在进化闸门里由代码强制，不靠提示词。
 
 **社交化带来的新攻击面**：
@@ -381,11 +383,11 @@ AGLIbot/
 2. **记忆**：接入 Mongo、episodes 和 persons（带 ns 和 scope）、检索、夜间 `reflect`（含 2d 的脱敏流程）。
 3. **驱力与 heartbeat**：主动消息、作息。
 4. **社会层**：`identity` / `acl` / `privacy` / `floor`、群聊接入、bot 识别与轮次上限；接入 QQ（OneBot）。
-5. **工作层与双手**：board、断点续做、`delegate`（`codex exec`）、`web`。
+5. **工作层与双手**：board、断点续做、`delegate`（`codex exec`，迁往 `dsh headless`，见工单 #25）、`web`。
 6. **研究流水线与知识层**：从澄清到交付的完整流程、claims 台账、sources 信誉表、watchlist 主动跟进。
 7. **心流**：按 namespace 分桶、即时反思、缓存命中计量。
 8. **级联与综合审查**：自检失败时升级重做；`judge.rs` 覆盖 5d 的四类事项，并实现每日汇总。自动打分等内容见 5c′，不在本计划范围内。
-9. **进化闸门**：接入 DSH，完成 proposal → cargo test / eval → 审查 → 审批 → commit 的流程，加上 L4 隔离和漂移探针。
+9. **进化闸门**：在已接入的 DSH 上完成 proposal → cargo test / eval → 审查 → 审批 → commit 的流程，加上 L4 隔离和漂移探针。
 
 **可恢复性与幂等性不是首版的优先事项。** 首版只要求三点：基本任务状态、`log.md` 断点、可以人工恢复。有外部影响的动作在 `audit` 中留一条最小执行记录（sent / unknown / failed），恢复时能识别“结果未知”，避免盲目重复。以下内容列为后续增强：崩溃后自动续做、重复消息和重复工具调用的去重、文件与数据库的一致性修复。
 
@@ -418,7 +420,7 @@ AGLI 其实已经是双层结构，只是之前没有这样命名：
 | Super-agent | AGLI | 现状 |
 |---|---|---|
 | Router 层：常驻、统一对外、不执行 | 人格主循环 `agli.rs` + `floor` / `decide` / `speak` | 有；聊天路径本来就没有执行工具 |
-| Worker 层：上下文隔离、并发、用最强模型、不直接对人 | hands：`research::run` 调用 codex / cc | 一次只跑一个；一次性流水线，开跑后收不到新消息 |
+| Worker 层：上下文隔离、并发、用最强模型、不直接对人 | hands：`research::run` 调用 codex（迁往 DSH） | 一次只跑一个；一次性流水线，开跑后收不到新消息 |
 | 两级过滤（代码 Fast Path + 模型 Slow Path） | `floor.rs` + `consider_group`（triage） | 有 |
 | Router 合并积压事件 | 群聊 `unseen` 攒够再一起看 | 只有群聊；私聊逐条处理 |
 | Thread 订阅与直通 | 无；任务只记录 requester | 缺 |
