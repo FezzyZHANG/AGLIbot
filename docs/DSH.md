@@ -14,6 +14,7 @@ Merge these lines into the existing `hands` mapping in `config/runtime.yaml`:
 hands:
   research: dsh
   dsh_profile: agli
+  dsh_home: data/dsh-home
   code: codex
 ```
 
@@ -22,15 +23,70 @@ Bailian model/key, search backend and isolated runner. No daily cap is enforced.
 The stock headless web search provider is `deepseek-official`, using
 `DEEPSEEK_API_KEY`; a Bailian model key alone does not configure that search service.
 
+## Dedicated DSH home (ticket 48)
+
+`hands.dsh_home` defaults to `data/dsh-home`, already covered by `/data` in
+`.gitignore`. Like `data_dir`, a relative path is resolved against the AGLI root;
+an explicit absolute path is retained. Config loading resolves it to an absolute
+path before any task changes cwd. Each DSH invocation creates the directory if
+missing and passes it as the child's `DSH_HOME`, replacing any parent value.
+Codex receives no `DSH_HOME`. AGLI never copies credentials or profiles from the
+owner's DSH home and does not change the parent's environment.
+
+Create and inspect `agli` in this dedicated home. In PowerShell, from the AGLI
+root (use the configured path if different):
+
+```powershell
+$previousDshHome = $env:DSH_HOME
+try {
+    $env:DSH_HOME = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path 'data/dsh-home'))
+    New-Item -ItemType Directory -Force -Path $env:DSH_HOME | Out-Null
+    dsh --profile agli --from-default-profile headless
+    dsh --profile agli --dump-config
+} finally {
+    if ($null -eq $previousDshHome) { Remove-Item Env:DSH_HOME -ErrorAction SilentlyContinue }
+    else { $env:DSH_HOME = $previousDshHome }
+}
+```
+
+The profile is under `data/dsh-home/profiles/agli`; configure its Bailian provider
+and research patch there. Set both `AGLI_DSH_DEEPSEEK_API_KEY` and
+`AGLI_DSH_BAILIAN_API_KEY` in AGLI's `.env` as described below. Never copy
+`~/.dsh/.credentials.yaml` into this home or point the profile at that file.
+The shipped `headless` template supplies the starting composition, not the
+owner's existing profile or login. Config dumps also rewrite generated profile
+files, so always set this home when inspecting the profile.
+
+Read-only inspection of the installed `C:/dev/DSH/resources/app.asar` found:
+under `dsh/node_modules/@deepseek-ai/`, `dsh-home-paths/lib/index.js:83-85,109-110`
+uses a nonempty `DSH_HOME` before the `homedir()` fallback. With the absolute
+home passed here, `USERPROFILE`/`HOME` do not redirect the default credential
+store. `dsh-credentials-local/lib/index.js:56-58` resolves that store within the
+selected home. There is an explicit override: the same line honors plugin
+`config.path`, or `config.dshHome`, ahead of the environment. A profile setting
+either to the owner's home/file can therefore still read the owner's credentials;
+the shipped `dsh-base/cordis.patch.yml:125-126` sets neither. Keep those overrides
+out of the AGLI profile. Stored credentials take precedence over environment
+keys (`dsh-credentials-local/lib/index.js:13-26`). This home separation is not
+an OS filesystem sandbox; the isolated runner requirement still applies.
+
+Deterministic ticket 48 tests cover default/custom/absolute home resolution,
+empty directory creation, reuse without overwriting existing state, failure on
+a file or unresolved relative path, and DSH versus Codex child environments
+with and without inherited `DSH_HOME` (including Windows case variants).
+Only the harmless test child runs; no live DSH invocation is needed.
+
 ## Delegate environment and dedicated keys (ticket 46)
 
 Both hands start with an empty environment. The single `DELEGATE_ENV_ALLOWLIST`
 in `src/hands/delegate.rs` restores runtime paths, Windows/npm startup variables,
-temporary directories, user/application directories, `CODEX_HOME`, `DSH_HOME`,
+temporary directories, user/application directories, `CODEX_HOME`,
 and HTTP/HTTPS/ALL/NO proxy variables (including lowercase spellings).
 Windows variable matching is case-insensitive. Codex retains its existing login
 under `CODEX_HOME` or `%USERPROFILE%\.codex`; it receives no AGLI/provider keys.
 Variables not explicitly allowed, including `NODE_OPTIONS`, are discarded.
+The same policy assembly in `ns::secrets` strips inherited `DSH_HOME` and adds
+the resolved AGLI home only for DSH.
 
 Secret metadata lives in `ns::secrets::SecretRegistry`: variable name,
 `ProcessingPolicy`, and optional child-side rename. `allows_executor` treats

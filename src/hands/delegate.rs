@@ -45,7 +45,6 @@ const DELEGATE_ENV_ALLOWLIST: &[&str] = &[
     "ProgramFiles(x86)",
     "ProgramW6432",
     "CODEX_HOME",
-    "DSH_HOME",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
@@ -57,23 +56,23 @@ const DELEGATE_ENV_ALLOWLIST: &[&str] = &[
 ];
 
 #[derive(Clone, Copy)]
-enum Delegate {
+enum Delegate<'a> {
     Codex,
-    Dsh,
+    Dsh(&'a Path),
 }
 
 fn delegate_environment(
     cmd: &mut Command,
-    delegate: Delegate,
+    delegate: Delegate<'_>,
     registry: &SecretRegistry,
     parent: impl IntoIterator<Item = (OsString, OsString)>,
 ) {
     cmd.env_clear();
-    let executor = match delegate {
-        Delegate::Codex => "codex",
-        Delegate::Dsh => "dsh",
+    let (executor, dsh_home) = match delegate {
+        Delegate::Codex => ("codex", None),
+        Delegate::Dsh(home) => ("dsh", Some(home)),
     };
-    let environment = registry.assemble(executor, DELEGATE_ENV_ALLOWLIST, parent);
+    let environment = registry.assemble(executor, DELEGATE_ENV_ALLOWLIST, parent, dsh_home);
     cmd.envs(environment.variables);
     for source in environment.missing {
         tracing::warn!(
@@ -84,7 +83,7 @@ fn delegate_environment(
 
 async fn run(
     mut cmd: Command,
-    delegate: Delegate,
+    delegate: Delegate<'_>,
     stdin: &str,
     timeout: Duration,
     mut on_line: impl FnMut(&[u8]) -> Result<()>,
@@ -470,7 +469,7 @@ impl Drop for DshAudit<'_> {
 pub async fn dsh(
     dir: &Path,
     prompt: &str,
-    profile: &str,
+    hands: &crate::config::HandsCfg,
     timeout: Duration,
     resume: Option<&str>,
     store: &dyn Store,
@@ -478,8 +477,13 @@ pub async fn dsh(
 ) -> Result<DshOutput> {
     let executable = std::env::var_os("AGLI_DSH_BIN").filter(|s| !s.is_empty()).unwrap_or_else(|| program("dsh").into());
     let dir = std::path::absolute(dir)?;
-    let cmd = dsh_command(&executable, &dir, profile, resume)?;
-    dsh_run(cmd, &dir, prompt, profile, timeout, resume, store, kind).await
+    let cmd = dsh_command(&executable, &dir, &hands.dsh_profile, resume)?;
+    dsh_run(cmd, &dir, prompt, &hands.dsh_profile, &hands.dsh_home, timeout, resume, store, kind).await
+}
+
+fn prepare_dsh_home(home: &Path) -> Result<()> {
+    anyhow::ensure!(home.is_absolute(), "AGLI DSH home must be resolved against the AGLI root");
+    std::fs::create_dir_all(home).with_context(|| format!("creating AGLI DSH home {}", home.display()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -488,14 +492,16 @@ async fn dsh_run(
     dir: &Path,
     prompt: &str,
     profile: &str,
+    home: &Path,
     timeout: Duration,
     resume: Option<&str>,
     store: &dyn Store,
     kind: &str,
 ) -> Result<DshOutput> {
+    prepare_dsh_home(home)?;
     let mut audit = DshAudit::open(dir, store, profile, kind)?;
     let result = async {
-        run(cmd, Delegate::Dsh, prompt, timeout, |line| audit.line(line)).await?;
+        run(cmd, Delegate::Dsh(home), prompt, timeout, |line| audit.line(line)).await?;
         if let Some(error) = &audit.events.error {
             bail!("DSH: {error}");
         }
@@ -554,14 +560,19 @@ mod tests {
             "NODE_OPTIONS",
         ];
         parent.extend(blocked.iter().map(|name| ((*name).into(), "parent-secret".into())));
+        let home = std::path::absolute("data/dsh-home")?;
         for (delegate, key_value) in [
             (Delegate::Codex, Some("dedicated-secret")),
             (Delegate::Codex, None),
-            (Delegate::Dsh, Some("dedicated-secret")),
-            (Delegate::Dsh, None),
-            (Delegate::Dsh, Some("")),
+            (Delegate::Dsh(&home), Some("dedicated-secret")),
+            (Delegate::Dsh(&home), None),
+            (Delegate::Dsh(&home), Some("")),
         ] {
             let mut source = parent.clone();
+            // Exercise both inherited and absent homes without changing process env.
+            if key_value.is_some() {
+                source.push((if cfg!(windows) { "dSh_HoMe" } else { "DSH_HOME" }.into(), "owner-home".into()));
+            }
             if let Some(value) = key_value {
                 source.extend(DSH_ENV_KEYS.iter().map(|(name, target)| {
                     let name = if cfg!(windows) { name.to_ascii_lowercase() } else { name.to_string() };
@@ -577,6 +588,7 @@ mod tests {
             let stdout = String::from_utf8(output.stdout)?;
             let actual: Vec<_> = stdout.lines().filter_map(|line| line.split_once('=')).collect();
             let value = |name: &str| actual.iter().find(|(key, _)| env_name_matches(OsStr::new(key), name)).map(|(_, value)| *value);
+            assert_eq!(value("DSH_HOME"), if matches!(delegate, Delegate::Dsh(_)) { home.to_str() } else { None });
             for (name, expected) in parent.iter().take(DELEGATE_ENV_ALLOWLIST.len()) {
                 assert_eq!(value(name.to_str().unwrap()), expected.to_str(), "allowlisted variable {name:?}");
             }
@@ -587,7 +599,7 @@ mod tests {
             }
             for (source, target) in DSH_ENV_KEYS {
                 assert!(value(source).is_none(), "prefixed variable {source} leaked");
-                let expected = if matches!(delegate, Delegate::Dsh) {
+                let expected = if matches!(delegate, Delegate::Dsh(_)) {
                     key_value.filter(|v| !v.is_empty()).map(|v| format!("{v}-{target}"))
                 } else {
                     None
@@ -682,6 +694,24 @@ mod tests {
         assert!(dsh_command("dsh".as_ref(), dir, "a&b", None).is_err());
     }
 
+    #[test]
+    fn dsh_home_is_created_empty_and_existing_state_is_preserved() -> Result<()> {
+        let dir = fixture_dir("home");
+        let home = dir.join("data/dsh-home");
+        assert!(!home.exists());
+        prepare_dsh_home(&home)?;
+        assert!(home.is_dir());
+        assert_eq!(std::fs::read_dir(&home)?.count(), 0);
+        std::fs::write(home.join("profile-marker"), "keep")?;
+        prepare_dsh_home(&home)?;
+        assert_eq!(std::fs::read_to_string(home.join("profile-marker"))?, "keep");
+        assert!(!home.join(".credentials.yaml").exists());
+        assert!(prepare_dsh_home(&home.join("profile-marker")).is_err());
+        assert!(prepare_dsh_home(Path::new("relative-home")).is_err());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     fn fixture_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("agli-dsh-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -765,6 +795,7 @@ mod tests {
                 &dir,
                 "prompt through stdin",
                 "agli",
+                &dir.join("dsh-home"),
                 Duration::from_secs(10),
                 None,
                 &store,
@@ -805,6 +836,7 @@ mod tests {
                 &dir,
                 "prompt through stdin",
                 "agli",
+                &dir.join("dsh-home"),
                 Duration::from_secs(10),
                 session,
                 &store,
@@ -841,7 +873,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             // A full pipe must not prevent the timeout from firing (the fixture never reads stdin).
             let prompt = if cancel { String::new() } else { "x".repeat(1024 * 1024) };
-            dsh_run(cmd, &work_dir, &prompt, "agli", Duration::from_secs(8), None, store.as_ref(), "research").await
+            dsh_run(cmd, &work_dir, &prompt, "agli", &work_dir.join("dsh-home"), Duration::from_secs(8), None, store.as_ref(), "research").await
         });
         let ready = tokio::time::timeout(Duration::from_secs(6), async {
             loop {

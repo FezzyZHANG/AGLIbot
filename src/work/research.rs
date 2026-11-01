@@ -501,16 +501,14 @@ async fn gather(
     match job.hands.research {
         DelegateTool::Dsh => {
             let prompt = format!("{brief}{}", with_followups(&dsh_gather_prompt(&job.task, plan, fixes), instructions));
-            let result =
-                delegate::dsh(dir, &prompt, &job.hands.dsh_profile, job.timeout(), session.as_deref(), job.store.as_ref(), "research")
-                    .await;
+            let result = delegate::dsh(dir, &prompt, &job.hands, job.timeout(), session.as_deref(), job.store.as_ref(), "research").await;
             // Gathering has no external effects and the brief makes a fresh session inspect first.
             let output = match result {
                 Ok(output) => output,
                 Err(e) if session.is_some() => {
                     job.log(&format!("DSH resume 失败，回退到新会话：{e:#}"));
                     *session = None;
-                    delegate::dsh(dir, &prompt, &job.hands.dsh_profile, job.timeout(), None, job.store.as_ref(), "research").await?
+                    delegate::dsh(dir, &prompt, &job.hands, job.timeout(), None, job.store.as_ref(), "research").await?
                 }
                 Err(e) => return Err(e),
             };

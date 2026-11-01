@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::path::Path;
 use std::sync::{LazyLock, RwLock};
 
 use super::ProcessingPolicy;
@@ -90,6 +91,7 @@ impl SecretRegistry {
         executor: &str,
         runtime_allowlist: &[&str],
         parent: impl IntoIterator<Item = (OsString, OsString)>,
+        dsh_home: Option<&Path>,
     ) -> ExecutorEnvironment {
         let parent: Vec<_> = parent.into_iter().collect();
         let mut variables = Vec::new();
@@ -105,6 +107,12 @@ impl SecretRegistry {
                 Some((_, value)) => variables.push((secret.child_name.as_deref().unwrap_or(&secret.name).into(), value.clone())),
                 None => missing.push(secret.name.clone()),
             }
+        }
+        // CLI homes are runtime-owned: never inherit the owner's DSH home, even
+        // if it was accidentally allowlisted or registered as a shared variable.
+        variables.retain(|(name, _)| !env_name_matches(name, "DSH_HOME"));
+        if let Some(home) = dsh_home.filter(|_| executor == "dsh") {
+            variables.push(("DSH_HOME".into(), home.as_os_str().to_owned()));
         }
         ExecutorEnvironment { variables, missing }
     }
@@ -149,6 +157,22 @@ mod tests {
     }
 
     #[test]
+    fn dsh_home_is_owned_by_runtime_and_never_inherited() {
+        let registry = SecretRegistry::default();
+        let home = std::path::absolute("agli/data/dsh-home").unwrap();
+        for inherited in [None, Some("owner/.dsh")] {
+            for name in ["DSH_HOME", if cfg!(windows) { "dSh_HoMe" } else { "DSH_HOME" }] {
+                let source = inherited.map(|value| parent(&[(name, value)])).unwrap_or_default();
+                for executor in ["dsh", "codex"] {
+                    let env = registry.assemble(executor, &["DSH_HOME"], source.clone(), Some(&home));
+                    let expected = if executor == "dsh" { vec![(OsString::from("DSH_HOME"), home.as_os_str().to_owned())] } else { vec![] };
+                    assert_eq!(env.variables, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn defaults_keep_internal_secrets_local() {
         let registry = SecretRegistry::default();
         for name in
@@ -184,7 +208,7 @@ mod tests {
         let allowlist: Vec<_> = source.iter().map(|(name, _)| name.to_str().unwrap()).collect();
         let expected = parent(&[("PATH", "runtime"), ("HOME", "login")]);
         for executor in ["codex", "dsh", "unknown"] {
-            let result = registry.assemble(executor, &allowlist, source.clone());
+            let result = registry.assemble(executor, &allowlist, source.clone(), None);
             assert!(result.missing.is_empty());
             let mut expected: BTreeMap<_, _> = expected.clone().into_iter().collect();
             if executor == "dsh" {
@@ -215,7 +239,7 @@ mod tests {
         let source = names.iter().map(|name| ((*name).into(), "sensitive".into())).collect::<Vec<_>>();
         let registry = SecretRegistry::default();
         for executor in ["codex", "dsh"] {
-            assert!(registry.assemble(executor, &names, source.clone()).variables.is_empty());
+            assert!(registry.assemble(executor, &names, source.clone(), None).variables.is_empty());
         }
     }
 
@@ -223,10 +247,10 @@ mod tests {
     fn runtime_proxies_with_credentials_are_not_public_runtime_values() {
         let registry = SecretRegistry::default();
         for value in ["http://user:password@localhost:7890", "socks5://user@localhost", "user:password@localhost:7890"] {
-            assert!(registry.assemble("codex", &["https_proxy"], parent(&[("https_proxy", value)])).variables.is_empty());
+            assert!(registry.assemble("codex", &["https_proxy"], parent(&[("https_proxy", value)]), None).variables.is_empty());
         }
         let source = parent(&[("https_proxy", "http://localhost:7890"), ("NO_PROXY", "localhost,127.0.0.1")]);
-        assert_eq!(values(registry.assemble("codex", &["https_proxy", "NO_PROXY"], source.clone())), source.into_iter().collect());
+        assert_eq!(values(registry.assemble("codex", &["https_proxy", "NO_PROXY"], source.clone(), None)), source.into_iter().collect());
     }
 
     #[test]
@@ -242,11 +266,11 @@ mod tests {
                 .insert(registry_key(name), SecretVariable { name: name.into(), policy, child_name: child_name.map(String::from) });
         }
         let source = parent(&[("SHARED_SECRET", "shared"), ("CODEX_SECRET", "private"), ("RUNTIME_PATH", "hidden")]);
-        let codex = values(registry.assemble("codex", &["RUNTIME_PATH"], source.clone()));
+        let codex = values(registry.assemble("codex", &["RUNTIME_PATH"], source.clone(), None));
         assert_eq!(codex, parent(&[("SHARED_SECRET", "shared"), ("RENAMED", "private")]).into_iter().collect());
-        let dsh = values(registry.assemble("dsh", &["RUNTIME_PATH"], source));
+        let dsh = values(registry.assemble("dsh", &["RUNTIME_PATH"], source, None));
         assert_eq!(dsh, parent(&[("SHARED_SECRET", "shared")]).into_iter().collect());
-        let missing = registry.assemble("codex", &[], parent(&[("SHARED_SECRET", "")])).missing;
+        let missing = registry.assemble("codex", &[], parent(&[("SHARED_SECRET", "")]), None).missing;
         assert_eq!(missing, ["CODEX_SECRET", "SHARED_SECRET"]);
     }
 
@@ -264,10 +288,10 @@ mod tests {
             assert_eq!(registry.variables[&registry_key(name)].policy, ProcessingPolicy::LocalOnly);
         }
         let source = parent(&[("CUSTOM_AUTH", "future"), ("AGLI_DSH_BAILIAN_API_KEY", "now-local")]);
-        assert!(registry.assemble("dsh", &["CUSTOM_AUTH"], source.clone()).variables.is_empty());
+        assert!(registry.assemble("dsh", &["CUSTOM_AUTH"], source.clone(), None).variables.is_empty());
         models.providers.clear();
         registry.protect_models(&models);
-        assert!(registry.assemble("dsh", &["CUSTOM_AUTH"], source).variables.is_empty());
+        assert!(registry.assemble("dsh", &["CUSTOM_AUTH"], source, None).variables.is_empty());
     }
 
     #[test]
