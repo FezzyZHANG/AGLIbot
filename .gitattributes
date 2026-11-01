@@ -1,0 +1,3 @@
+# Moldloft hashes managed blocks and notes by their bytes; keep these LF on every platform.
+*.md text eol=lf
+.gitignore text eol=lf
