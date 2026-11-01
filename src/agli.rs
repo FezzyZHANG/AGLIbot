@@ -871,6 +871,7 @@ impl Agli {
                 max_episodes: mem.episodes_in_context,
                 max_facts: mem.facts_in_context,
                 include_lessons: false,
+                half_life_days: mem.half_life_days,
             },
         )?;
         let n = self.cfg.runtime.session.recap_messages;
@@ -1420,6 +1421,12 @@ impl Agli {
         if let Some(path) = reflect::write_journal(&self.models, self.store.as_ref(), self.speaker.l1(), dir, date).await? {
             info!("journal written: {}", path.display());
         }
+        // Archiving is housekeeping: a failure must not make the whole nightly pass (journal
+        // included) rerun on every tick.
+        if let Err(e) = reflect::archive_nightly(&self.models, self.store.as_ref(), &self.cfg.runtime.memory,
+            &self.cfg.social, date, Utc::now()).await {
+            warn!("nightly archive failed: {e:#}");
+        }
         self.state.last_reflect = Some(date);
         self.speaker.reset_all();
         Ok(())
@@ -1464,7 +1471,8 @@ impl Agli {
             let me: Namespace = Namespace::SelfNs;
             let recall = privacy::recall(
                 self.store.as_ref(),
-                &Query { audience: &Audience::solo(), ns: &me, partners: &[], max_episodes: 0, max_facts: 0, include_lessons: true },
+                &Query { audience: &Audience::solo(), ns: &me, partners: &[], max_episodes: 0, max_facts: 0,
+                    include_lessons: true, half_life_days: self.cfg.runtime.memory.half_life_days },
             )?;
             if !recall.is_empty() {
                 text.push_str(&privacy::render(&recall));

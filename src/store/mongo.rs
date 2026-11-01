@@ -128,7 +128,7 @@ impl MongoStore {
         let snapshot = super::import::Snapshot {
             messages: self.scan("messages", doc! {})?,
             model_calls: self.scan("model_calls", doc! {})?,
-            episodes: self.episodes()?,
+            episodes: self.all_episodes()?,
             persons: self.keyed_snapshot("persons")?,
             groups: self.keyed_snapshot("groups")?,
             relations: self.keyed_snapshot("relations")?,
@@ -255,8 +255,20 @@ impl Store for MongoStore {
         self.append("episodes", e, doc! { "ns": e.ns.to_string(), "ts": timestamp(e.ts) })
     }
 
-    fn episodes(&self) -> Result<Vec<Episode>> {
+    fn all_episodes(&self) -> Result<Vec<Episode>> {
         self.scan("episodes", doc! {})
+    }
+
+    fn archive_episode(&self, archive: &Episode) -> Result<()> {
+        blocking(|| {
+            let _guard = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+            if super::archive_needed(&self.all_episodes()?, archive)? {
+                let fields = doc! { "_id": &archive.id, "_order": self.next_order()?,
+                    "ns": archive.ns.to_string(), "ts": timestamp(archive.ts) };
+                self.collection("episodes").insert_one(record(archive, fields)?).run()?;
+            }
+            Ok(())
+        })
     }
 
     fn persons(&self) -> Result<BTreeMap<String, Person>> {

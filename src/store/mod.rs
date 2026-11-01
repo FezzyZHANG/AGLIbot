@@ -7,7 +7,7 @@ pub mod mongo;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -70,6 +70,42 @@ pub struct Episode {
     pub salience: f64,
     pub ns: Namespace,
     pub scope: Scope,
+    /// A summary archives these originals in place; they remain in `all_episodes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+}
+
+impl Episode {
+    pub fn age_days(&self, now: DateTime<Utc>) -> f64 {
+        (now - self.ts).num_seconds().max(0) as f64 / 86_400.0
+    }
+
+    pub fn effective_salience(&self, now: DateTime<Utc>, half_life_days: f64) -> f64 {
+        self.salience * 0.5_f64.powf(self.age_days(now) / half_life_days)
+    }
+}
+
+fn active_episodes(all: Vec<Episode>) -> Vec<Episode> {
+    let archived: BTreeSet<String> = all.iter().flat_map(|e| e.sources.iter().cloned()).collect();
+    all.into_iter().filter(|e| !archived.contains(&e.id)).collect()
+}
+
+/// Checked under the backend's write lock. One appended summary is the archive commit.
+fn archive_needed(all: &[Episode], archive: &Episode) -> Result<bool> {
+    anyhow::ensure!(!archive.sources.is_empty() && !archive.summary.trim().is_empty(), "empty archive");
+    if let Some(existing) = all.iter().find(|e| e.id == archive.id) {
+        anyhow::ensure!(serde_json::to_value(existing)? == serde_json::to_value(archive)?, "archive id conflict");
+        return Ok(false);
+    }
+    let archived: BTreeSet<&String> = all.iter().flat_map(|e| &e.sources).collect();
+    for id in &archive.sources {
+        anyhow::ensure!(id != &archive.id && !archived.contains(id), "source already archived: {id}");
+        let originals: Vec<_> = all.iter().filter(|e| &e.id == id).collect();
+        anyhow::ensure!(!originals.is_empty(), "missing archive source: {id}");
+        anyhow::ensure!(originals.iter().all(|e| e.ns == archive.ns && e.scope == archive.scope),
+            "archive crosses namespace or scope");
+    }
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,7 +271,12 @@ pub trait Store: Send + Sync {
     fn spent_since(&self, since: DateTime<Utc>) -> Result<f64>;
 
     fn append_episode(&self, e: &Episode) -> Result<()>;
-    fn episodes(&self) -> Result<Vec<Episode>>;
+    /// Active memories, with archived originals excluded from normal recall.
+    fn episodes(&self) -> Result<Vec<Episode>> { Ok(active_episodes(self.all_episodes()?)) }
+    /// Includes unchanged originals, retrievable by the summary's `sources` ids.
+    fn all_episodes(&self) -> Result<Vec<Episode>>;
+    /// Append a summary and hide its sources atomically; an exact retry is a no-op.
+    fn archive_episode(&self, archive: &Episode) -> Result<()>;
 
     fn persons(&self) -> Result<BTreeMap<String, Person>>;
     fn save_person(&self, p: &Person) -> Result<()>;

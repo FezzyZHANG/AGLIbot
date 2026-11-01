@@ -3,6 +3,7 @@
 //! in private is never even shown to the model in a group — the model's discretion is not relied on.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use tracing::info;
 
 use crate::ns::{Audience, Namespace, ProcessingPolicy, Scope};
@@ -49,9 +50,14 @@ pub struct Query<'a> {
     pub max_facts: usize,
     /// Self-scoped lessons are only for solo thinking, and only when a local model can process them.
     pub include_lessons: bool,
+    pub half_life_days: f64,
 }
 
 pub fn recall(store: &dyn Store, q: &Query<'_>) -> Result<Recall> {
+    recall_at(store, q, Utc::now())
+}
+
+fn recall_at(store: &dyn Store, q: &Query<'_>, now: DateTime<Utc>) -> Result<Recall> {
     let mut out = Recall::default();
 
     for p in q.partners {
@@ -74,11 +80,11 @@ pub fn recall(store: &dyn Store, q: &Query<'_>) -> Result<Recall> {
             out.withheld += 1;
         }
     }
-    // Own namespace first, then by salience and recency.
+    // Own namespace first, then by decayed salience and recency.
     relevant.sort_by(|a, b| {
         (&b.ns == q.ns)
             .cmp(&(&a.ns == q.ns))
-            .then(b.salience.total_cmp(&a.salience))
+            .then(b.effective_salience(now, q.half_life_days).total_cmp(&a.effective_salience(now, q.half_life_days)))
             .then(b.ts.cmp(&a.ts))
     });
     relevant.truncate(q.max_episodes);
@@ -135,7 +141,35 @@ mod tests {
             salience: 0.5,
             ns: ns.parse().unwrap(),
             scope,
+            sources: vec![],
         }
+    }
+
+    #[test]
+    fn recall_ranks_by_decayed_salience_with_configured_half_life() {
+        let dir = std::env::temp_dir().join(format!("aglibot-test-decay-recall-{}", std::process::id()));
+        let store = JsonlStore::open(&dir).unwrap();
+        let now: DateTime<Utc> = "2026-11-01T00:00:00Z".parse().unwrap();
+        let mut old = episode("old", "person/owner", Scope::Public, "owner", "old");
+        old.ts = now - chrono::Duration::days(60);
+        old.salience = 0.8;
+        let mut recent = Episode { id: "recent".into(), ts: now, salience: 0.3, ..old.clone() };
+        store.append_episode(&old).unwrap();
+        store.append_episode(&recent).unwrap();
+        let ns = old.ns.clone();
+        let audience = Audience::private("owner");
+        let mut q = Query { audience: &audience, ns: &ns, partners: &[], max_episodes: 1,
+            max_facts: 0, include_lessons: false, half_life_days: 30.0 };
+        assert_eq!(recall_at(&store, &q, now).unwrap().episodes[0].id, "recent");
+        q.half_life_days = 300.0;
+        assert_eq!(recall_at(&store, &q, now).unwrap().episodes[0].id, "old");
+        // An archived original no longer competes with its replacement in recall.
+        recent.id = "summary".into();
+        recent.sources = vec![old.id.clone(), "recent".into()];
+        store.archive_episode(&recent).unwrap();
+        assert_eq!(recall_at(&store, &q, now).unwrap().episodes[0].id, "summary");
+        assert_eq!(store.all_episodes().unwrap()[0].salience, 0.8);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// DESIGN 9: a secret told in private must not reach a group context, filtered at retrieval.
@@ -162,7 +196,7 @@ mod tests {
 
         let group_ns: Namespace = "group/qq:1".parse().unwrap();
         let group = Audience::group("qq:1", ["owner".to_string(), "qq:5".to_string()]);
-        let q = Query { audience: &group, ns: &group_ns, partners: &partners, max_episodes: 10, max_facts: 10, include_lessons: false };
+        let q = Query { audience: &group, ns: &group_ns, partners: &partners, max_episodes: 10, max_facts: 10, include_lessons: false, half_life_days: 30.0 };
         let r = recall(&store, &q).unwrap();
         let text = render(&r);
         assert!(!text.contains("辞职") && !text.contains("换工作"), "{text}");
@@ -171,7 +205,7 @@ mod tests {
 
         let owner_ns: Namespace = "person/owner".parse().unwrap();
         let dm = Audience::private("owner");
-        let q = Query { audience: &dm, ns: &owner_ns, partners: &partners, max_episodes: 10, max_facts: 10, include_lessons: false };
+        let q = Query { audience: &dm, ns: &owner_ns, partners: &partners, max_episodes: 10, max_facts: 10, include_lessons: false, half_life_days: 30.0 };
         let text = render(&recall(&store, &q).unwrap());
         assert!(text.contains("辞职") && text.contains("换工作"));
         // The group episode involved the owner but is scoped to the group: not in the DM either.
