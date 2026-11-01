@@ -16,7 +16,7 @@ pub enum ProviderKind {
     OpenaiCompat,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ProviderCfg {
     pub kind: ProviderKind,
     #[serde(default)]
@@ -29,7 +29,7 @@ pub struct ProviderCfg {
 }
 
 /// $/M tokens.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Price {
     pub input: f64,
     pub cached: f64,
@@ -39,7 +39,7 @@ pub struct Price {
 }
 
 /// One row of the QCL table.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ModelEntry {
     pub id: String,
     pub provider: String,
@@ -57,7 +57,7 @@ pub struct ModelEntry {
     pub enable_thinking: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ModelsCfg {
     pub daily_budget_usd: f64,
     pub providers: BTreeMap<String, ProviderCfg>,
@@ -72,7 +72,7 @@ pub enum Priority {
     Quality,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Scenario {
     #[serde(default)]
     pub q_min: f64,
@@ -89,7 +89,7 @@ pub struct Scenario {
 
 pub type ScenariosCfg = BTreeMap<String, Scenario>;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Owner {
     pub person_id: String,
     /// Env var holding the owner's numeric Telegram id; read once by `Config::load`.
@@ -104,7 +104,7 @@ pub struct Owner {
     pub qq_user_id: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct AclCfg {
     pub owner: Owner,
     /// Platform ids (`qq:123`, `telegram:456`) known to be bots/agents.
@@ -112,7 +112,7 @@ pub struct AclCfg {
     pub known_agents: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TelegramCfg {
     pub poll_timeout_s: u64,
     /// Env var holding the proxy URL; unset or empty means no explicit proxy.
@@ -122,7 +122,7 @@ pub struct TelegramCfg {
     pub proxy: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct QqCfg {
     pub enabled: bool,
     /// Env vars for the OneBot v11 forward WebSocket (NapCat) and its access token.
@@ -134,13 +134,13 @@ pub struct QqCfg {
     pub token: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ChannelsCfg {
     pub telegram: TelegramCfg,
     pub qq: QqCfg,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct FloorCfg {
     /// Ask the triage model whether to chime in after this many unanswered group messages.
     pub check_every: usize,
@@ -148,13 +148,13 @@ pub struct FloorCfg {
     pub unsolicited_cooldown_min: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TurnLimit {
     pub max_replies: usize,
     pub window_min: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SocialCfg {
     /// Reply allowlist, as `platform:chat_id`. Other joined groups are read-only.
     #[serde(default)]
@@ -179,7 +179,7 @@ pub struct SocialCfg {
 fn default_group_reply_max() -> usize { 150 }
 fn default_interjection_max() -> usize { 80 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ReadOnlyReflectCfg {
     pub max_messages_per_night: usize,
@@ -203,7 +203,7 @@ impl SocialCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionCfg {
     pub max_turns: usize,
     pub idle_minutes: i64,
@@ -212,7 +212,7 @@ pub struct SessionCfg {
     pub debounce: DebounceCfg,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct DebounceCfg {
     /// 0 disables both waiting and adaptive learning.
@@ -246,20 +246,20 @@ impl DebounceCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RoutineCfg {
     pub sleep_at: NaiveTime,
     pub wake_at: NaiveTime,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct HeartbeatCfg {
     pub tick_s: u64,
     /// Minimum hours between two messages he starts on his own.
     pub proactive_gap_hours: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct MemoryCfg {
     /// Extract episodes from a chat once this many messages are unprocessed (also nightly).
     pub extract_after: usize,
@@ -301,7 +301,7 @@ pub enum DelegateTool {
     Off,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct HandsCfg {
     #[serde(default)]
     pub research: DelegateTool,
@@ -336,12 +336,12 @@ impl HandsCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct JudgeCfg {
     pub digest_at: NaiveTime,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RuntimeCfg {
     pub data_dir: PathBuf,
     pub mind_dir: PathBuf,
@@ -356,7 +356,7 @@ pub struct RuntimeCfg {
     pub mongo: MongoCfg,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct MongoCfg {
     pub url_env: String,
