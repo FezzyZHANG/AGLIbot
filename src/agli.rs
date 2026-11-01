@@ -81,7 +81,7 @@ pub fn next_work(events: &mut VecDeque<Event>, acl: &AclCfg) -> Option<WorkItem>
 pub struct Intent {
     pub text: String,
     pub silent: bool,
-    pub task: Option<(TaskKind, String)>,
+    pub tasks: Vec<(TaskKind, String)>,
     pub relay: Option<String>,
     pub followups: Vec<(String, String)>,
 }
@@ -99,10 +99,12 @@ fn take_tag(text: &mut String, open_prefix: &str, close: &str) -> Option<(String
 /// Strip runtime markers from a reply. See the "hands" section of L1.
 pub fn parse_intent(raw: &str) -> Intent {
     let mut text = raw.to_string();
-    let task = take_tag(&mut text, "<任务", "</任务>").map(|(attrs, body)| {
+    // A merged batch may ask for several things; each gets its own marker and task.
+    let mut tasks = Vec::new();
+    while let Some((attrs, body)) = take_tag(&mut text, "<任务", "</任务>") {
         let kind = if attrs.contains("code") { TaskKind::Code } else { TaskKind::Research };
-        (kind, body)
-    });
+        tasks.push((kind, body));
+    }
     let relay = take_tag(&mut text, "<转告主人", "</转告主人>").map(|(_, body)| body);
     let mut followups = Vec::new();
     while let Some((attrs, body)) = take_tag(&mut text, "<补充", "</补充>") {
@@ -111,7 +113,7 @@ pub fn parse_intent(raw: &str) -> Intent {
     }
     let text = text.trim().to_string();
     let silent = text.is_empty() || text == "[沉默]" || text == "[不发]";
-    Intent { text, silent, task, relay, followups }
+    Intent { text, silent, tasks, relay, followups }
 }
 
 /// Short multi-paragraph replies go out as separate bubbles, like texting.
@@ -539,13 +541,13 @@ impl Agli {
         };
         let mut intent = parse_intent(&raw);
         let from_owner = ctx.partner.as_ref().is_some_and(|w| w.is_owner);
-        if let Some((kind, title)) = &intent.task {
-            if from_owner && intent.followups.is_empty() {
+        for (kind, title) in &intent.tasks {
+            if from_owner {
                 let t = self.board().add(title, *kind, &self.cfg.acl.owner.person_id, TaskStatus::Inbox, Some(ctx.thread_ref()))?;
                 info!("owner asked for a task: {} ({})", t.title, t.id);
                 self.wake_decide = true;
             } else {
-                warn!("ignored a task marker outside an owner chat or alongside a follow-up");
+                warn!("ignored a task marker outside an owner chat");
             }
         }
         if let Some(req) = &intent.relay {
@@ -1357,7 +1359,7 @@ mod tests {
     fn markers_are_parsed_and_stripped() {
         let i = parse_intent("行，我去翻翻原文。\n<任务 类型=\"research\">查 OpenAI 关于 P vs NP 的说法</任务>");
         assert_eq!(i.text, "行，我去翻翻原文。");
-        assert_eq!(i.task, Some((TaskKind::Research, "查 OpenAI 关于 P vs NP 的说法".into())));
+        assert_eq!(i.tasks, [(TaskKind::Research, "查 OpenAI 关于 P vs NP 的说法".into())]);
         assert!(!i.silent);
 
         let i = parse_intent("这个我得问问他。<转告主人>想让他帮忙跑个脚本</转告主人>");
@@ -1366,7 +1368,10 @@ mod tests {
 
         assert!(parse_intent("[沉默]").silent);
         assert!(parse_intent(" [不发] ").silent);
-        assert_eq!(parse_intent("<任务 类型=\"code\">写个脚本</任务>").task.unwrap().0, TaskKind::Code);
+        assert_eq!(parse_intent("<任务 类型=\"code\">写个脚本</任务>").tasks[0].0, TaskKind::Code);
+        let two = parse_intent("都记下了。<任务 类型=\"research\">查 A</任务><任务 类型=\"code\">写 B</任务>");
+        assert_eq!(two.tasks, [(TaskKind::Research, "查 A".into()), (TaskKind::Code, "写 B".into())]);
+        assert_eq!(two.text, "都记下了。");
     }
 
     #[test]
