@@ -1,5 +1,5 @@
 //! Task pipelines. Research: plan (clarify the question first) → gather evidence with a delegate
-//! into `sources/` and `claims.yaml` → rule checks → judge → at most one revision → report.
+//! into `sources/` and `claims.yaml` → rule checks → judge → bounded revisions → report.
 //! Code: delegate to Codex in `scratch/` → judge the result.
 //!
 //! Runs as a background job; the result goes back to the mind, which tells the owner in his own voice.
@@ -80,6 +80,110 @@ fn read(dir: &Path, name: &str) -> String {
     std::fs::read_to_string(dir.join(name)).unwrap_or_default()
 }
 
+const MAX_REPLANS: usize = 1;
+const MAX_GATHERS: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    Plan,
+    Gather,
+    Review,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FollowupAction {
+    Continue,
+    Replan,
+    Gather,
+    Limit,
+}
+
+/// The step-boundary seam for future reflection; no goal classifier or decide() call here.
+fn boundary_decision(boundary: Boundary, replans: usize, gathers: usize, has_new: bool) -> FollowupAction {
+    if !has_new {
+        FollowupAction::Continue
+    } else if boundary == Boundary::Plan {
+        // Out of replans: the first gather still sees them.
+        if replans < MAX_REPLANS { FollowupAction::Replan } else { FollowupAction::Gather }
+    } else if gathers < MAX_GATHERS {
+        FollowupAction::Gather
+    } else {
+        FollowupAction::Limit
+    }
+}
+
+#[derive(Default)]
+struct Followups {
+    consumed: usize,
+    instructions: String,
+    pending: bool,
+}
+
+impl Followups {
+    fn unread<'a>(&self, snapshot: &'a str) -> Result<&'a str> {
+        snapshot.get(self.consumed..).context("followups.md changed before the consumed position")
+    }
+
+    fn consume(&mut self, snapshot: &str) -> Result<()> {
+        self.instructions.push_str(self.unread(snapshot)?);
+        self.consumed = snapshot.len();
+        Ok(())
+    }
+
+    fn at_boundary(&mut self, snapshot: &str, step: Boundary, replans: usize, gathers: usize) -> Result<FollowupAction> {
+        let action = boundary_decision(step, replans, gathers, !self.unread(snapshot)?.trim().is_empty());
+        if matches!(action, FollowupAction::Replan | FollowupAction::Gather) {
+            self.consume(snapshot)?;
+            self.pending = action == FollowupAction::Gather;
+        }
+        Ok(action)
+    }
+}
+
+fn read_followups(dir: &Path) -> Result<String> {
+    match std::fs::read_to_string(dir.join("followups.md")) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).context("reading followups.md"),
+    }
+}
+
+fn followup_snapshot(job: &Job) -> Result<String> {
+    // Board::follow_up holds this same lock across the entire (possibly multiline) append.
+    let board = job.board.lock().unwrap_or_else(|e| e.into_inner());
+    read_followups(&board.task_dir(&job.task.id))
+}
+
+fn boundary(job: &Job, followups: &mut Followups, step: Boundary, replans: usize, gathers: usize) -> Result<FollowupAction> {
+    let snapshot = followup_snapshot(job)?;
+    let new = followups.unread(&snapshot)?;
+    let action = followups.at_boundary(&snapshot, step, replans, gathers)?;
+    let decision = match action {
+        FollowupAction::Continue => return Ok(action),
+        FollowupAction::Replan => "重新规划（re-plan）",
+        FollowupAction::Gather => "传给下一轮 gather，追加一轮取证和审查",
+        // Deliver what exists rather than discard the finished gathers; the outcome names the rest.
+        FollowupAction::Limit => {
+            job.log(&format!("{step:?} 边界仍有补充，但已达取证上限（{MAX_GATHERS} 轮），留在 followups.md：\n{new}"));
+            return Ok(action);
+        }
+    };
+    job.log(&format!("{step:?} 边界消费补充 → {decision}：\n{new}"));
+    Ok(action)
+}
+
+fn with_followups(prompt: &str, instructions: &str) -> String {
+    if instructions.trim().is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{prompt}\n\n主人对任务的补充（按时间顺序，后面的要求更新前面的要求）：\n{instructions}")
+    }
+}
+
+fn gather_again(verdict: Verdict, pending: bool, gathers: usize, can_revise: bool) -> bool {
+    gathers < MAX_GATHERS && (pending || (verdict == Verdict::Revise && can_revise))
+}
+
 /// Hash every saved source, so the report's evidence is pinned to exact bytes.
 fn index_sources(dir: &Path) -> Result<(usize, Vec<String>)> {
     let src = dir.join("sources");
@@ -147,13 +251,32 @@ fn gather_prompt(task: &Task, plan: &str, fixes: Option<&str>) -> String {
     p
 }
 
-async fn gather(job: &Job, dir: &Path, plan: &str, fixes: Option<&str>) -> Result<String> {
-    let prompt = gather_prompt(&job.task, plan, fixes);
+async fn gather(
+    job: &Job,
+    dir: &Path,
+    plan: &str,
+    fixes: Option<&str>,
+    instructions: &str,
+    session: &mut Option<String>,
+) -> Result<String> {
+    let prompt = with_followups(&gather_prompt(&job.task, plan, fixes), instructions);
     match job.hands.research {
         DelegateTool::Codex => {
-            let text = delegate::codex(dir, &prompt, &job.hands.codex_model, true, job.timeout()).await?;
+            let result = delegate::codex_session(dir, &prompt, &job.hands.codex_model, true, job.timeout(), session.as_deref()).await;
+            let output = match result {
+                Ok(output) => output,
+                Err(e) if session.is_some() => {
+                    job.log(&format!("Codex resume 失败，回退到新会话：{e:#}"));
+                    *session = None;
+                    delegate::codex_session(dir, &prompt, &job.hands.codex_model, true, job.timeout(), None).await?
+                }
+                Err(e) => return Err(e),
+            };
+            std::fs::write(dir.join("codex-session-id"), &output.session_id)?;
+            job.log(&format!("Codex 会话：{}", output.session_id));
+            *session = Some(output.session_id);
             job.log("Codex 完成取证");
-            Ok(text)
+            Ok(output.text)
         }
         DelegateTool::Off => {
             // No hands: say so plainly instead of pretending to have sources.
@@ -162,6 +285,10 @@ async fn gather(job: &Job, dir: &Path, plan: &str, fixes: Option<&str>) -> Resul
                  区分你确定的、不确定的和需要查证的。",
                 job.task.title
             );
+            let mut user = with_followups(&user, instructions);
+            if let Some(f) = fixes {
+                user.push_str(&format!("\n\n审稿人修改意见：\n{f}"));
+            }
             let text = job.models.ask("synthesize", &ProcessingPolicy::Any, &job.l1, &user).await?;
             std::fs::write(dir.join("report.md"), &text)?;
             job.log("未联网，凭已有知识写了报告");
@@ -178,20 +305,44 @@ async fn research(job: &Job) -> Result<Outcome> {
          2. 拆成哪几个子问题。\n3. 什么算一手来源，去哪里找。\n4. 交付时要回答到什么程度。",
         job.task.title
     );
-    let plan = job.models.ask("research_plan", &ProcessingPolicy::Any, &job.l1, &plan_prompt).await?;
-    std::fs::write(dir.join("plan.md"), &plan)?;
-    job.log("计划写好了");
+    let mut followups = Followups::default();
+    let mut replans = 0;
+    let plan = loop {
+        let prompt = with_followups(&plan_prompt, &followups.instructions);
+        let plan = job.models.ask("research_plan", &ProcessingPolicy::Any, &job.l1, &prompt).await?;
+        std::fs::write(dir.join("plan.md"), &plan)?;
+        job.log(if replans == 0 { "计划写好了" } else { "已按补充重新规划，覆盖 plan.md" });
+        if boundary(job, &mut followups, Boundary::Plan, replans, 0)? != FollowupAction::Replan {
+            break plan;
+        }
+        replans += 1;
+    };
 
-    let mut gist = gather(job, &dir, &plan, None).await?;
-    let mut evidence = format!("{}\n\n## report.md\n{}\n\n## claims.yaml\n{}", rule_checks(&dir), read(&dir, "report.md"), read(&dir, "claims.yaml"));
-    let mut j = judge::review(&job.models, ReviewCategory::Verify, &job.task.title, &evidence).await?;
-    job.log(&format!("审查：{}（{}）", j.verdict.zh(), j.reasons));
-    if j.verdict == Verdict::Revise && job.hands.research != DelegateTool::Off {
-        gist = gather(job, &dir, &plan, Some(&j.fixes)).await?;
-        evidence = format!("{}\n\n## report.md\n{}\n\n## claims.yaml\n{}", rule_checks(&dir), read(&dir, "report.md"), read(&dir, "claims.yaml"));
-        j = judge::review(&job.models, ReviewCategory::Verify, &job.task.title, &evidence).await?;
-        job.log(&format!("复审：{}（{}）", j.verdict.zh(), j.reasons));
-    }
+    let mut session = None;
+    let mut fixes = None;
+    let mut gathers = 0;
+    let mut can_revise = job.hands.research != DelegateTool::Off;
+    let (gist, j) = loop {
+        let subject = with_followups(&job.task.title, &followups.instructions);
+        let gist = gather(job, &dir, &plan, fixes.as_deref(), &followups.instructions, &mut session).await?;
+        gathers += 1;
+        followups.pending = false;
+        boundary(job, &mut followups, Boundary::Gather, replans, gathers)?;
+        let evidence =
+            format!("{}\n\n## report.md\n{}\n\n## claims.yaml\n{}", rule_checks(&dir), read(&dir, "report.md"), read(&dir, "claims.yaml"));
+        let j = judge::review(&job.models, ReviewCategory::Verify, &subject, &evidence).await?;
+        job.log(&format!("审查（第 {gathers} 轮）：{}（{}）", j.verdict.zh(), j.reasons));
+        boundary(job, &mut followups, Boundary::Review, replans, gathers)?;
+        if !gather_again(j.verdict, followups.pending, gathers, can_revise) {
+            break (gist, j);
+        }
+        fixes = if j.verdict == Verdict::Revise {
+            can_revise = false;
+            Some(j.fixes)
+        } else {
+            None
+        };
+    };
     let item = judge::file(
         job.store.as_ref(),
         ReviewCategory::Verify,
@@ -205,6 +356,13 @@ async fn research(job: &Job) -> Result<Outcome> {
         Verdict::Pass => String::new(),
         v => format!("\n审稿意见（{}）：{}", v.zh(), j.reasons),
     };
+    let snapshot = followup_snapshot(job)?;
+    let unprocessed = followups.unread(&snapshot)?.trim();
+    let caveat = if unprocessed.is_empty() {
+        caveat
+    } else {
+        format!("{caveat}\n这些补充没来得及处理，留在 followups.md：\n{unprocessed}")
+    };
     Ok(Outcome {
         task_id: job.task.id.clone(),
         title: job.task.title.clone(),
@@ -217,21 +375,24 @@ async fn research(job: &Job) -> Result<Outcome> {
 async fn code(job: &Job) -> Result<Outcome> {
     let dir = job.dir().join("scratch");
     std::fs::create_dir_all(&dir)?;
-    let prompt = format!(
-        "任务：{}\n只在当前目录里工作。完成后用几句话说明做了什么、怎么验证的、还有什么没做。",
-        job.task.title
-    );
+    let prompt = format!("任务：{}\n只在当前目录里工作。完成后用几句话说明做了什么、怎么验证的、还有什么没做。", job.task.title);
+    let instructions = followup_snapshot(job)?;
+    let prompt = with_followups(&prompt, &instructions);
+    if !instructions.trim().is_empty() {
+        job.log(&format!("编码任务开始时消费补充 → 传给编码委托：\n{instructions}"));
+    }
     let text = match job.hands.code {
         DelegateTool::Codex => delegate::codex(&dir, &prompt, &job.hands.codex_model, false, job.timeout()).await?,
         DelegateTool::Off => anyhow::bail!("编码委托已关闭（config/runtime.yaml 的 hands.code）"),
     };
     job.log("编码委托完成");
-    let files: Vec<String> = std::fs::read_dir(&dir)?
-        .filter_map(|e| e.ok().and_then(|e| e.file_name().to_str().map(String::from)))
-        .collect();
+    let files: Vec<String> =
+        std::fs::read_dir(&dir)?.filter_map(|e| e.ok().and_then(|e| e.file_name().to_str().map(String::from))).collect();
     let evidence = format!("产出文件：{}\n\n执行者的说明：\n{}", files.join("、"), text);
-    let j = judge::review(&job.models, ReviewCategory::Act, &job.task.title, &evidence).await?;
-    let item = judge::file(job.store.as_ref(), ReviewCategory::Act, &job.task.title, &evidence, &j, false, json!({"task_id": job.task.id}))?;
+    let subject = with_followups(&job.task.title, &instructions);
+    let j = judge::review(&job.models, ReviewCategory::Act, &subject, &evidence).await?;
+    let item =
+        judge::file(job.store.as_ref(), ReviewCategory::Act, &job.task.title, &evidence, &j, false, json!({"task_id": job.task.id}))?;
     Ok(Outcome {
         task_id: job.task.id.clone(),
         title: job.task.title.clone(),
@@ -244,6 +405,116 @@ async fn code(job: &Job) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn followups_consume_only_new_bytes_including_multiline_and_repeated_text() {
+        let mut f = Followups::default();
+        assert_eq!(f.unread("").unwrap(), "");
+        let first = "- 11-01 12:00 补充（telegram / 42 / 7）：改成方案 B\n保留 A 作对照\n";
+        assert_eq!(f.unread(first).unwrap(), first);
+        f.consume(first).unwrap();
+        assert_eq!(f.unread(first).unwrap(), "");
+        f.consume(first).unwrap();
+        assert_eq!(f.instructions, first);
+        let snapshot = format!("{first}{first}");
+        assert_eq!(f.unread(&snapshot).unwrap(), first);
+        f.consume(&snapshot).unwrap();
+        assert_eq!(f.instructions, snapshot);
+        assert_eq!(f.unread(&snapshot).unwrap(), "");
+        assert!(f.unread("").is_err());
+        // Consumption is deliberately run-local, not a delivery receipt.
+        assert_eq!(Followups::default().unread(&snapshot).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn followups_read_the_board_format_and_surface_io_errors() {
+        use super::super::board::{TaskStatus, ThreadRef};
+        let root = std::env::temp_dir().join(format!("aglibot-test-research-followups-{}", std::process::id()));
+        let mut board = Board::load(&root).unwrap();
+        let task = board.add("方案研究", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
+        let dir = board.task_dir(&task.id);
+        assert!(read_followups(&dir).unwrap().is_empty());
+        let thread = ThreadRef { platform: "telegram".into(), chat_id: "42".into(), message_id: Some("7".into()) };
+        board.follow_up(&task.id, "改成方案 B\n保留 A 作对照", thread.clone()).unwrap();
+        let first = read_followups(&dir).unwrap();
+        let mut f = Followups::default();
+        f.consume(&first).unwrap();
+        board.follow_up(&task.id, "只用一手来源", thread).unwrap();
+        let snapshot = read_followups(&dir).unwrap();
+        let new = f.unread(&snapshot).unwrap();
+        assert!(first.contains("改成方案 B\n保留 A 作对照"));
+        assert!(new.contains("只用一手来源") && !new.contains("方案 B"));
+        std::fs::remove_file(dir.join("followups.md")).unwrap();
+        std::fs::create_dir(dir.join("followups.md")).unwrap();
+        assert!(read_followups(&dir).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn before_gather_followups_replan_once_and_preserve_overflow() {
+        let mut f = Followups::default();
+        assert_eq!(f.at_boundary("", Boundary::Plan, 0, 0).unwrap(), FollowupAction::Continue);
+        assert_eq!(f.at_boundary("方案 B\n", Boundary::Plan, 0, 0).unwrap(), FollowupAction::Replan);
+        assert!(!f.pending);
+        assert_eq!(f.at_boundary("方案 B\n", Boundary::Plan, 1, 0).unwrap(), FollowupAction::Continue);
+        assert_eq!(f.at_boundary("方案 B\n方案 C\n", Boundary::Plan, MAX_REPLANS, 0).unwrap(), FollowupAction::Gather);
+        assert_eq!(f.unread("方案 B\n方案 C\n").unwrap(), "");
+        assert_eq!(f.instructions, "方案 B\n方案 C\n");
+    }
+
+    #[test]
+    fn gather_and_review_followups_force_one_pass_even_after_pass() {
+        let mut f = Followups::default();
+        assert_eq!(f.at_boundary("补充一\n补充二\n", Boundary::Gather, 0, 1).unwrap(), FollowupAction::Gather);
+        assert_eq!(f.at_boundary("补充一\n补充二\n", Boundary::Review, 0, 1).unwrap(), FollowupAction::Continue);
+        assert!(gather_again(Verdict::Pass, f.pending, 1, false));
+        let snapshot = "补充一\n补充二\n审查时的新补充\n";
+        assert_eq!(f.at_boundary(snapshot, Boundary::Review, 0, 1).unwrap(), FollowupAction::Gather);
+        assert!(gather_again(Verdict::Pass, f.pending, 1, false));
+        assert_eq!(f.instructions, snapshot);
+        // All pending entries go to one gather; no further pass without new input or a revision.
+        f.pending = false;
+        for step in [Boundary::Gather, Boundary::Review] {
+            assert_eq!(f.at_boundary(snapshot, step, 0, 2).unwrap(), FollowupAction::Continue);
+        }
+        assert!(!gather_again(Verdict::Pass, f.pending, 2, true));
+
+        let mut during_review = Followups::default();
+        assert_eq!(during_review.at_boundary("新目标", Boundary::Review, 0, 1).unwrap(), FollowupAction::Gather);
+        assert!(gather_again(Verdict::Pass, during_review.pending, 1, true));
+    }
+
+    #[test]
+    fn ongoing_followups_and_judge_revisions_stay_bounded() {
+        for step in [Boundary::Gather, Boundary::Review] {
+            let mut f = Followups::default();
+            let mut snapshot = String::new();
+            for gathers in 1..MAX_GATHERS {
+                snapshot.push_str("新的补充\n");
+                assert_eq!(f.at_boundary(&snapshot, step, 0, gathers).unwrap(), FollowupAction::Gather);
+                assert!(gather_again(Verdict::Pass, f.pending, gathers, false));
+                f.pending = false;
+            }
+            snapshot.push_str("上限后的补充\n");
+            assert_eq!(f.at_boundary(&snapshot, step, 0, MAX_GATHERS).unwrap(), FollowupAction::Limit);
+            assert_eq!(f.unread(&snapshot).unwrap(), "上限后的补充\n");
+            assert!(!gather_again(Verdict::Revise, true, MAX_GATHERS, true));
+        }
+        assert!(gather_again(Verdict::Revise, false, 1, true));
+        assert!(!gather_again(Verdict::Revise, false, 2, false));
+        for verdict in [Verdict::Pass, Verdict::Owner, Verdict::Defer] {
+            assert!(!gather_again(verdict, false, 1, true));
+        }
+    }
+
+    #[test]
+    fn owner_instructions_are_appended_to_step_prompts() {
+        assert_eq!(with_followups("原始任务", " \n"), "原始任务");
+        let prompt = with_followups("计划与审稿意见", "改成方案 B\n只用一手来源\n");
+        assert!(prompt.starts_with("计划与审稿意见\n\n"));
+        assert!(prompt.ends_with("改成方案 B\n只用一手来源\n"));
+        assert!(prompt.contains("后面的要求更新前面的要求"));
+    }
 
     #[test]
     fn rule_checks_flag_missing_evidence() {
