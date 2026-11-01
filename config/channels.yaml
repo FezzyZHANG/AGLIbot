@@ -2,3 +2,9 @@ telegram:
   poll_timeout_s: 30
   # 代理地址写在这个环境变量里（例如 http://127.0.0.1:7890）；不设置则不走显式代理。
   proxy_env: TELEGRAM_PROXY
+
+qq:
+  enabled: true
+  # NapCat 的 OneBot v11 正向 WebSocket（只监听本机），地址和 access token 写在 .env。
+  url_env: ONEBOT_URL
+  token_env: ONEBOT_TOKEN

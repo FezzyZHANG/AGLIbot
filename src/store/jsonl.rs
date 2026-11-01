@@ -1,5 +1,8 @@
-//! Append-only JSONL files under `data/`. Reads scan whole files, which is fine at phase-1 volume.
+//! File-backed store under `data/`. Append-only collections are JSONL; mutable ones (persons,
+//! reviews, kv) are whole JSON documents rewritten atomically. Reads scan whole files, which is
+//! fine at single-person volume; MongoDB replaces this when volume demands it.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -9,26 +12,38 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
-use super::{MessageRecord, ModelCallRecord, Store};
+use super::{AuditRecord, Episode, Lesson, MessageRecord, ModelCallRecord, Person, ReviewItem, Store};
+use crate::ns::Namespace;
 
 const MESSAGES: &str = "messages.jsonl";
 const MODEL_CALLS: &str = "model_calls.jsonl";
+const EPISODES: &str = "episodes.jsonl";
+const LESSONS: &str = "lessons.jsonl";
+const AUDIT: &str = "audit.jsonl";
+const PERSONS: &str = "persons.json";
+const REVIEWS: &str = "reviews.json";
+const KV: &str = "kv.json";
 
 pub struct JsonlStore {
     dir: PathBuf,
-    write_lock: Mutex<()>,
+    lock: Mutex<()>,
 }
 
 impl JsonlStore {
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        Ok(JsonlStore { dir: dir.to_path_buf(), write_lock: Mutex::new(()) })
+        Ok(JsonlStore { dir: dir.to_path_buf(), lock: Mutex::new(()) })
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn append<T: Serialize>(&self, file: &str, rec: &T) -> Result<()> {
         let line = serde_json::to_string(rec)?;
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self.guard();
         let mut f = OpenOptions::new().create(true).append(true).open(self.dir.join(file))?;
         writeln!(f, "{line}")?;
         Ok(())
@@ -54,6 +69,34 @@ impl JsonlStore {
         }
         Ok(out)
     }
+
+    fn read_doc<T: DeserializeOwned + Default>(&self, file: &str) -> Result<T> {
+        let path = self.dir.join(file);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write to a temp file then rename, so a crash never leaves half a document.
+    fn write_doc<T: Serialize>(&self, file: &str, doc: &T) -> Result<()> {
+        let path = self.dir.join(file);
+        let tmp = self.dir.join(format!(".{file}.tmp"));
+        std::fs::write(&tmp, serde_json::to_vec_pretty(doc)?)?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))
+    }
+
+    fn update_doc<T, F>(&self, file: &str, f: F) -> Result<()>
+    where
+        T: Serialize + DeserializeOwned + Default,
+        F: FnOnce(&mut T),
+    {
+        let _g = self.guard();
+        let mut doc: T = self.read_doc(file)?;
+        f(&mut doc);
+        self.write_doc(file, &doc)
+    }
 }
 
 impl Store for JsonlStore {
@@ -61,11 +104,25 @@ impl Store for JsonlStore {
         self.append(MESSAGES, m)
     }
 
-    fn recent_messages(&self, chat_id: &str, n: usize) -> Result<Vec<MessageRecord>> {
+    fn recent_in_ns(&self, ns: &Namespace, n: usize) -> Result<Vec<MessageRecord>> {
         let mut all: Vec<MessageRecord> = self.scan(MESSAGES)?;
-        all.retain(|m| m.chat_id == chat_id);
+        all.retain(|m| &m.ns == ns);
         let skip = all.len().saturating_sub(n);
         Ok(all.split_off(skip))
+    }
+
+    fn messages_after(&self, ns: &Namespace, after: DateTime<Utc>) -> Result<Vec<MessageRecord>> {
+        let mut all: Vec<MessageRecord> = self.scan(MESSAGES)?;
+        all.retain(|m| &m.ns == ns && m.ts > after);
+        Ok(all)
+    }
+
+    fn active_namespaces(&self, after: DateTime<Utc>) -> Result<Vec<Namespace>> {
+        let all: Vec<MessageRecord> = self.scan(MESSAGES)?;
+        let mut out: Vec<Namespace> = all.into_iter().filter(|m| m.ts > after).map(|m| m.ns).collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     fn append_model_call(&self, c: &ModelCallRecord) -> Result<()> {
@@ -76,12 +133,72 @@ impl Store for JsonlStore {
         let calls: Vec<ModelCallRecord> = self.scan(MODEL_CALLS)?;
         Ok(calls.iter().filter(|c| c.ts >= since).map(|c| c.cost_usd).sum())
     }
+
+    fn append_episode(&self, e: &Episode) -> Result<()> {
+        self.append(EPISODES, e)
+    }
+
+    fn episodes(&self) -> Result<Vec<Episode>> {
+        self.scan(EPISODES)
+    }
+
+    fn persons(&self) -> Result<BTreeMap<String, Person>> {
+        let _g = self.guard();
+        self.read_doc(PERSONS)
+    }
+
+    fn save_person(&self, p: &Person) -> Result<()> {
+        self.update_doc(PERSONS, |doc: &mut BTreeMap<String, Person>| {
+            doc.insert(p.person_id.clone(), p.clone());
+        })
+    }
+
+    fn append_lesson(&self, l: &Lesson) -> Result<()> {
+        self.append(LESSONS, l)
+    }
+
+    fn lessons(&self) -> Result<Vec<Lesson>> {
+        self.scan(LESSONS)
+    }
+
+    fn append_audit(&self, a: &AuditRecord) -> Result<()> {
+        self.append(AUDIT, a)
+    }
+
+    fn reviews(&self) -> Result<Vec<ReviewItem>> {
+        let _g = self.guard();
+        self.read_doc(REVIEWS)
+    }
+
+    fn save_review(&self, r: &ReviewItem) -> Result<()> {
+        self.update_doc(REVIEWS, |doc: &mut Vec<ReviewItem>| match doc.iter_mut().find(|x| x.id == r.id) {
+            Some(slot) => *slot = r.clone(),
+            None => doc.push(r.clone()),
+        })
+    }
+
+    fn next_review_id(&self) -> Result<u64> {
+        Ok(self.reviews()?.iter().map(|r| r.id).max().unwrap_or(0) + 1)
+    }
+
+    fn kv_get(&self, key: &str) -> Result<Option<Value>> {
+        let _g = self.guard();
+        let doc: BTreeMap<String, Value> = self.read_doc(KV)?;
+        Ok(doc.get(key).cloned())
+    }
+
+    fn kv_set(&self, key: &str, value: Value) -> Result<()> {
+        self.update_doc(KV, |doc: &mut BTreeMap<String, Value>| {
+            doc.insert(key.to_string(), value);
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ns::{Namespace, Scope};
+    use crate::ns::Scope;
+    use crate::store::{PersonKind, ReviewCategory, ReviewStatus, Tier};
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("aglibot-test-{name}-{}", std::process::id()));
@@ -89,30 +206,33 @@ mod tests {
         dir
     }
 
-    fn msg(chat: &str, text: &str) -> MessageRecord {
+    fn msg(ns: &str, text: &str) -> MessageRecord {
         MessageRecord {
             ts: Utc::now(),
             platform: "telegram".into(),
-            chat_id: chat.into(),
+            chat_id: "1".into(),
             sender: "owner".into(),
+            sender_name: String::new(),
             outgoing: false,
             text: text.into(),
-            ns: Namespace::Person("owner".into()),
+            ns: ns.parse().unwrap(),
             scope: Scope::Persons { ids: vec!["owner".into()] },
         }
     }
 
     #[test]
-    fn recent_messages_filters_and_keeps_order() {
+    fn recent_in_ns_filters_and_keeps_order() {
         let dir = temp_dir("recent");
         let store = JsonlStore::open(&dir).unwrap();
         for i in 0..5 {
-            store.append_message(&msg("a", &format!("a{i}"))).unwrap();
-            store.append_message(&msg("b", &format!("b{i}"))).unwrap();
+            store.append_message(&msg("person/a", &format!("a{i}"))).unwrap();
+            store.append_message(&msg("person/b", &format!("b{i}"))).unwrap();
         }
-        let got: Vec<String> = store.recent_messages("a", 3).unwrap().into_iter().map(|m| m.text).collect();
+        let a: Namespace = "person/a".parse().unwrap();
+        let got: Vec<String> = store.recent_in_ns(&a, 3).unwrap().into_iter().map(|m| m.text).collect();
         assert_eq!(got, ["a2", "a3", "a4"]);
-        assert!(store.recent_messages("none", 3).unwrap().is_empty());
+        assert_eq!(store.active_namespaces(Utc::now() - chrono::Duration::hours(1)).unwrap().len(), 2);
+        assert!(store.recent_in_ns(&"person/none".parse().unwrap(), 3).unwrap().is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -141,6 +261,49 @@ mod tests {
         store.append_model_call(&call(0.5, now)).unwrap();
         let spent = store.spent_since(now - chrono::Duration::hours(1)).unwrap();
         assert!((spent - 0.75).abs() < 1e-12);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn documents_round_trip() {
+        let dir = temp_dir("docs");
+        let store = JsonlStore::open(&dir).unwrap();
+        let mut p = Person {
+            person_id: "qq:1".into(),
+            platform_ids: vec!["qq:1".into()],
+            name: "A".into(),
+            kind: PersonKind::Human,
+            tier: Tier::Groupmate,
+            trust: 0.0,
+            intimacy: 0.0,
+            facts: vec![],
+            last_seen: Utc::now(),
+        };
+        store.save_person(&p).unwrap();
+        p.name = "B".into();
+        store.save_person(&p).unwrap();
+        assert_eq!(store.persons().unwrap()["qq:1"].name, "B");
+
+        let id = store.next_review_id().unwrap();
+        let mut r = ReviewItem {
+            id,
+            ts: Utc::now(),
+            category: ReviewCategory::Act,
+            subject: "s".into(),
+            detail: "d".into(),
+            verdict: "转交主人".into(),
+            status: ReviewStatus::Open,
+            payload: Value::Null,
+            notified: false,
+        };
+        store.save_review(&r).unwrap();
+        r.status = ReviewStatus::Approved;
+        store.save_review(&r).unwrap();
+        assert_eq!(store.reviews().unwrap().len(), 1);
+        assert_eq!(store.next_review_id().unwrap(), id + 1);
+
+        store.kv_set("k", serde_json::json!(3)).unwrap();
+        assert_eq!(store.kv_get("k").unwrap(), Some(serde_json::json!(3)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

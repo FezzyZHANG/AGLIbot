@@ -1,0 +1,16 @@
+# 他参与的群聊，格式 平台:群号，例如 qq:123456789、telegram:-100123。
+# 不在名单里的群，消息一律不读不记；日志会打印群号，方便你加进来。
+groups: []
+
+# 主人以外的人能不能私聊他。
+private_from_others: true
+
+# 群聊轮次（floor）：被 @ 或被回复时一定接话；否则攒够 check_every 条未回复的消息，
+# 才用廉价模型判断一次要不要插话；两次主动插话之间至少隔 unsolicited_cooldown_min 分钟。
+floor:
+  check_every: 8
+  unsolicited_cooldown_min: 30
+
+# 对同一个人在同一个聊天里的回复上限（滑动窗口）。对 bot 收紧，防止两个 bot 无限互聊。
+human_limit: { max_replies: 30, window_min: 10 }
+agent_limit: { max_replies: 3, window_min: 10 }

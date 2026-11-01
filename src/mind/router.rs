@@ -83,9 +83,9 @@ impl Router {
 
 /// Daily spend tracker; rolls over at local midnight.
 pub struct Budget {
-    limit_usd: f64,
+    pub limit_usd: f64,
     day: NaiveDate,
-    spent_usd: f64,
+    pub spent_usd: f64,
 }
 
 impl Budget {

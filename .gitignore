@@ -1,3 +1,18 @@
 /target
 /data
 .env
+
+
+# moldloft:project:begin
+/.moldloft/*.local.json
+/.moldloft/.*.tmp
+/.tools/moldloft/
+/.moldloft/process.local.json
+/workspace/moldloft/data/tickets.db*
+/workspace/moldloft/data/drydocks/**/*.db*
+# moldloft:project:end
+
+# 运行时生成的个人内容
+/work/board.yaml
+/work/tasks/
+/mind/life/journal/

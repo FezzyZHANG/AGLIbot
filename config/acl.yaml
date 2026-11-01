@@ -1,5 +1,9 @@
 # 身份 → 权限。权限只认平台数字 ID，不认昵称。
-# ID 本身不进仓库：写在 .env 或环境变量里。可以给 @userinfobot 发消息获得。
+# ID 本身不进仓库：写在 .env 或环境变量里。Telegram ID 可以给 @userinfobot 发消息获得。
 owner:
   person_id: owner
   telegram_user_id_env: OWNER_TELEGRAM_ID
+  qq_user_id_env: OWNER_QQ_ID
+
+# 已知是 bot / agent 的账号，格式 平台:ID，例如 qq:123456。Telegram 的 bot 会自动识别。
+known_agents: []

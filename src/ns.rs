@@ -76,7 +76,6 @@ pub struct Audience {
 }
 
 impl Audience {
-    #[allow(dead_code)] // used by reflect / solo work (phase 2)
     pub fn solo() -> Self {
         Self::default()
     }
@@ -85,7 +84,6 @@ impl Audience {
         Audience { members: BTreeSet::from([person_id.to_string()]), group: None }
     }
 
-    #[allow(dead_code)] // used once group chats land (phase 4)
     pub fn group(group_id: &str, members: impl IntoIterator<Item = String>) -> Self {
         Audience { members: members.into_iter().collect(), group: Some(group_id.to_string()) }
     }

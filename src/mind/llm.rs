@@ -97,8 +97,10 @@ pub fn openai_body(m: &ModelEntry, p: &Prompt<'_>) -> Value {
     if m.stream {
         body["stream_options"] = json!({"include_usage": true});
     }
+    // A low-effort scenario (chat, triage) turns thinking off even on models configured with it:
+    // the same model serves research too, so thinking follows the scenario, not the model.
     if let Some(thinking) = m.enable_thinking {
-        body["enable_thinking"] = json!(thinking);
+        body["enable_thinking"] = json!(thinking && p.effort != Some("low"));
     }
     body
 }
@@ -224,6 +226,13 @@ impl LlmClient {
             None => Ok(None),
             Some(var) => std::env::var(var).map(Some).with_context(|| format!("env var {var} is not set")),
         }
+    }
+
+    /// For keyless (local) providers: is the server actually up? Checked once at startup.
+    pub async fn reachable(&self, m: &ModelEntry) -> bool {
+        let Some(base) = self.providers.get(&m.provider).and_then(provider_base_url) else { return false };
+        let probe = self.http.get(format!("{base}/models")).timeout(Duration::from_secs(2)).send().await;
+        probe.is_ok_and(|r| r.status().is_success())
     }
 
     pub async fn complete(&self, m: &ModelEntry, p: &Prompt<'_>) -> Result<Reply> {
@@ -376,7 +385,9 @@ mod tests {
         m.enable_thinking = Some(true);
         let body = openai_body(&m, &prompt);
         assert_eq!(body["stream"], true);
-        assert_eq!(body["enable_thinking"], true);
+        assert_eq!(body["enable_thinking"], false, "low effort turns thinking off");
+        let deep = openai_body(&m, &Prompt { effort: None, ..prompt });
+        assert_eq!(deep["enable_thinking"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert!(body.get("output_config").is_none());
     }

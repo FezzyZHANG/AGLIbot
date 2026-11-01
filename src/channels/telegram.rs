@@ -11,11 +11,16 @@ use crate::config::TelegramCfg;
 /// Telegram's limit is 4096 UTF-16 units; stay well under it in chars.
 const CHUNK_CHARS: usize = 3500;
 
+/// Cloneable: one copy polls (it owns the offset), others only send.
+#[derive(Clone)]
 pub struct Telegram {
     http: reqwest::Client,
     base: String,
     offset: i64,
     poll_timeout_s: u64,
+    /// The bot's own id and username, for detecting @mentions and replies to it in groups.
+    me_id: i64,
+    me_username: String,
 }
 
 impl Telegram {
@@ -27,7 +32,39 @@ impl Telegram {
             base: format!("https://api.telegram.org/bot{token}"),
             offset: 0,
             poll_timeout_s: cfg.poll_timeout_s,
+            me_id: 0,
+            me_username: String::new(),
         })
+    }
+
+    /// Learn who the bot is; needed before polling groups.
+    pub async fn identify(&mut self) -> Result<()> {
+        let v: Value = self.http.get(format!("{}/getMe", self.base)).send().await?.json().await?;
+        if v.get("ok").and_then(Value::as_bool) != Some(true) {
+            bail!("getMe failed: {v}");
+        }
+        self.me_id = v.pointer("/result/id").and_then(Value::as_i64).unwrap_or(0);
+        self.me_username = v.pointer("/result/username").and_then(Value::as_str).unwrap_or_default().to_string();
+        Ok(())
+    }
+
+    /// Poll forever, forwarding messages; transient errors back off and retry.
+    pub async fn run(mut self, tx: tokio::sync::mpsc::Sender<Envelope>) {
+        loop {
+            match self.poll().await {
+                Ok(envs) => {
+                    for env in envs {
+                        if tx.send(env).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("telegram poll failed: {e:#}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
     }
 
     pub async fn poll(&mut self) -> Result<Vec<Envelope>> {
@@ -51,7 +88,7 @@ impl Telegram {
             if let Some(id) = update.get("update_id").and_then(Value::as_i64) {
                 self.offset = self.offset.max(id + 1);
             }
-            if let Some(env) = parse_message(update.get("message").unwrap_or(&Value::Null)) {
+            if let Some(env) = parse_message(update.get("message").unwrap_or(&Value::Null), self.me_id, &self.me_username) {
                 out.push(env);
             }
         }
@@ -86,11 +123,13 @@ fn http_client(cfg: &TelegramCfg) -> Result<reqwest::Client> {
     builder.build().context("building Telegram HTTP client")
 }
 
-fn parse_message(msg: &Value) -> Option<Envelope> {
+fn parse_message(msg: &Value, me_id: i64, me_username: &str) -> Option<Envelope> {
     let text = msg.get("text")?.as_str()?.to_string();
     let from = msg.get("from")?;
     let chat = msg.get("chat")?;
     let chat_type = chat.get("type")?.as_str()?;
+    let replied_to_me = me_id != 0 && msg.pointer("/reply_to_message/from/id").and_then(Value::as_i64) == Some(me_id);
+    let mentioned = !me_username.is_empty() && text.contains(&format!("@{me_username}"));
     Some(Envelope {
         platform: "telegram",
         chat_id: chat.get("id")?.as_i64()?.to_string(),
@@ -98,11 +137,12 @@ fn parse_message(msg: &Value) -> Option<Envelope> {
         sender_name: from.get("first_name").and_then(Value::as_str).unwrap_or_default().to_string(),
         sender_is_bot: from.get("is_bot").and_then(Value::as_bool).unwrap_or(false),
         is_group: chat_type != "private",
+        mentions_me: replied_to_me || mentioned,
         text,
     })
 }
 
-fn chunks(text: &str, max_chars: usize) -> Vec<String> {
+pub(crate) fn chunks(text: &str, max_chars: usize) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     chars.chunks(max_chars).map(|c| c.iter().collect()).collect()
 }
@@ -119,9 +159,24 @@ mod tests {
             "chat": {"id": 42, "type": "private"},
             "text": "在吗"
         });
-        let env = parse_message(&msg).unwrap();
+        let env = parse_message(&msg, 7, "aglibot").unwrap();
         assert_eq!((env.chat_id.as_str(), env.sender_id.as_str(), env.is_group), ("42", "42", false));
-        assert!(parse_message(&json!({"from": {"id": 1}, "chat": {"id": 1, "type": "private"}})).is_none());
+        assert!(!env.mentions_me);
+        assert!(parse_message(&json!({"from": {"id": 1}, "chat": {"id": 1, "type": "private"}}), 7, "x").is_none());
+    }
+
+    #[test]
+    fn detects_mentions_and_replies_in_groups() {
+        let group = |extra: Value| {
+            let mut m = json!({"message_id": 2, "from": {"id": 5, "first_name": "A"}, "chat": {"id": -100, "type": "supergroup"}, "text": "hi"});
+            for (k, v) in extra.as_object().unwrap() {
+                m[k] = v.clone();
+            }
+            parse_message(&m, 7, "aglibot").unwrap()
+        };
+        assert!(!group(json!({})).mentions_me);
+        assert!(group(json!({"text": "@aglibot 你怎么看"})).mentions_me);
+        assert!(group(json!({"reply_to_message": {"from": {"id": 7}}})).mentions_me);
     }
 
     #[test]
@@ -170,6 +225,8 @@ mod tests {
             base: "http://telegram.invalid/bot-test".into(),
             offset: 0,
             poll_timeout_s: cfg.poll_timeout_s,
+            me_id: 0,
+            me_username: String::new(),
         };
         assert!(tg.poll().await.unwrap().is_empty());
         tg.send("42", "proxy test").await.unwrap();
