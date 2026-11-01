@@ -91,6 +91,8 @@ mod tests {
     fn cfg() -> SocialCfg {
         SocialCfg {
             groups: vec![],
+            ignored_groups: vec![],
+            read_only_reflect: Default::default(),
             private_from_others: true,
             group_reply_max: 150,
             interjection_max: 80,

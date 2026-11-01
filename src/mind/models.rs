@@ -30,6 +30,20 @@ pub struct Models {
 struct Stub {
     replies: std::collections::VecDeque<String>,
     prompts: Vec<(String, ProcessingPolicy, String)>,
+    cost_usd: f64,
+}
+
+/// Admission limit from recorded spend. An in-flight call is charged when usage arrives.
+#[derive(Clone, Copy)]
+pub struct SpendLimit {
+    pub since: DateTime<Utc>,
+    pub max_usd: f64,
+}
+
+impl SpendLimit {
+    pub fn exhausted(&self, store: &dyn Store) -> Result<bool> {
+        Ok(!self.max_usd.is_finite() || self.max_usd <= 0.0 || store.spent_since(self.since)? >= self.max_usd)
+    }
 }
 
 pub fn local_midnight_utc() -> DateTime<Utc> {
@@ -85,13 +99,18 @@ impl Models {
             router: Router::new(vec![], Default::default()),
             llm: LlmClient::new(Default::default()).unwrap(), store,
             budget: Mutex::new(Budget::new(1.0, 0.0)), has_local: false,
-            stub: Some(Mutex::new(Stub { replies: replies.into(), prompts: vec![] })),
+            stub: Some(Mutex::new(Stub { replies: replies.into(), prompts: vec![], cost_usd: 0.0 })),
         }
     }
 
     #[cfg(test)]
     pub fn stub_prompts(&self) -> Vec<(String, ProcessingPolicy, String)> {
         self.stub.as_ref().unwrap().lock().unwrap().prompts.clone()
+    }
+
+    #[cfg(test)]
+    pub fn stub_cost(&self, cost: f64) {
+        self.stub.as_ref().unwrap().lock().unwrap().cost_usd = cost;
     }
 
     pub fn router(&self) -> &Router {
@@ -216,11 +235,34 @@ impl Models {
         system: &str,
         user: &str,
     ) -> Result<T> {
+        self.ask_json_with_limit(scenario, policy, system, user, None).await
+    }
+
+    /// Limited background calls never retry or escalate outside the caller's spend check.
+    pub async fn ask_json_with_limit<T: DeserializeOwned>(
+        &self,
+        scenario: &str,
+        policy: &ProcessingPolicy,
+        system: &str,
+        user: &str,
+        limit: Option<SpendLimit>,
+    ) -> Result<T> {
+        if let Some(limit) = limit {
+            anyhow::ensure!(!limit.exhausted(self.store.as_ref())?, "read-only reflection cost budget exhausted");
+        }
         #[cfg(test)]
         if let Some(stub) = &self.stub {
             let mut stub = stub.lock().unwrap();
             stub.prompts.push((scenario.into(), policy.clone(), user.into()));
+            self.store.append_model_call(&ModelCallRecord {
+                ts: Utc::now(), scenario: scenario.into(), model_id: "stub".into(), session_id: scenario.into(),
+                uncached_input: 0, cached_input: 0, cache_write: 0, output: 0, latency_ms: 0,
+                cost_usd: stub.cost_usd, ok: true, error: None, escalated_from: None,
+            })?;
             return extract_json(&stub.replies.pop_front().expect("unexpected model call"));
+        }
+        if limit.is_some() {
+            return extract_json(&self.ask_once(scenario, policy, system, user).await?);
         }
         let model = self.pick(scenario, policy)?;
         let turns = [Turn::User(user.to_string())];

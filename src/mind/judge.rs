@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::models::Models;
+use super::models::{Models, SpendLimit};
 use crate::ns::ProcessingPolicy;
 use crate::store::{ReviewCategory, ReviewItem, ReviewStatus, Store};
 
@@ -76,6 +76,10 @@ fn checklist(category: ReviewCategory) -> &'static str {
 
 /// Ask the reviewer model. `evidence` should already contain rule/test/execution results.
 pub async fn review(models: &Models, category: ReviewCategory, subject: &str, evidence: &str) -> Result<Judgement> {
+    review_with_limit(models, category, subject, evidence, None).await
+}
+
+pub async fn review_with_limit(models: &Models, category: ReviewCategory, subject: &str, evidence: &str, limit: Option<SpendLimit>) -> Result<Judgement> {
     let system = "你是一个严格的审稿人。你只做判断，不改写内容。强模型同意不等于正确：没有证据支持的结论不能通过。";
     let user = format!(
         "审查类别：{category:?}\n检查要点：{}\n\n## 审查对象\n{subject}\n\n## 材料与证据\n{evidence}\n\n\
@@ -83,7 +87,7 @@ pub async fn review(models: &Models, category: ReviewCategory, subject: &str, ev
         checklist(category)
     );
     // If no reviewer is available or it fails, the item goes to the owner instead of through.
-    match models.ask_json::<Raw>("verify", &ProcessingPolicy::Any, system, &user).await {
+    match models.ask_json_with_limit::<Raw>("verify", &ProcessingPolicy::Any, system, &user, limit).await {
         Ok(raw) => Ok(Judgement { verdict: Verdict::parse(&raw.verdict), reasons: raw.reasons, fixes: raw.fixes }),
         Err(e) => {
             tracing::warn!("review unavailable, forwarding to owner: {e:#}");

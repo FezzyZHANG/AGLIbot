@@ -156,9 +156,13 @@ pub struct TurnLimit {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SocialCfg {
-    /// Group chats he takes part in, as `platform:chat_id`. Other groups are ignored entirely.
+    /// Reply allowlist, as `platform:chat_id`. Other joined groups are read-only.
     #[serde(default)]
     pub groups: Vec<String>,
+    #[serde(default)]
+    pub ignored_groups: Vec<String>,
+    #[serde(default)]
+    pub read_only_reflect: ReadOnlyReflectCfg,
     /// Whether people other than the owner may chat with him in private.
     pub private_from_others: bool,
     /// CJK characters plus runs of other letters/digits, per complete group reply.
@@ -174,6 +178,30 @@ pub struct SocialCfg {
 
 fn default_group_reply_max() -> usize { 150 }
 fn default_interjection_max() -> usize { 80 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReadOnlyReflectCfg {
+    pub max_messages_per_night: usize,
+    pub max_cost_usd: f64,
+}
+
+impl Default for ReadOnlyReflectCfg {
+    fn default() -> Self { Self { max_messages_per_night: 400, max_cost_usd: 0.10 } }
+}
+
+impl SocialCfg {
+    pub fn read_only_group(&self, id: &str) -> bool {
+        !self.groups.iter().any(|g| g == id) && !self.ignored_groups.iter().any(|g| g == id)
+    }
+
+    pub fn reflects_normally(&self, ns: &crate::ns::Namespace) -> bool {
+        match ns {
+            crate::ns::Namespace::Group(id) => self.groups.contains(id) && !self.ignored_groups.contains(id),
+            _ => true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionCfg {

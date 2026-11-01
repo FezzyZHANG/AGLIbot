@@ -11,16 +11,17 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use chrono::{DateTime, Local, NaiveDate, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
-use super::models::Models;
+use super::models::{Models, SpendLimit};
 use super::{commitments, judge};
+use crate::config::SocialCfg;
 use crate::ns::{Namespace, ProcessingPolicy, Scope};
 use crate::social::groups;
 use crate::social::people::People;
-use crate::store::{Episode, Fact, Lesson, ReviewCategory, Store};
+use crate::store::{Episode, Fact, Lesson, MessageRecord, ReviewCategory, Store};
 
 #[derive(Deserialize)]
 struct RawEpisode {
@@ -84,11 +85,18 @@ pub fn watermark(store: &dyn Store, ns: &Namespace) -> Result<DateTime<Utc>> {
 pub async fn extract_ns(models: &Models, store: &dyn Store, people: &mut People, ns: &Namespace) -> Result<ExtractOutcome> {
     let since = watermark(store, ns)?;
     let msgs = store.messages_after(ns, since)?;
+    extract_messages(models, store, people, ns, &msgs, None, None).await
+}
+
+async fn extract_messages(
+    models: &Models, store: &dyn Store, people: &mut People, ns: &Namespace,
+    msgs: &[MessageRecord], through: Option<DateTime<Utc>>, limit: Option<SpendLimit>,
+) -> Result<ExtractOutcome> {
     let Some(last) = msgs.last() else { return Ok(ExtractOutcome::default()) };
     let scope = last.scope.clone();
     let mut ids: BTreeSet<String> = BTreeSet::new();
     let mut transcript = String::new();
-    for m in &msgs {
+    for m in msgs {
         let (id, name) = if m.outgoing { ("me".to_string(), "我".to_string()) } else { (m.sender.clone(), people.name_of(&m.sender)) };
         transcript.push_str(&format!(
             "[{}] {name}（{id}）：{}\n",
@@ -107,18 +115,18 @@ pub async fn extract_ns(models: &Models, store: &dyn Store, people: &mut People,
          只输出一个 JSON 对象：{{\"episodes\": [{{\"summary\": \"\", \"participants\": [], \"emotion\": \"\", \"salience\": 0.5}}], \
          \"facts\": [{{\"person\": \"\", \"text\": \"\"}}], \"lessons\": [{{\"text\": \"\", \"shareable\": false}}]}}，没有就给空数组。\n\n{transcript}"
     );
-    let (agenda, policy) = commitments::extraction_context(store, ns, &msgs)?;
+    let (agenda, policy) = commitments::extraction_context(store, ns, msgs)?;
     // Existing agenda items are also model input; a restricted one must not taint a group card.
     let social_allowed = matches!(ns, Namespace::Group(_)) && commitments::load(store)?.iter()
         .filter(|c| c.ns == *ns && c.status == commitments::Status::Open)
         .all(|c| c.scope == scope);
     let social = if social_allowed { groups::extraction_prompt(ns) } else { "" };
-    let raw: Extracted = models.ask_json("extract", &policy, system, &format!("{user}\n{agenda}{social}")).await?;
+    let raw: Extracted = models.ask_json_with_limit("extract", &policy, system, &format!("{user}\n{agenda}{social}"), limit).await?;
 
     let now = Utc::now();
-    commitments::apply(store, ns, &msgs, raw.agenda, now)?;
+    commitments::apply(store, ns, msgs, raw.agenda, now)?;
     if social_allowed {
-        groups::apply(store, ns, &msgs, raw.social)?;
+        groups::apply(store, ns, msgs, raw.social)?;
     }
     let mut out = ExtractOutcome { messages: msgs.len(), ..Default::default() };
     let mut episode_ids = Vec::new();
@@ -167,12 +175,12 @@ pub async fn extract_ns(models: &Models, store: &dyn Store, people: &mut People,
         }
     }
     // Mark the batch done before the slower reviews, so a failure there never re-extracts it.
-    store.kv_set(&watermark_key(ns), json!(last.ts.to_rfc3339()))?;
+    store.kv_set(&watermark_key(ns), json!(through.unwrap_or(last.ts).to_rfc3339()))?;
     for lesson in widen {
         // Widening scope always goes through review (2d). A pass widens it now, as a separate
         // record pointing at its source; anything else stays self-only or waits for the owner.
         let evidence = format!("来源：{} 条经历（原可见范围 {:?}）。只看这条经验本身是否还能认出人。", episode_ids.len(), scope);
-        let j = judge::review(models, ReviewCategory::Widen, &lesson.text, &evidence).await?;
+        let j = judge::review_with_limit(models, ReviewCategory::Widen, &lesson.text, &evidence, limit).await?;
         judge::file(
             store,
             ReviewCategory::Widen,
@@ -192,6 +200,74 @@ pub async fn extract_ns(models: &Models, store: &dyn Store, people: &mut People,
         out.messages, out.episodes, out.facts, out.lessons
     );
     Ok(out)
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct ReadOnlyUsage {
+    messages: usize,
+    cost_usd: f64,
+    pending_since: Option<DateTime<Utc>>,
+}
+
+impl ReadOnlyUsage {
+    fn settle(&mut self, store: &dyn Store) -> Result<()> {
+        if let Some(since) = self.pending_since {
+            self.cost_usd += store.spent_since(since)?;
+            self.pending_since = None;
+        }
+        Ok(())
+    }
+}
+
+/// Evenly spaced messages over the whole window, including both ends when possible.
+fn sample(msgs: &[MessageRecord], count: usize) -> Vec<MessageRecord> {
+    let count = count.min(msgs.len());
+    match count {
+        0 => vec![],
+        1 => vec![msgs[msgs.len() / 2].clone()],
+        _ => (0..count).map(|i| msgs[i * (msgs.len() - 1) / (count - 1)].clone()).collect(),
+    }
+}
+
+/// Run only after priority chats. Budget state survives retries/restarts in the same diary night.
+pub async fn read_only_nightly(
+    models: &Models, store: &dyn Store, people: &mut People, social: &SocialCfg,
+    date: NaiveDate, after: DateTime<Utc>,
+) -> Result<()> {
+    let key = format!("read_only_reflect:{date}");
+    let mut used: ReadOnlyUsage = store.kv_get(&key)?.map(serde_json::from_value).transpose()?.unwrap_or_default();
+    // After an interrupted call, conservatively charge all recorded spend since its start.
+    used.settle(store)?;
+    store.kv_set(&key, json!(used))?;
+    let mut groups = Vec::new();
+    for ns in store.active_namespaces(after)? {
+        if let Namespace::Group(id) = &ns && social.read_only_group(id) {
+            let msgs = store.messages_after(&ns, watermark(store, &ns)?.max(after))?;
+            if !msgs.is_empty() { groups.push((ns, msgs)); }
+        }
+    }
+    groups.sort_by(|(a, am), (b, bm)| bm.len().cmp(&am.len()).then_with(|| a.to_string().cmp(&b.to_string())));
+    for (ns, msgs) in groups {
+        let remaining = social.read_only_reflect.max_messages_per_night.saturating_sub(used.messages);
+        let limit = SpendLimit { since: Utc::now(), max_usd: social.read_only_reflect.max_cost_usd - used.cost_usd };
+        let count = if limit.exhausted(store)? { 0 } else { remaining.min(msgs.len()) };
+        if count < msgs.len() {
+            info!(%ns, sampled = count, total = msgs.len(), ratio = count as f64 / msgs.len() as f64,
+                cost_usd = used.cost_usd, "read-only reflect: budget sampling");
+        }
+        if count == 0 { continue }
+        let selected = sample(&msgs, count);
+        used.messages += count;
+        used.pending_since = Some(limit.since);
+        store.kv_set(&key, json!(used))?;
+        let result = extract_messages(models, store, people, &ns, &selected, msgs.last().map(|m| m.ts), Some(limit)).await;
+        used.settle(store)?;
+        store.kv_set(&key, json!(used))?;
+        if let Err(e) = result {
+            warn!(%ns, "read-only reflect failed: {e:#}");
+        }
+    }
+    Ok(())
 }
 
 /// The public copy of a reviewed lesson; the self-scoped original stays as it was.
@@ -258,6 +334,36 @@ pub async fn write_journal(models: &Models, store: &dyn Store, l1: &str, journal
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn sampling_is_even_deterministic_and_handles_zero_or_one() {
+        let msgs: Vec<_> = (0..10).map(|i| MessageRecord {
+            ts: Utc.timestamp_opt(i, 0).unwrap(), platform: "telegram".into(), chat_id: "g".into(),
+            sender: "p".into(), sender_name: "p".into(), outgoing: false, text: i.to_string(),
+            ns: Namespace::Group("g".into()), scope: Scope::Group { id: "g".into() },
+        }).collect();
+        let indices = |n| sample(&msgs, n).into_iter().map(|m| m.ts.timestamp()).collect::<Vec<_>>();
+        assert!(indices(0).is_empty());
+        assert_eq!(indices(1), [5]);
+        assert_eq!(indices(4), [0, 3, 6, 9]);
+        assert_eq!(indices(4), indices(4));
+        assert_eq!(indices(20), (0..10).collect::<Vec<_>>());
+        assert!(sample(&[], 1).is_empty());
+    }
+
+    #[test]
+    fn read_only_social_defaults_and_ignore_precedence() {
+        let mut social: SocialCfg = serde_yaml::from_str(include_str!("../../config/social.yaml")).unwrap();
+        assert!(social.ignored_groups.is_empty());
+        assert_eq!(social.read_only_reflect.max_messages_per_night, 400);
+        assert_eq!(social.read_only_reflect.max_cost_usd, 0.10);
+        let partial: crate::config::ReadOnlyReflectCfg = serde_yaml::from_str("max_messages_per_night: 10").unwrap();
+        assert_eq!(partial.max_cost_usd, 0.10);
+        social.groups.push("g".into());
+        social.ignored_groups.push("g".into());
+        assert!(!social.read_only_group("g"));
+        assert!(!social.reflects_normally(&Namespace::Group("g".into())));
+    }
 
     #[test]
     fn after_midnight_still_counts_as_the_same_day() {
