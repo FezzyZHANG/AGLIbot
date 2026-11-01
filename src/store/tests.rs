@@ -105,12 +105,31 @@ pub(super) fn contract(store: &dyn Store) {
         salience: 0.5,
         ns: Namespace::SelfNs,
         scope: Scope::SelfOnly,
+        sources: vec![],
     };
     let mut earlier = e.clone();
     earlier.ts -= Duration::days(1);
     store.append_episode(&e).unwrap();
     store.append_episode(&earlier).unwrap();
-    same(&store.episodes().unwrap(), &vec![e, earlier]); // Append, even with duplicate ids.
+    same(&store.episodes().unwrap(), &vec![e.clone(), earlier.clone()]); // Append, even with duplicate ids.
+    let mut archive = Episode { id: "archive".into(), sources: vec![e.id.clone()], ..e.clone() };
+    archive.scope = Scope::Public;
+    assert!(store.archive_episode(&archive).is_err());
+    archive.scope = e.scope.clone();
+    archive.ns = Namespace::Person("other".into());
+    assert!(store.archive_episode(&archive).is_err());
+    archive.ns = e.ns.clone();
+    archive.sources = vec!["missing".into()];
+    assert!(store.archive_episode(&archive).is_err());
+    archive.sources = vec![e.id.clone()];
+    store.archive_episode(&archive).unwrap();
+    store.archive_episode(&archive).unwrap();
+    same(&store.episodes().unwrap(), &vec![archive.clone()]);
+    same(&store.all_episodes().unwrap(), &vec![e, earlier, archive.clone()]);
+    archive.summary = "conflicting retry".into();
+    assert!(store.archive_episode(&archive).is_err());
+    archive.id = "overlapping-archive".into();
+    assert!(store.archive_episode(&archive).is_err());
 
     let l = Lesson {
         id: "lesson".into(),
@@ -239,7 +258,14 @@ pub(super) fn persisted(store: &dyn Store) {
     assert_eq!(audit[0].outcome, Outcome::Denied);
     assert_eq!(audit[0].reason, "denied");
     assert_eq!(store.recent_in_ns(&"person/a".parse().unwrap(), 100).unwrap().len(), 5);
-    assert_eq!(store.episodes().unwrap().len(), 2);
+    assert_eq!(store.episodes().unwrap().len(), 1);
+    let all = store.all_episodes().unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].summary, "event");
+    assert_eq!(all[1].ts, time() - Duration::days(1));
+    assert_eq!(all[2].sources, ["same-id"]);
+    store.archive_episode(&all[2]).unwrap();
+    assert_eq!(store.all_episodes().unwrap().len(), 3);
     assert_eq!(store.lessons().unwrap().len(), 2);
     assert_eq!(store.persons().unwrap()["p.z"].name, "new");
     let group = store.group("telegram:-7").unwrap().unwrap();

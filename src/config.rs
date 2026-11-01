@@ -265,6 +265,31 @@ pub struct MemoryCfg {
     pub extract_after: usize,
     pub episodes_in_context: usize,
     pub facts_in_context: usize,
+    #[serde(default = "default_half_life_days")]
+    pub half_life_days: f64,
+    #[serde(default = "default_archive_threshold")]
+    pub archive_threshold: f64,
+    #[serde(default = "default_archive_min_age_days")]
+    pub archive_min_age_days: f64,
+    #[serde(default = "default_archive_max_groups")]
+    pub archive_max_groups: usize,
+}
+
+fn default_half_life_days() -> f64 { 30.0 }
+fn default_archive_threshold() -> f64 { 0.05 }
+fn default_archive_min_age_days() -> f64 { 30.0 }
+fn default_archive_max_groups() -> usize { 20 }
+
+impl MemoryCfg {
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.half_life_days.is_finite() && self.half_life_days > 0.0,
+            "memory.half_life_days must be positive and finite");
+        anyhow::ensure!(self.archive_threshold.is_finite() && (0.0..=1.0).contains(&self.archive_threshold),
+            "memory.archive_threshold must be in [0, 1]");
+        anyhow::ensure!(self.archive_min_age_days.is_finite() && self.archive_min_age_days >= 0.0,
+            "memory.archive_min_age_days must be nonnegative and finite");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -431,6 +456,7 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         self.runtime.session.debounce.validate()?;
+        self.runtime.memory.validate()?;
         for m in &self.models.models {
             if !self.models.providers.contains_key(&m.provider) {
                 bail!("model `{}` references unknown provider `{}`", m.id, m.provider);
@@ -464,6 +490,33 @@ fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_decay_defaults_overrides_and_validation() {
+        let yaml = "extract_after: 10\nepisodes_in_context: 5\nfacts_in_context: 5\n";
+        let memory: MemoryCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(memory.half_life_days, 30.0);
+        assert_eq!(memory.archive_threshold, 0.05);
+        assert_eq!(memory.archive_min_age_days, 30.0);
+        assert_eq!(memory.archive_max_groups, 20);
+        memory.validate().unwrap();
+        let mut memory: MemoryCfg = serde_yaml::from_str(&format!("{yaml}half_life_days: 10\narchive_threshold: 0.1\narchive_min_age_days: 7\narchive_max_groups: 0\n")).unwrap();
+        assert_eq!(memory.half_life_days, 10.0);
+        assert_eq!(memory.archive_threshold, 0.1);
+        assert_eq!(memory.archive_min_age_days, 7.0);
+        assert_eq!(memory.archive_max_groups, 0);
+        memory.validate().unwrap();
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            memory.half_life_days = bad;
+            assert!(memory.validate().is_err());
+        }
+        memory.half_life_days = 30.0;
+        memory.archive_threshold = 1.1;
+        assert!(memory.validate().is_err());
+        memory.archive_threshold = 0.05;
+        memory.archive_min_age_days = -1.0;
+        assert!(memory.validate().is_err());
+    }
 
     #[test]
     fn social_reply_limits_default_and_override() {

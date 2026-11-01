@@ -63,8 +63,12 @@ impl JsonlStore {
     }
 
     fn append<T: Serialize>(&self, file: &str, rec: &T) -> Result<()> {
-        let line = serde_json::to_string(rec)?;
         let _g = self.guard();
+        self.append_unlocked(file, rec)
+    }
+
+    fn append_unlocked<T: Serialize>(&self, file: &str, rec: &T) -> Result<()> {
+        let line = serde_json::to_string(rec)?;
         let mut f = OpenOptions::new().create(true).append(true).open(self.dir.join(file))?;
         writeln!(f, "{line}")?;
         Ok(())
@@ -166,8 +170,17 @@ impl Store for JsonlStore {
         self.append(EPISODES, e)
     }
 
-    fn episodes(&self) -> Result<Vec<Episode>> {
+    fn all_episodes(&self) -> Result<Vec<Episode>> {
+        let _g = self.guard();
         self.scan(EPISODES)
+    }
+
+    fn archive_episode(&self, archive: &Episode) -> Result<()> {
+        let _g = self.guard();
+        if super::archive_needed(&self.scan_mode(EPISODES, true)?, archive)? {
+            self.append_unlocked(EPISODES, archive)?;
+        }
+        Ok(())
     }
 
     fn persons(&self) -> Result<BTreeMap<String, Person>> {
