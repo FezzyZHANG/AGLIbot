@@ -309,6 +309,16 @@ struct ReplyBatch {
     consider: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct OvernightChat {
+    platform: String,
+    chat_id: String,
+    sender_id: String,
+    is_agent: bool,
+}
+
+const OVERNIGHT_CHATS: &str = "overnight_chats";
+
 impl ChatCtx {
     fn owner_private(&self) -> bool {
         !self.is_group && self.partner.as_ref().is_some_and(|w| w.is_owner)
@@ -371,6 +381,8 @@ pub struct Agli {
     deliveries: Vec<research::Outcome>,
     ignored_logged: HashSet<String>,
     wake_decide: bool,
+    #[cfg(test)]
+    test_chat: Option<tests::TestChat>,
 }
 
 impl Agli {
@@ -401,6 +413,8 @@ impl Agli {
             deliveries: Vec::new(),
             ignored_logged: HashSet::new(),
             wake_decide: recovered > 0,
+            #[cfg(test)]
+            test_chat: None,
             cfg,
             store,
             models,
@@ -550,7 +564,7 @@ impl Agli {
             let label = if who.is_owner { "主人".to_string() } else { self.people.name_of(&who.person_id) };
             batch.lines.push(format!("{label}：{}", env.text));
             if asleep && !who.is_owner {
-                // Nobody wakes him but the owner; the message is kept for his memory.
+                self.remember_overnight(&env, who.is_agent)?;
                 info!("asleep: not replying to {} now", who.person_id);
                 return Ok(());
             }
@@ -575,6 +589,84 @@ impl Agli {
             }
             FloorDecision::Consider => batch.consider = true,
             FloorDecision::Silent(_) => {}
+        }
+        Ok(())
+    }
+
+    fn overnight_chats(&self) -> Result<Vec<OvernightChat>> {
+        Ok(self.store.kv_get(OVERNIGHT_CHATS)?.map(serde_json::from_value).transpose()?.unwrap_or_default())
+    }
+
+    fn remember_overnight(&self, env: &Envelope, is_agent: bool) -> Result<()> {
+        let mut chats = self.overnight_chats()?;
+        if let Some(chat) = chats.iter_mut().find(|c| c.platform == env.platform && c.chat_id == env.chat_id) {
+            chat.is_agent |= is_agent;
+        } else {
+            // Insertion order is the order of each chat's first unanswered message.
+            chats.push(OvernightChat {
+                platform: env.platform.into(), chat_id: env.chat_id.clone(), sender_id: env.sender_id.clone(), is_agent,
+            });
+        }
+        self.store.kv_set(OVERNIGHT_CHATS, json!(chats))
+    }
+
+    fn overnight_turn(&self, chat: &OvernightChat) -> Result<Option<(ChatCtx, String, usize)>> {
+        let platform = match chat.platform.as_str() {
+            "telegram" => "telegram",
+            "qq" => "qq",
+            _ => return Ok(None),
+        };
+        let env = Envelope {
+            platform, chat_id: chat.chat_id.clone(), sender_id: chat.sender_id.clone(), sender_name: String::new(),
+            sender_is_bot: chat.is_agent, is_group: false, mentions_me: false, text: String::new(), message_id: None, arrived: None,
+        };
+        let mut who = identify(&self.cfg.acl, &env);
+        if who.is_owner {
+            return Ok(None);
+        }
+        who.is_agent |= self.people.get(&who.person_id).is_some_and(|p| p.kind == crate::store::PersonKind::Agent);
+        let ctx = ChatCtx {
+            key: format!("{platform}:{}", chat.chat_id), platform, chat_id: chat.chat_id.clone(), message_id: None,
+            ns: Namespace::Person(who.person_id.clone()), scope: Scope::Persons { ids: vec![who.person_id.clone()] },
+            audience: Audience::private(&who.person_id), is_group: false, partner: Some(who),
+        };
+        let messages = self.store.messages_after(&ctx.ns, DateTime::UNIX_EPOCH)?;
+        let in_chat = |m: &MessageRecord| m.platform == platform && m.chat_id == chat.chat_id;
+        let start = messages.iter().rposition(|m| in_chat(m) && m.outgoing).map_or(0, |i| i + 1);
+        let pending = &messages[start..];
+        let lines: Vec<String> = pending.iter()
+            .filter(|m| in_chat(m) && !m.outgoing && m.scope.permits(&ctx.audience))
+            .map(|m| format!("{}：{}", self.people.name_of(&m.sender), m.text)).collect();
+        Ok(Some((ctx, lines.join("\n"), pending.len())))
+    }
+
+    async fn catch_up_overnight(&mut self) -> Result<()> {
+        if self.frozen() || !self.cfg.social.private_from_others {
+            return Ok(());
+        }
+        let mut remaining = self.overnight_chats()?;
+        for chat in remaining.clone() {
+            let result = async {
+                let Some((ctx, mut body, current)) = self.overnight_turn(&chat)? else { return Ok(false) };
+                if body.is_empty() {
+                    return Ok(false);
+                }
+                let who = ctx.partner.as_ref().unwrap();
+                if !self.floor.allow_reply(&self.cfg.social, &ctx.key, &who.person_id, who.is_agent, Utc::now()) {
+                    return Ok(false);
+                }
+                body.push_str("\n\n（你刚睡醒，这些是睡觉期间收到的消息。酌情回答，不需要回复就只输出 [沉默] 或 [不发]。）");
+                self.converse(&ctx, body, current, false).await?;
+                Ok::<_, anyhow::Error>(true)
+            }.await;
+            match result {
+                Ok(true) => {
+                    remaining.retain(|c| c.platform != chat.platform || c.chat_id != chat.chat_id);
+                    self.store.kv_set(OVERNIGHT_CHATS, json!(remaining))?;
+                }
+                Ok(false) => {}
+                Err(e) => warn!("overnight catch-up in {}:{} failed: {e:#}", chat.platform, chat.chat_id),
+            }
         }
         Ok(())
     }
@@ -689,15 +781,27 @@ impl Agli {
         let tasks = ctx.task_cards(&self.board());
         let (l2, policy) = self.frame(ctx, current, &tasks)?;
         self.speaker.refresh_tasks(&ctx.key, &tasks);
-        let raw = match self.speaker.say(&self.models, &ctx.key, &policy, now, text, || Ok(l2)).await
-        {
+        #[cfg(test)]
+        let response = if let Some(test) = &mut self.test_chat {
+            test.turns.push((ctx.key.clone(), text.clone(), l2.clone()));
+            Some(test.replies.pop_front().expect("unexpected model call"))
+        } else {
+            None
+        };
+        #[cfg(not(test))]
+        let response: Option<Result<String>> = None;
+        let response = match response {
+            Some(r) => r,
+            None => self.speaker.say(&self.models, &ctx.key, &policy, now, text, || Ok(l2)).await,
+        };
+        let raw = match response {
             Ok(r) => r,
             Err(e) => {
                 error!("reply failed: {e:#}");
                 if !ctx.is_group {
                     let _ = self.outlets.send(ctx.platform, &ctx.chat_id, "（刚才走神了，你再说一遍？）").await;
                 }
-                return Ok(());
+                return Err(e);
             }
         };
         let mut intent = parse_intent(&raw);
@@ -724,6 +828,10 @@ impl Agli {
             self.floor.spoke(&ctx.key, unsolicited, now);
         }
         let outcome = self.send_bubbles(ctx.platform, &ctx.chat_id, &intent.text).await;
+        if unsolicited {
+            self.audit("me", "group_chime_in", true, &ctx.key, outcome)?;
+        }
+        anyhow::ensure!(outcome == Outcome::Sent, "reply delivery in {}: {outcome:?}", ctx.key);
         self.store.append_message(&MessageRecord {
             ts: Utc::now(),
             platform: ctx.platform.into(),
@@ -735,13 +843,14 @@ impl Agli {
             ns: ctx.ns.clone(),
             scope: ctx.scope.clone(),
         })?;
-        if unsolicited {
-            self.audit("me", "group_chime_in", true, &ctx.key, outcome)?;
-        }
         Ok(())
     }
 
     async fn send_bubbles(&self, platform: &str, chat_id: &str, text: &str) -> Outcome {
+        #[cfg(test)]
+        if let Some(test) = &self.test_chat {
+            return test.sends.lock().unwrap().pop_front().expect("unexpected send");
+        }
         for (i, b) in bubbles(text).iter().enumerate() {
             if i > 0 {
                 tokio::time::sleep(Duration::from_millis(700)).await;
@@ -1043,6 +1152,7 @@ impl Agli {
             match c {
                 Change::FellAsleep => self.nightly().await?,
                 Change::WokeUp => {
+                    self.catch_up_overnight().await?;
                     for o in std::mem::take(&mut self.deliveries) {
                         self.deliver(o).await?;
                     }
@@ -1661,6 +1771,21 @@ mod tests {
         assert!(queue.is_empty());
     }
 
+    pub(super) struct TestChat {
+        pub(super) replies: VecDeque<Result<String>>,
+        pub(super) turns: Vec<(String, String, String)>,
+        pub(super) sends: Mutex<VecDeque<Outcome>>,
+    }
+
+    impl TestChat {
+        fn new(replies: &[&str], sends: &[Outcome]) -> Self {
+            Self {
+                replies: replies.iter().map(|s| Ok((*s).into())).collect(), turns: Vec::new(),
+                sends: Mutex::new(sends.iter().copied().collect()),
+            }
+        }
+    }
+
     struct TestAgli {
         agli: Agli,
         dir: std::path::PathBuf,
@@ -1707,6 +1832,193 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.dir).unwrap();
         }
+    }
+
+    fn private_message(sender: &str, text: &str) -> Envelope {
+        let Event::Inbound(mut env) = inbound(sender, text, "1") else { unreachable!() };
+        env.sender_id = sender.into();
+        env.sender_name = format!("person-{sender}");
+        env
+    }
+
+    fn private_record(sender: &str, chat: &str, text: &str, outgoing: bool) -> MessageRecord {
+        MessageRecord {
+            ts: Utc::now(), platform: "telegram".into(), chat_id: chat.into(),
+            sender: if outgoing { "me".into() } else { format!("telegram:{sender}") }, sender_name: String::new(),
+            outgoing, text: text.into(), ns: Namespace::Person(format!("telegram:{sender}")),
+            scope: Scope::Persons { ids: vec![format!("telegram:{sender}")] },
+        }
+    }
+
+    // Force a wake transition regardless of the wall clock, without unrelated tick model calls.
+    async fn wake(a: &mut Agli) {
+        let now = Utc::now();
+        let cfg = Arc::make_mut(&mut a.cfg);
+        cfg.runtime.routine.sleep_at = (now + chrono::Duration::hours(2)).with_timezone(&Local).time();
+        cfg.runtime.routine.wake_at = (now + chrono::Duration::hours(3)).with_timezone(&Local).time();
+        cfg.runtime.memory.extract_after = usize::MAX;
+        a.state.energy.asleep = true;
+        a.state.last_tick = Some(now);
+        a.state.last_digest = Some(now.with_timezone(&Local).date_naive());
+        a.state.revisit_at = None;
+        a.wake_decide = false;
+        a.on_tick().await.unwrap();
+        assert!(!a.state.energy.asleep);
+    }
+
+    #[tokio::test]
+    async fn overnight_list_survives_restart_in_first_message_order() {
+        let mut test = TestAgli::new("overnight-restart").await;
+        let a = &mut test.agli;
+        a.state.energy.asleep = true;
+        for sender in ["8", "7", "8"] {
+            assert!(!a.prepare_messages(vec![private_message(sender, "overnight")]).await.speak);
+        }
+        assert!(a.prepare_messages(vec![private_message("42", "owner awake")]).await.speak);
+        a.prepare_messages(group_messages(&["group overnight"], false)).await;
+        let mut bot = private_message("9", "bot overnight");
+        bot.sender_is_bot = true;
+        a.prepare_messages(vec![bot]).await;
+        a.state.save(&a.cfg.data_dir()).unwrap();
+        let cfg = a.cfg.clone();
+        let store = Arc::new(crate::store::jsonl::JsonlStore::open(&cfg.data_dir()).unwrap());
+        let models = Arc::new(Models::new(&cfg, store.clone()).await.unwrap());
+        let (tx, _) = mpsc::channel(16);
+        test.agli = Agli::new(cfg, store, models, Outlets::default(), tx).unwrap();
+        let a = &mut test.agli;
+        assert!(a.state.energy.asleep);
+        let chats = a.overnight_chats().unwrap();
+        assert_eq!(chats.iter().map(|c| c.chat_id.as_str()).collect::<Vec<_>>(), ["8", "7", "9"]);
+        assert!(chats[2].is_agent);
+        a.test_chat = Some(TestChat::new(&["[沉默]", "[不发]", "[沉默]"], &[]));
+        wake(a).await;
+        let calls = &a.test_chat.as_ref().unwrap().turns;
+        assert_eq!(calls.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["telegram:8", "telegram:7", "telegram:9"]);
+        assert_eq!(calls[0].1.matches("person-8：overnight").count(), 2);
+        assert!(calls[2].2.contains("bot / agent"));
+        assert!(a.overnight_chats().unwrap().is_empty());
+        a.on_tick().await.unwrap(); // No second catch-up on an ordinary awake tick.
+        assert_eq!(a.test_chat.as_ref().unwrap().turns.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn overnight_wake_selects_unanswered_chat_messages_with_original_privacy() {
+        let mut test = TestAgli::new("overnight-selection").await;
+        let a = &mut test.agli;
+        Arc::make_mut(&mut a.cfg).runtime.session.recap_messages = 2;
+        for (text, outgoing) in [("old question", false), ("last answer", true), ("unanswered before sleep", false)] {
+            a.store.append_message(&private_record("7", "7", text, outgoing)).unwrap();
+        }
+        a.state.energy.asleep = true;
+        for i in 0..12 {
+            a.prepare_messages(vec![private_message("7", &format!("night-{i}"))]).await;
+        }
+        // Same namespace, different send target; neither its text nor its outgoing cuts off chat 7.
+        a.store.append_message(&private_record("7", "other-chat", "other outgoing", true)).unwrap();
+        a.store.append_message(&private_record("7", "other-chat", "other incoming", false)).unwrap();
+        let mut restricted = private_record("7", "7", "restricted secret", false);
+        restricted.scope = Scope::SelfOnly;
+        a.store.append_message(&restricted).unwrap();
+        a.prepare_messages(vec![private_message("8", "other person secret")]).await;
+        // A newer daytime answer leaves no messages to catch up on; skip without completing a turn.
+        a.prepare_messages(vec![private_message("9", "already answered")]).await;
+        a.store.append_message(&private_record("9", "9", "daytime answer", true)).unwrap();
+        a.state.last_proactive = Some(Utc::now());
+        a.test_chat = Some(TestChat::new(&["morning answer", "[沉默]"], &[Outcome::Sent]));
+        wake(a).await;
+        let calls = &a.test_chat.as_ref().unwrap().turns;
+        assert_eq!(calls.len(), 2);
+        let (_, tail, frame) = &calls[0];
+        assert!(tail.contains("刚睡醒") && tail.contains("unanswered before sleep"));
+        for i in 0..12 {
+            assert!(tail.contains(&format!("person-7：night-{i}")));
+        }
+        for excluded in ["old question", "last answer", "other outgoing", "other incoming", "restricted secret", "other person secret"] {
+            assert!(!tail.contains(excluded), "{excluded}");
+        }
+        assert!(!frame.contains("night-0") && !frame.contains("restricted secret"));
+        let history = a.store.recent_in_ns(&Namespace::Person("telegram:7".into()), 1).unwrap();
+        assert!(history[0].outgoing);
+        assert_eq!(history[0].scope, Scope::Persons { ids: vec!["telegram:7".into()] });
+        let remaining = a.overnight_chats().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].chat_id, "9");
+    }
+
+    #[tokio::test]
+    async fn overnight_frozen_and_disabled_private_chats_keep_the_list() {
+        let mut test = TestAgli::new("overnight-frozen").await;
+        let a = &mut test.agli;
+        a.state.energy.asleep = true;
+        a.prepare_messages(vec![private_message("7", "pending")]).await;
+        let saved = a.store.kv_get(OVERNIGHT_CHATS).unwrap();
+        a.test_chat = Some(TestChat::new(&["[沉默]"], &[]));
+        a.store.kv_set("frozen", json!(true)).unwrap();
+        wake(a).await;
+        assert_eq!(a.store.kv_get(OVERNIGHT_CHATS).unwrap(), saved);
+        assert!(a.test_chat.as_ref().unwrap().turns.is_empty());
+        a.store.kv_set("frozen", json!(false)).unwrap();
+        Arc::make_mut(&mut a.cfg).social.private_from_others = false;
+        wake(a).await;
+        assert_eq!(a.store.kv_get(OVERNIGHT_CHATS).unwrap(), saved);
+        assert!(a.test_chat.as_ref().unwrap().turns.is_empty());
+        Arc::make_mut(&mut a.cfg).social.private_from_others = true;
+        wake(a).await;
+        assert!(a.overnight_chats().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn overnight_respects_human_and_agent_caps_and_current_owner_identity() {
+        let mut test = TestAgli::new("overnight-caps").await;
+        let a = &mut test.agli;
+        a.state.energy.asleep = true;
+        for sender in ["7", "8", "9", "10"] {
+            let mut env = private_message(sender, "pending");
+            env.sender_is_bot = sender == "8";
+            a.prepare_messages(vec![env]).await;
+        }
+        let cfg = Arc::make_mut(&mut a.cfg);
+        cfg.acl.owner.telegram_user_id = 10;
+        cfg.acl.known_agents.push("telegram:9".into());
+        cfg.social.agent_limit.max_replies = 0;
+        cfg.social.human_limit.max_replies = 1;
+        assert!(a.floor.allow_reply(&a.cfg.social, "telegram:7", "telegram:7", false, Utc::now()));
+        a.test_chat = Some(TestChat::new(&[], &[]));
+        wake(a).await;
+        assert!(a.test_chat.as_ref().unwrap().turns.is_empty());
+        assert_eq!(a.overnight_chats().unwrap().len(), 4);
+        a.floor = Floor::default();
+        a.test_chat = Some(TestChat::new(&["[不发]"], &[]));
+        wake(a).await;
+        assert_eq!(a.test_chat.as_ref().unwrap().turns[0].0, "telegram:7");
+        assert_eq!(a.overnight_chats().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn overnight_clears_only_completed_turns_and_retries_failures_next_wake() {
+        let mut test = TestAgli::new("overnight-completion").await;
+        let a = &mut test.agli;
+        a.state.energy.asleep = true;
+        for sender in ["6", "7", "8", "9", "10"] {
+            a.prepare_messages(vec![private_message(sender, "pending question")]).await;
+        }
+        let mut chat = TestChat::new(&["failed send", "partial send", "[沉默]", "sent"], &[Outcome::Failed, Outcome::Unknown, Outcome::Sent]);
+        chat.replies.push_front(Err(anyhow::anyhow!("model failed")));
+        a.test_chat = Some(chat);
+        wake(a).await;
+        assert_eq!(a.test_chat.as_ref().unwrap().turns.len(), 5);
+        assert_eq!(a.overnight_chats().unwrap().iter().map(|c| c.chat_id.as_str()).collect::<Vec<_>>(), ["6", "7", "8"]);
+        for sender in ["6", "7", "8", "9"] {
+            let history = a.store.recent_in_ns(&Namespace::Person(format!("telegram:{sender}")), 10).unwrap();
+            assert!(history.iter().all(|m| !m.outgoing));
+        }
+        a.test_chat = Some(TestChat::new(&["[不发]", "retry sent", "[沉默]"], &[Outcome::Sent]));
+        wake(a).await;
+        assert_eq!(a.test_chat.as_ref().unwrap().turns.len(), 3);
+        assert!(a.test_chat.as_ref().unwrap().turns.iter().all(|c| c.1.contains("pending question")));
+        assert!(a.overnight_chats().unwrap().is_empty());
+        let reopened = crate::store::jsonl::JsonlStore::open(&a.cfg.data_dir()).unwrap();
+        assert_eq!(reopened.kv_get(OVERNIGHT_CHATS).unwrap(), Some(json!([])));
     }
 
     #[tokio::test]
