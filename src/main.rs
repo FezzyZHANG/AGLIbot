@@ -25,6 +25,9 @@ use mind::models::Models;
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("import-jsonl")) {
+        return store::import::run(std::env::args_os().skip(2));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
