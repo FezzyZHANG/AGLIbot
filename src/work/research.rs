@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use super::board::{Board, Task, TaskKind};
+use super::board::{Board, Task, TaskKind, TaskStatus};
 use super::resume::{self, Uncertain};
 use crate::config::{DelegateTool, HandsCfg};
 use crate::hands::delegate;
@@ -35,9 +35,17 @@ pub struct Outcome {
     pub task_id: String,
     pub title: String,
     pub ok: bool,
+    /// A successful planning pause, not a failed or completed research task.
+    pub clarification: Option<String>,
     /// Plain facts for the owner; the mind rephrases them in his voice.
     pub summary: String,
     pub verdict: Option<String>,
+}
+
+impl Outcome {
+    pub fn status(&self) -> TaskStatus {
+        if self.ok && self.clarification.is_none() { TaskStatus::Done } else { TaskStatus::Waiting }
+    }
 }
 
 impl Job {
@@ -77,6 +85,7 @@ pub async fn run(job: Job) -> Outcome {
                 task_id: job.task.id.clone(),
                 title: job.task.title.clone(),
                 ok: false,
+                clarification: None,
                 summary: format!("任务没做完，卡在：{e:#}"),
                 verdict: None,
             }
@@ -87,11 +96,12 @@ pub async fn run(job: Job) -> Outcome {
 fn waiting_for_owner(store: &dyn Store, task: &Task, reason: &str) -> Result<Outcome> {
     let j = judge::Judgement { verdict: Verdict::Owner, reasons: reason.into(), fixes: String::new() };
     let item = judge::file(store, ReviewCategory::Act, &task.title, reason, &j, false, json!({"task_id": task.id}))?;
-    // on_job_done maps ok=false to Waiting; approving this review does not replay anything.
+    // Approving this review does not replay anything.
     Ok(Outcome {
         task_id: task.id.clone(),
         title: task.title.clone(),
         ok: false,
+        clarification: None,
         summary: format!("恢复前核实未完成，已停止并等待主人决定：{reason}"),
         verdict: Some(format!("#{} {}", item.id, j.verdict.zh())),
     })
@@ -99,6 +109,30 @@ fn waiting_for_owner(store: &dyn Store, task: &Task, reason: &str) -> Result<Out
 
 fn read(dir: &Path, name: &str) -> String {
     std::fs::read_to_string(dir.join(name)).unwrap_or_default()
+}
+
+/// Only a final, unadorned verdict with one or two questions can pause research.
+pub(super) fn clarification(plan: &str) -> Option<&str> {
+    let line = plan.lines().rev().find(|line| !line.trim().is_empty())?.trim();
+    let questions = line.strip_prefix("澄清：")?.trim();
+    let count = questions.chars().filter(|c| matches!(c, '?' | '？')).count();
+    if (1..=2).contains(&count) && questions.ends_with(['?', '？']) {
+        Some(questions)
+    } else {
+        None
+    }
+}
+
+fn clarification_outcome(task: &Task, plan: &str) -> Option<Outcome> {
+    let questions = clarification(plan)?;
+    Some(Outcome {
+        task_id: task.id.clone(),
+        title: task.title.clone(),
+        ok: true,
+        clarification: Some(questions.into()),
+        summary: format!("任务 {} 暂停研究，等待主人澄清：{questions}\n请回复时注明任务编号，补充后可用 /run {} 继续。", task.id, task.id),
+        verdict: None,
+    })
 }
 
 const MAX_REPLANS: usize = 1;
@@ -395,20 +429,28 @@ fn save_dsh_research(dir: &Path, text: &str) -> Result<String> {
     Ok(report.summary)
 }
 
+fn plan_prompt(title: &str, brief: &str, existing_plan: &str, instructions: &str) -> String {
+    let prompt = format!(
+        "{brief}（这不是聊天，是你开始做一个研究任务前的准备。规划只依据所给资料，目录和外部结果的检查留给 hands。）任务：{title}\n\n先想清楚再动手，写一份简短计划（Markdown）：\n\
+         1. 问题本身准确吗？有没有概念混淆（例如把 P vs NP 说成 N=NP）？你理解的真正问题是什么。\n\
+         2. 拆成哪几个子问题。\n3. 什么算一手来源，去哪里找。\n4. 交付时要回答到什么程度。\n\
+         只有会阻塞研究的歧义才向主人提问：两种理解会导致不同的研究方向，且现有资料无法确定。\
+         轻微的范围选择自行决定，在计划中记下并继续。先结合主人最新补充重新判断；补充已回答的问题不要再问。\n\
+         最后单独一行必须是“澄清：无”，或“澄清：一到两个具体问题”，每个问题以问号（？或 ?）结束。\
+         不要给这一行加 Markdown 标记或代码围栏，行后不要再输出内容。\n\
+         已有计划（保留仍有效的部分）：\n{existing_plan}"
+    );
+    with_followups(&prompt, instructions)
+}
+
 async fn research(job: &Job) -> Result<Outcome> {
     let dir = job.dir();
     let snapshot = resume::inspect(&dir, &job.task, job.store.as_ref()).await?;
     let brief = snapshot.brief();
-    let plan_prompt = format!(
-        "{brief}（这不是聊天，是你开始做一个研究任务前的准备。规划只依据所给资料，目录和外部结果的检查留给 hands。）任务：{}\n\n先想清楚再动手，写一份简短计划（Markdown）：\n\
-         1. 问题本身准确吗？有没有概念混淆（例如把 P vs NP 说成 N=NP）？你理解的真正问题是什么。\n\
-         2. 拆成哪几个子问题。\n3. 什么算一手来源，去哪里找。\n4. 交付时要回答到什么程度。",
-        job.task.title
-    );
     let mut followups = Followups::default();
     let initial_followups = followup_snapshot(job)?;
     followups.consume(&initial_followups)?;
-    let existing_plan = resume::read_optional(&dir.join("plan.md"))?;
+    let mut existing_plan = resume::read_optional(&dir.join("plan.md"))?;
     let mut saved_plan = resume::reuse_plan(&existing_plan, &initial_followups).then_some(existing_plan.clone());
     let mut replans = 0;
     let plan = loop {
@@ -416,10 +458,11 @@ async fn research(job: &Job) -> Result<Outcome> {
             job.log("恢复前核实：plan.md 非空且没有补充，复用已有计划");
             plan
         } else {
-            let prompt = with_followups(&format!("{plan_prompt}\n已有计划（保留仍有效的部分）：\n{existing_plan}"), &followups.instructions);
+            let prompt = plan_prompt(&job.task.title, &brief, &existing_plan, &followups.instructions);
             let plan = job.models.ask("research_plan", &ProcessingPolicy::Any, &job.l1, &prompt).await?;
             resume::check_reply(&plan, false)?;
             std::fs::write(dir.join("plan.md"), &plan)?;
+            existing_plan = plan.clone();
             job.log(if replans == 0 { "计划写好了" } else { "已按补充重新规划，覆盖 plan.md" });
             plan
         };
@@ -428,6 +471,11 @@ async fn research(job: &Job) -> Result<Outcome> {
         }
         replans += 1;
     };
+
+    if let Some(outcome) = clarification_outcome(&job.task, &plan) {
+        job.log(&outcome.summary);
+        return Ok(outcome);
+    }
 
     let mut session = None;
     let mut fixes = None;
@@ -478,6 +526,7 @@ async fn research(job: &Job) -> Result<Outcome> {
         task_id: job.task.id.clone(),
         title: job.task.title.clone(),
         ok: true,
+        clarification: None,
         summary: format!("{}\n完整报告：{}{caveat}", gist.trim(), dir.join("report.md").display()),
         verdict: Some(format!("#{} {}", item.id, j.verdict.zh())),
     })
@@ -515,6 +564,7 @@ async fn code(job: &Job) -> Result<Outcome> {
         task_id: job.task.id.clone(),
         title: job.task.title.clone(),
         ok: true,
+        clarification: None,
         summary: format!("{}\n产出在：{}", text.trim(), dir.display()),
         verdict: Some(format!("#{} {}", item.id, j.verdict.zh())),
     })
@@ -523,6 +573,58 @@ async fn code(job: &Job) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clarification_requires_a_final_verdict_with_one_or_two_questions() {
+        assert_eq!(clarification("# 计划\n澄清：研究 A 还是 B？\n\n"), Some("研究 A 还是 B？"));
+        assert_eq!(clarification("澄清：Which release? 国内还是全球？"), Some("Which release? 国内还是全球？"));
+        for plan in [
+            "", "# 计划\n直接研究", "澄清：无", "澄清： ", "澄清: A 还是 B？",
+            "**澄清：A 还是 B？**", "澄清：范围不清", "澄清：A 还是 B？\n还有计划",
+            "澄清：\nA 还是 B？", "```\n澄清：A 还是 B？\n```", "澄清：A？B？C？",
+        ] {
+            assert_eq!(clarification(plan), None, "{plan}");
+        }
+    }
+
+    #[test]
+    fn clarification_is_a_successful_wait_without_a_review_verdict() {
+        let root = std::env::temp_dir().join(format!("agli-clarification-{}", std::process::id()));
+        let mut board = Board::load(&root).unwrap();
+        let task = board.add("研究版本", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
+        let plan = "# 计划\n需确定研究对象。\n澄清：研究 A 还是 B？";
+        let outcome = clarification_outcome(&task, plan).unwrap();
+        assert!(outcome.ok);
+        assert_eq!(outcome.status(), TaskStatus::Waiting);
+        assert_eq!(outcome.clarification.as_deref(), Some("研究 A 还是 B？"));
+        assert!(outcome.summary.contains(&task.id));
+        assert!(outcome.verdict.is_none());
+        assert!(clarification_outcome(&task, "# 计划\n澄清：无").is_none());
+        assert!(clarification_outcome(&task, "legacy plan").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replanning_includes_the_pending_question_and_owners_answer() {
+        use super::super::board::ThreadRef;
+        let root = std::env::temp_dir().join(format!("agli-clarification-answer-{}", std::process::id()));
+        let mut board = Board::load(&root).unwrap();
+        let task = board.add("研究版本", TaskKind::Research, "owner", TaskStatus::Waiting, None).unwrap();
+        let plan = "# 计划\n澄清：研究 A 还是 B？";
+        std::fs::write(board.task_dir(&task.id).join("plan.md"), plan).unwrap();
+        board.follow_up(&task.id, "研究 B", ThreadRef {
+            platform: "telegram".into(), chat_id: "42".into(), message_id: Some("19".into()),
+        }).unwrap();
+        let saved_plan = resume::read_optional(&board.task_dir(&task.id).join("plan.md")).unwrap();
+        let instructions = read_followups(&board.task_dir(&task.id)).unwrap();
+        assert!(!resume::reuse_plan(&saved_plan, &instructions));
+        let prompt = plan_prompt(&task.title, "", &saved_plan, &instructions);
+        assert!(prompt.contains(plan) && prompt.ends_with(&instructions));
+        assert!(prompt.contains("研究 B") && prompt.contains("补充已回答的问题不要再问"));
+        assert!(prompt.contains("轻微的范围选择自行决定"));
+        assert!(clarification_outcome(&task, "# 计划\n按补充研究 B。\n澄清：无").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn uncertain_resume_files_owner_review_and_returns_waiting_outcome() {

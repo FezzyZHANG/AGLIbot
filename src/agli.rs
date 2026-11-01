@@ -781,10 +781,11 @@ impl Agli {
             self.job = None;
         }
         let exit = self.flow.exit(Utc::now());
-        self.board().set_status(&o.task_id, if o.ok { TaskStatus::Done } else { TaskStatus::Waiting }, if o.ok { "" } else { "出错，等主人看" })?;
+        let note = if o.clarification.is_some() { "等待主人澄清" } else if o.ok { "" } else { "出错，等主人看" };
+        self.board().set_status(&o.task_id, o.status(), note)?;
         self.audit("owner", "delegate_result", true, &o.task_id, if o.ok { Outcome::Sent } else { Outcome::Failed })?;
         self.state.finished_work();
-        reflect::note_today(self.store.as_ref(), &format!("专心做了 {} 分钟：{}（{}）", exit.minutes, o.title, if o.ok { "完成" } else { "没做完" }))?;
+        reflect::note_today(self.store.as_ref(), &format!("专心做了 {} 分钟：{}（{}）", exit.minutes, o.title, if o.status() == TaskStatus::Done { "完成" } else { "没做完" }))?;
         if self.state.energy.asleep {
             self.deliveries.push(o);
         } else {
@@ -849,12 +850,21 @@ impl Agli {
             warn!("task {} finished but the owner has never messaged; nowhere to report", o.task_id);
             return Ok(());
         };
-        let body = format!(
-            "（这不是主人的消息。你刚做完主人交代的事：{}。\n结果：\n{}\n审查：{}\n用你自己的话简短告诉主人结论，附上报告位置；没做完就直说卡在哪。）",
-            o.title,
-            o.summary,
-            o.verdict.clone().unwrap_or_else(|| "无".into())
-        );
+        let body = if let Some(questions) = &o.clarification {
+            format!(
+                "（这不是主人的消息。任务 {}：{}，已暂停并等待主人澄清，还没开始本轮取证。\n\
+                 用你自己的语气向主人问清以下问题，保留任务编号，告诉他回复时注明编号即可：\n{questions}\n\
+                 告诉主人补充后可用 /run {} 继续。主人的后续回答应通过 <补充 任务=\"{}\">回答内容</补充> 挂回任务；本轮只提问，不生成补充标记，也不宣称任务完成。）",
+                o.task_id, o.title, o.task_id, o.task_id
+            )
+        } else {
+            format!(
+                "（这不是主人的消息。你刚做完主人交代的事：{}。\n结果：\n{}\n审查：{}\n用你自己的话简短告诉主人结论，附上报告位置；没做完就直说卡在哪。）",
+                o.title,
+                o.summary,
+                o.verdict.clone().unwrap_or_else(|| "无".into())
+            )
+        };
         self.converse(&ctx, body, 0, false).await
     }
 
@@ -1086,6 +1096,7 @@ mod tests {
     fn batching_preserves_tick_and_job_done_boundaries() {
         let outcome = research::Outcome {
             task_id: "task-1".into(), title: "done".into(), ok: true,
+            clarification: None,
             summary: "result".into(), verdict: None,
         };
         let mut queue = VecDeque::from([
@@ -1148,6 +1159,31 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.dir).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn clarification_completion_waits_without_failure_or_judge_review() {
+        let mut test = TestAgli::new("clarification").await;
+        let a = &mut test.agli;
+        a.state.energy.asleep = true; // Queue delivery without a model or network call.
+        let task = a.board().add("研究版本", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
+        let questions = "研究 A 还是 B？";
+        a.on_job_done(research::Outcome {
+            task_id: task.id.clone(), title: task.title, ok: true,
+            clarification: Some(questions.into()), summary: questions.into(), verdict: None,
+        }).await.unwrap();
+        let board = a.board();
+        let saved = board.get(&task.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Waiting);
+        assert_eq!(saved.note, "等待主人澄清");
+        drop(board);
+        assert!(a.store.reviews().unwrap().is_empty());
+        let audits = a.store.audits().unwrap();
+        let result = audits.iter().find(|record| record.tool == "delegate_result").unwrap();
+        assert_eq!(result.outcome, Outcome::Sent);
+        assert_eq!(a.deliveries.len(), 1);
+        assert_eq!(a.deliveries[0].task_id, task.id);
+        assert_eq!(a.deliveries[0].clarification.as_deref(), Some(questions));
     }
 
     #[tokio::test]

@@ -125,7 +125,7 @@ impl Snapshot {
 
 // No cross-run follow-up receipts yet (#41): any existing follow-up conservatively invalidates reuse.
 pub(super) fn reuse_plan(plan: &str, followups: &str) -> bool {
-    !plan.trim().is_empty() && followups.trim().is_empty()
+    !plan.trim().is_empty() && followups.trim().is_empty() && super::research::clarification(plan).is_none()
 }
 
 #[derive(Debug)]
@@ -226,6 +226,15 @@ mod tests {
         assert!(!reuse_plan(" \n", ""));
         assert!(!reuse_plan("# Plan", "changed objective"));
         assert!(!reuse_plan("# Plan", "old followup without receipt"));
+    }
+
+    #[test]
+    fn pending_clarification_is_never_reused_even_without_a_followup() {
+        let plan = "# Plan\n澄清：研究 A 还是 B？\n";
+        assert!(!reuse_plan(plan, ""));
+        assert!(!reuse_plan(plan, "研究 B"));
+        assert!(reuse_plan("# Plan\n研究 B\n澄清：无", ""));
+        assert!(reuse_plan("# Legacy plan", ""));
     }
 
     #[test]
