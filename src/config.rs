@@ -161,11 +161,19 @@ pub struct SocialCfg {
     pub groups: Vec<String>,
     /// Whether people other than the owner may chat with him in private.
     pub private_from_others: bool,
+    /// CJK characters plus runs of other letters/digits, per complete group reply.
+    #[serde(default = "default_group_reply_max")]
+    pub group_reply_max: usize,
+    #[serde(default = "default_interjection_max")]
+    pub interjection_max: usize,
     pub floor: FloorCfg,
     /// Reply caps per (chat, sender) over a sliding window.
     pub human_limit: TurnLimit,
     pub agent_limit: TurnLimit,
 }
+
+fn default_group_reply_max() -> usize { 150 }
+fn default_interjection_max() -> usize { 80 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionCfg {
@@ -414,6 +422,15 @@ fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn social_reply_limits_default_and_override() {
+        let yaml = "private_from_others: true\nfloor: {check_every: 3, unsolicited_cooldown_min: 30}\nhuman_limit: {max_replies: 5, window_min: 10}\nagent_limit: {max_replies: 2, window_min: 10}\n";
+        let cfg: SocialCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!((cfg.group_reply_max, cfg.interjection_max), (150, 80));
+        let cfg: SocialCfg = serde_yaml::from_str(&format!("{yaml}group_reply_max: 12\ninterjection_max: 4\n")).unwrap();
+        assert_eq!((cfg.group_reply_max, cfg.interjection_max), (12, 4));
+    }
 
     #[test]
     fn session_debounce_defaults_and_overrides() {

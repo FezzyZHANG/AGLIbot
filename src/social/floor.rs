@@ -92,6 +92,8 @@ mod tests {
         SocialCfg {
             groups: vec![],
             private_from_others: true,
+            group_reply_max: 150,
+            interjection_max: 80,
             floor: FloorCfg { check_every: 3, unsolicited_cooldown_min: 30 },
             human_limit: TurnLimit { max_replies: 5, window_min: 10 },
             agent_limit: TurnLimit { max_replies: 2, window_min: 10 },
