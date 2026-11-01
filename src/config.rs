@@ -249,7 +249,14 @@ pub struct HandsCfg {
     #[serde(default = "default_dsh_profile")]
     pub dsh_profile: String,
     pub timeout_min: u64,
+    #[serde(default = "default_stall_minutes")]
+    pub stall_minutes: u64,
+    #[serde(default = "default_total_budget_minutes")]
+    pub total_budget_minutes: u64,
 }
+
+fn default_stall_minutes() -> u64 { 20 }
+fn default_total_budget_minutes() -> u64 { 90 }
 
 fn default_dsh_profile() -> String {
     "agli".into()
@@ -440,10 +447,13 @@ mod tests {
         let hands: HandsCfg = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(hands.research, DelegateTool::Codex);
         assert_eq!(hands.dsh_profile, "agli");
+        assert_eq!((hands.stall_minutes, hands.total_budget_minutes), (20, 90));
         let hands: HandsCfg = serde_yaml::from_str(&format!("{yaml}research: dsh\ndsh_profile: agli-research")).unwrap();
         assert_eq!(hands.research, DelegateTool::Dsh);
         assert_eq!(hands.code, DelegateTool::Codex);
         assert_eq!(hands.dsh_profile, "agli-research");
+        let hands: HandsCfg = serde_yaml::from_str(&format!("{yaml}stall_minutes: 3\ntotal_budget_minutes: 15")).unwrap();
+        assert_eq!((hands.stall_minutes, hands.total_budget_minutes), (3, 15));
     }
 
     #[test]
