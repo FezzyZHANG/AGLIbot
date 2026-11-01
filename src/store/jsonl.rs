@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::{AuditRecord, Episode, Lesson, MessageRecord, ModelCallRecord, Person, ReviewItem, Store};
+use super::{AuditRecord, Episode, Group, Lesson, MessageRecord, ModelCallRecord, Person, Relation, ReviewItem, Store};
 use crate::ns::Namespace;
 
 const MESSAGES: &str = "messages.jsonl";
@@ -23,6 +23,8 @@ const EPISODES: &str = "episodes.jsonl";
 const LESSONS: &str = "lessons.jsonl";
 const AUDIT: &str = "audit.jsonl";
 const PERSONS: &str = "persons.json";
+const GROUPS: &str = "groups.json";
+const RELATIONS: &str = "relations.json";
 const REVIEWS: &str = "reviews.json";
 const KV: &str = "kv.json";
 
@@ -40,6 +42,8 @@ impl JsonlStore {
             model_calls: store.scan_mode(MODEL_CALLS, true)?,
             episodes: store.scan_mode(EPISODES, true)?,
             persons: store.persons()?,
+            groups: store.read_doc(GROUPS)?,
+            relations: store.read_doc(RELATIONS)?,
             lessons: store.scan_mode(LESSONS, true)?,
             audit: store.scan_mode(AUDIT, true)?,
             reviews: store.reviews()?,
@@ -179,6 +183,30 @@ impl Store for JsonlStore {
 
     fn append_lesson(&self, l: &Lesson) -> Result<()> {
         self.append(LESSONS, l)
+    }
+
+    fn group(&self, chat_id: &str) -> Result<Option<Group>> {
+        let _g = self.guard();
+        let groups: BTreeMap<String, Group> = self.read_doc(GROUPS)?;
+        Ok(groups.get(chat_id).cloned())
+    }
+
+    fn save_group(&self, g: &Group) -> Result<()> {
+        self.update_doc(GROUPS, |doc: &mut BTreeMap<String, Group>| {
+            doc.insert(g.chat_id.clone(), g.clone());
+        })
+    }
+
+    fn relations(&self, ns: &Namespace) -> Result<Vec<Relation>> {
+        let _g = self.guard();
+        let relations: BTreeMap<String, Relation> = self.read_doc(RELATIONS)?;
+        Ok(relations.into_values().filter(|r| &r.ns == ns).collect())
+    }
+
+    fn save_relation(&self, r: &Relation) -> Result<()> {
+        self.update_doc(RELATIONS, |doc: &mut BTreeMap<String, Relation>| {
+            doc.insert(r.key(), r.clone());
+        })
     }
 
     fn lessons(&self) -> Result<Vec<Lesson>> {

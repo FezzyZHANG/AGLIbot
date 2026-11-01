@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::{AuditRecord, Episode, Lesson, MessageRecord, ModelCallRecord, Person, ReviewItem, Store};
+use super::{AuditRecord, Episode, Group, Lesson, MessageRecord, ModelCallRecord, Person, Relation, ReviewItem, Store};
 use crate::ns::Namespace;
 
 const COLLECTIONS: &[&str] =
@@ -130,6 +130,8 @@ impl MongoStore {
             model_calls: self.scan("model_calls", doc! {})?,
             episodes: self.episodes()?,
             persons: self.keyed_snapshot("persons")?,
+            groups: self.keyed_snapshot("groups")?,
+            relations: self.keyed_snapshot("relations")?,
             lessons: self.lessons()?,
             audit: self.scan("audit", doc! {})?,
             reviews: self.reviews()?,
@@ -267,6 +269,23 @@ impl Store for MongoStore {
 
     fn append_lesson(&self, l: &Lesson) -> Result<()> {
         self.append("lessons", l, doc! { "ts": timestamp(l.ts) })
+    }
+
+    fn group(&self, chat_id: &str) -> Result<Option<Group>> {
+        blocking(|| self.collection("groups").find_one(doc! { "_id": chat_id }).run()?.map(decode).transpose())
+    }
+
+    fn save_group(&self, g: &Group) -> Result<()> {
+        self.save("groups", &g.chat_id, g, false)
+    }
+
+    fn relations(&self, ns: &Namespace) -> Result<Vec<Relation>> {
+        let relations: BTreeMap<String, Relation> = self.keyed_snapshot("relations")?;
+        Ok(relations.into_values().filter(|r| &r.ns == ns).collect())
+    }
+
+    fn save_relation(&self, r: &Relation) -> Result<()> {
+        self.save("relations", &r.key(), r, false)
     }
 
     fn lessons(&self) -> Result<Vec<Lesson>> {

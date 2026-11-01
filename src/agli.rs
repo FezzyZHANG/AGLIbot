@@ -858,7 +858,9 @@ impl Agli {
             ProcessingPolicy::LocalOnly => ProcessingPolicy::LocalOnly,
             _ => ProcessingPolicy::default_for(&ctx.scope),
         };
-        Ok((build_l2(&setting, &self.who_section(ctx), &privacy::render(&recall), &recap, tasks), policy))
+        let mut who = self.who_section(ctx);
+        crate::social::groups::append_card(&mut who, self.store.as_ref(), &ctx.ns, &ctx.audience)?;
+        Ok((build_l2(&setting, &who, &privacy::render(&recall), &recap, tasks), policy))
     }
 
     /// Append one turn to the chat's session, act on the reply's markers, send what remains.
@@ -2524,6 +2526,32 @@ mod tests {
             env.mentions_me = mention_first && i == 0;
             env
         }).collect()
+    }
+
+    #[tokio::test]
+    async fn group_frame_appends_learned_card_after_the_unchanged_handwritten_card() {
+        let mut test = TestAgli::new("learned-group-card").await;
+        let a = &mut test.agli;
+        let batch = a.prepare_messages(group_messages(&["hello", "reply"], true)).await;
+        let ctx = batch.ctx.unwrap();
+        Arc::make_mut(&mut a.cfg).runtime.mind_dir = test.dir.join("mind");
+        let dir = a.cfg.mind_dir().join("social/groups");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("telegram_-7.md");
+        let handwritten = "# 手写群卡\n\nOWNER_RULE: observer only.\n";
+        std::fs::write(&path, handwritten).unwrap();
+        let msgs = a.store.recent_in_ns(&ctx.ns, 10).unwrap();
+        let raw = serde_json::from_value(json!({"group": {
+            "norms":["LEARNED_RULE"], "topics":["testing"], "my_role":"observer"
+        }})).unwrap();
+        crate::social::groups::apply(a.store.as_ref(), &ctx.ns, &msgs, raw).unwrap();
+        let (l2, _) = a.frame(&ctx, 0, "").unwrap();
+        assert!(l2.contains(handwritten.trim_end()));
+        assert!(l2.find("OWNER_RULE").unwrap() < l2.find("## 群聊观察").unwrap());
+        assert!(l2.find("## 群聊观察").unwrap() < l2.find("LEARNED_RULE").unwrap());
+        assert!(l2.contains("testing") && l2.contains("2 条消息"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), handwritten);
+        assert!(!a.speaker.l1().contains("LEARNED_RULE"));
     }
 
     #[tokio::test]

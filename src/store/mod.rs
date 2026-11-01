@@ -13,6 +13,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::ns::{Namespace, Scope};
 
@@ -77,6 +78,47 @@ pub struct Fact {
     pub ns: Namespace,
     pub scope: Scope,
     pub ts: DateTime<Utc>,
+}
+
+/// An observed edge, kept separately for every source group (including its evidence).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Relation {
+    pub a: String,
+    pub b: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub evidence: Vec<DateTime<Utc>>,
+    pub strength: f64,
+    pub ns: Namespace,
+    pub scope: Scope,
+}
+
+impl Relation {
+    pub fn key(&self) -> String {
+        let key = serde_json::json!([self.ns, self.a, self.b, self.kind]).to_string();
+        format!("{:x}", Sha256::digest(key.as_bytes()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityStats {
+    /// Messages observed by reflection, not the group's full history or membership.
+    pub messages: u64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    /// Platform-qualified chat id, matching Namespace::Group (e.g. telegram:-42).
+    pub chat_id: String,
+    pub members: Vec<String>,
+    pub norms: Vec<String>,
+    pub topics: Vec<String>,
+    pub my_role: String,
+    pub activity_stats: ActivityStats,
+    pub ns: Namespace,
+    pub scope: Scope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +239,12 @@ pub trait Store: Send + Sync {
 
     fn persons(&self) -> Result<BTreeMap<String, Person>>;
     fn save_person(&self, p: &Person) -> Result<()>;
+
+    fn group(&self, chat_id: &str) -> Result<Option<Group>>;
+    fn save_group(&self, g: &Group) -> Result<()>;
+    fn relations(&self, ns: &Namespace) -> Result<Vec<Relation>>;
+    /// Insert or replace by (source namespace, a, b, type).
+    fn save_relation(&self, r: &Relation) -> Result<()>;
 
     fn append_lesson(&self, l: &Lesson) -> Result<()>;
     fn lessons(&self) -> Result<Vec<Lesson>>;
