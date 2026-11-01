@@ -1600,6 +1600,8 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         tx.try_send(inbound("42", "next batch", "10")).unwrap();
         tracing::subscriber::with_default(subscriber, || {
+            // Another test may already have cached this callsite as uninteresting without a subscriber.
+            tracing::callsite::rebuild_interest_cache();
             assert_eq!(texts(ready(recv.as_mut()).unwrap()), (0..10).map(|i| i.to_string()).collect::<Vec<_>>());
         });
         drop(recv);
