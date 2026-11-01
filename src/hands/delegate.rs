@@ -1018,4 +1018,44 @@ mod tests {
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
+
+    /// Verifies note n-agli-asm-dsh-apikeyenv end to end through AGLI's real env assembly.
+    /// Spends a little Bailian and DeepSeek search quota: opt-in only, run alone
+    /// (`--ignored --test-threads=1`, it edits the process environment). Needs the agli profile
+    /// in data/dsh-home and both AGLI_DSH_* keys in .env (docs/DSH.md).
+    #[tokio::test]
+    #[ignore = "runs the local dsh CLI against live providers"]
+    async fn live_dsh_profile_uses_dedicated_keys() -> Result<()> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let _ = dotenvy::from_path(root.join(".env"));
+        if std::env::var_os("AGLI_DSH_BIN").is_none() {
+            // SAFETY: this test runs alone; nothing else reads the environment concurrently.
+            unsafe { std::env::set_var("AGLI_DSH_BIN", "C:/dev/DSH/resources/runtime/cli/bin/dsh.cmd") };
+        }
+        let cfg = crate::config::Config::load(root)?;
+        let base = std::env::temp_dir().join(format!("aglibot-test-dsh-{}", std::process::id()));
+        let (ok_dir, nokey_dir) = (base.join("ok"), base.join("nokey"));
+        std::fs::create_dir_all(&ok_dir)?;
+        std::fs::create_dir_all(&nokey_dir)?;
+        let store = crate::store::jsonl::JsonlStore::open(&base.join("data"))?;
+
+        let prompt = "Use web_search once to find the official homepage of the Rust programming language, \
+                      then web_fetch that page. Reply with only the text of its <title> element.";
+        let out = dsh(&ok_dir, prompt, &cfg.runtime.hands, Duration::from_secs(300), None, &store, "live-test").await?;
+        println!("dsh answer: {}", out.text.trim());
+        let events = std::fs::read_to_string(ok_dir.join("dsh-events.jsonl"))?;
+        assert!(events.contains("web_search"), "no web_search call recorded");
+        let calls = std::fs::read_to_string(base.join("data").join("model_calls.jsonl")).unwrap_or_default();
+        println!("model calls: {}", calls.trim());
+        assert!(calls.contains("dsh:live-test"), "usage was not recorded");
+
+        // Without the dedicated model key the run must fail, not fall back to another key or provider.
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("AGLI_DSH_BAILIAN_API_KEY") };
+        let missing = dsh(&nokey_dir, "Reply with exactly: OK", &cfg.runtime.hands, Duration::from_secs(120), None, &store, "live-test").await;
+        println!("without key: {missing:?}");
+        assert!(missing.is_err(), "dsh answered without DSH_BAILIAN_API_KEY: {:?}", missing.map(|o| o.text));
+        std::fs::remove_dir_all(&base)?;
+        Ok(())
+    }
 }

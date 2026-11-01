@@ -2,10 +2,11 @@
 id: "n-agli-asm-dsh-apikeyenv"
 title: "The agli profile's Bailian provider entry reads its key only from DSH_BAILIAN_API_KEY"
 kind: "assumption"
-state: "proposed"
+state: "adopted"
 relations: [{"type": "assumes", "target": "ticket:46"}, {"type": "assumes", "target": "ticket:25"}, {"type": "relates", "target": "note:n-agli-q-dsh-tokens"}, {"type": "relates", "target": "note:n-agli-q-dsh-search"}]
-abstract_zh: "前提：agli profile 里百炼 provider 条目（qwen-token-plan-cn）设 apiKeyEnv: DSH_BAILIAN_API_KEY 后，DSH 只从子进程环境的这个名字取 key，缺键即失败而不回退。已由 2026-11-02 对 0.2.1-rc.5 的假 key 实测支持（n-ev-dsh-apikeyenv-live）。前提是 agli 基于 headless、不挂 credentials 服务；DSH 升级或 profile 基座变化时重验。"
-abstract_en: "Premise: with apiKeyEnv: DSH_BAILIAN_API_KEY on the agli profile's Bailian provider entry, DSH reads the key only from that child-env name and fails rather than falling back. Supported by 2026-11-02 fake-key runs on 0.2.1-rc.5, assuming a headless base with no credentials service; re-verify on DSH upgrades or base changes."
+abstract_zh: "已核实（2026-11-02）：DSH 的模型服务商可在 profile 里用 apiKeyEnv 指定 key 变量。AGLI 专用 DSH home 中的 agli profile 让百炼读 DSH_BAILIAN_API_KEY；实跑成功，去掉该 key 时明确报缺凭据、不回退；搜索只用改名传入的单独 DeepSeek key。"
+abstract_en: "Verified 2026-11-02: DSH providers take their key variable from a profile apiKeyEnv. The agli profile in AGLI's own DSH home reads DSH_BAILIAN_API_KEY for Bailian; a live run succeeded, removing the key fails with MISSING_CREDENTIAL and no fallback; search uses only the renamed separate DeepSeek key."
+adopted_digest: "fd0298e91e1bac6faf58ca86afba30f2fd8c3138fdd542a57731a8834132b2a3"
 ---
 Claim: in the `agli` profile, the Bailian provider entry `llm-pi-ai.providers.qwen-token-plan-cn`
 sets `apiKeyEnv: DSH_BAILIAN_API_KEY`. DSH then authenticates that route only from
@@ -44,3 +45,14 @@ tests so only the dedicated source populates it, and keep a test that a missing
 dedicated key fails the DSH run instead of succeeding on another key.
 
 Added 2026-11-02: verification must run with AGLI's own DSH home (#48), not ~/.dsh, whose .credentials.yaml holds the owner's DeepSeek account token. Also check that web_search bills the separate DeepSeek search key (owner uses a dedicated key with separate search billing) and not an account token.
+
+## Verified 2026-11-02 (Opus, owner-authorized)
+
+Profile `agli` built in AGLI's own DSH home (data/dsh-home, #48) from the shipped headless template plus the patch in data/dsh-home/profiles/agli/cordis.patch.yml: llm-pi-ai provider `bailian` (openai-completions, Token Plan base URL, apiKeyEnv: DSH_BAILIAN_API_KEY, model deepseek-v4.1-flash) as agent-default-model, the read-only research patch from docs/DSH.md, workflow-ptc disabled. The composed config (--dump-config) shows credentials and deepseek-account disabled and no credential path/dshHome override.
+
+Live check through AGLI's real env assembly (ignored test hands::delegate::tests::live_dsh_profile_uses_dedicated_keys):
+1. With AGLI_DSH_BAILIAN_API_KEY and AGLI_DSH_DEEPSEEK_API_KEY set: the run called web_search and web_fetch and answered correctly; usage recorded (1018 uncached + 2103 cached input, 183 output).
+2. Without AGLI_DSH_BAILIAN_API_KEY: DSH failed with MISSING_CREDENTIAL for provider route "bailian" naming DSH_BAILIAN_API_KEY; no fallback to DEEPSEEK_API_KEY or another provider.
+3. Search key: the child's only DEEPSEEK_API_KEY is the renamed AGLI_DSH_DEEPSEEK_API_KEY and the credential/account plugins are disabled, so web_search used the owner's separately billed search key.
+
+Gap: AGLI records the model as `dsh:profile:agli`; the provider/model from the events is not yet stored.

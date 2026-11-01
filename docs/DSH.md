@@ -191,7 +191,7 @@ so these switches remove capabilities in DSH code, not through a prompt.
 - id: tool-web
   config: {search: true, fetch: true, searchTimeoutMs: 60000}
 - id: tool-fs
-  config: {read: true, readImage: false, write: false, edit: false}
+  disabled: true   # no local reads: read-only mode does not confine paths (see below)
 - id: sandbox-policy
   config:
     mode: read-only
@@ -302,3 +302,33 @@ Ticket 25 Windows validation: `cargo test --locked` reported
 `cargo build --locked`, `cargo clippy --locked --all-targets -- -D warnings`, and
 `git diff --check` passed. The checkout's test suite is larger than the ticket's
 older 48-passed/4-ignored baseline; no live/ignored test was enabled.
+
+## Built profile (2026-11-02)
+
+The live `agli` profile is `data/dsh-home/profiles/agli/cordis.patch.yml` (gitignored with
+`data/`). On top of the research patch above it adds the model route:
+
+```yaml
+- id: llm-pi-ai
+  config:
+    providers:
+      bailian:
+        displayName: Bailian
+        api: openai-completions
+        baseURL: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+        apiKeyEnv: DSH_BAILIAN_API_KEY
+        models:
+          - {id: deepseek-v4.1-flash, name: DeepSeek V4.1 Flash, input: [text]}
+- id: agent-default-model
+  config: {provider: bailian, model: deepseek-v4.1-flash}
+- {id: workflow-ptc, disabled: true}
+```
+
+`tool-fs` is disabled rather than read-only: DSH's read-only mode does not confine read
+paths, so until the isolated runner exists a prompt-injected page could read `.env` and
+exfiltrate it through a fetch URL. AGLI already passes the plan and follow-ups in the prompt
+and writes every task file itself. The headless template keeps `credentials` and
+`deepseek-account` disabled, so stored credentials and the owner's account token are never
+used. Verify with `cargo test --locked live_dsh_profile_uses_dedicated_keys -- --ignored
+--test-threads=1 --nocapture` (spends a little quota).
+
