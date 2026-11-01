@@ -196,6 +196,10 @@ pub struct Person {
     #[serde(default)]
     pub intimacy: f64,
     #[serde(default)]
+    pub last_update: Option<DateTime<Utc>>, // newest episode considered by reciprocity
+    #[serde(default)]
+    pub last_update_day: Option<chrono::NaiveDate>,
+    #[serde(default)]
     pub facts: Vec<Fact>,
     pub last_seen: DateTime<Utc>,
 }

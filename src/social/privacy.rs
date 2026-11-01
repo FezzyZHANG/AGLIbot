@@ -236,6 +236,8 @@ mod tests {
             tier: Tier::Owner,
             trust: 1.0,
             intimacy: 1.0,
+            last_update: None,
+            last_update_day: None,
             facts: vec![Fact { text: "在考虑换工作".into(), ns: "person/owner".parse().unwrap(), scope: private, ts: Utc::now() }],
             last_seen: Utc::now(),
         };

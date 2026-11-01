@@ -165,6 +165,8 @@ pub(super) fn contract(store: &dyn Store) {
         tier: Tier::Owner,
         trust: 0.5,
         intimacy: 0.25,
+        last_update: None,
+        last_update_day: None,
         facts: vec![Fact { text: "fact".into(), ns: Namespace::SelfNs, scope: Scope::SelfOnly, ts }],
         last_seen: ts,
     };

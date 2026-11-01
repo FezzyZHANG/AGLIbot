@@ -359,6 +359,8 @@ mod tests {
             tier: Tier::Groupmate,
             trust: 0.0,
             intimacy: 0.0,
+            last_update: None,
+            last_update_day: None,
             facts: vec![],
             last_seen: Utc::now(),
         };

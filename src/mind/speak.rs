@@ -43,6 +43,12 @@ impl Speaker {
         &self.l1
     }
 
+    /// Activate a new effective persona only between sessions.
+    pub fn replace_l1(&mut self, l1: String) {
+        self.l1 = l1;
+        self.reset_all();
+    }
+
     /// End every session so the next turn rebuilds L2 with fresh memories (after nightly reflection).
     pub fn reset_all(&mut self) {
         self.sessions.clear();
