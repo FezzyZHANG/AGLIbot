@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "installation_id": "7e33d505f4da4278a266683b1c057236",
+  "source": "Moldloft",
+  "environment": ".tools/moldloft",
+  "db": "workspace/moldloft/data/tickets.db",
+  "notes": "workspace/moldloft/notes",
+  "port": 8787,
+  "hosts": [],
+  "principles": false,
+  "mode": "editable",
+  "process_record": ".moldloft/process.local.json",
+  "status_aliases": [],
+  "start_path": "/graph?drydock=default",
+  "bind": "0.0.0.0"
+}
