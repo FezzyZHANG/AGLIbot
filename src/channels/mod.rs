@@ -11,6 +11,8 @@ pub struct Envelope {
     pub platform: &'static str,
     /// Platform-native send target. Telegram: the chat id. QQ: `private:<user>` or `group:<group>`.
     pub chat_id: String,
+    /// Platform-native id of the inbound message, when supplied by the channel.
+    pub message_id: Option<String>,
     /// Platform-native numeric user id, as a string.
     pub sender_id: String,
     pub sender_name: String,

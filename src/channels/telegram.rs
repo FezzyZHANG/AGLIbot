@@ -133,6 +133,7 @@ fn parse_message(msg: &Value, me_id: i64, me_username: &str) -> Option<Envelope>
     Some(Envelope {
         platform: "telegram",
         chat_id: chat.get("id")?.as_i64()?.to_string(),
+        message_id: msg.get("message_id").and_then(Value::as_i64).map(|id| id.to_string()),
         sender_id: from.get("id")?.as_i64()?.to_string(),
         sender_name: from.get("first_name").and_then(Value::as_str).unwrap_or_default().to_string(),
         sender_is_bot: from.get("is_bot").and_then(Value::as_bool).unwrap_or(false),
@@ -162,6 +163,7 @@ mod tests {
         let env = parse_message(&msg, 7, "aglibot").unwrap();
         assert_eq!((env.chat_id.as_str(), env.sender_id.as_str(), env.is_group), ("42", "42", false));
         assert!(!env.mentions_me);
+        assert_eq!(env.message_id.as_deref(), Some("1"));
         assert!(parse_message(&json!({"from": {"id": 1}, "chat": {"id": 1, "type": "private"}}), 7, "x").is_none());
     }
 

@@ -249,6 +249,7 @@ fn parse_event(v: &Value, shared: &Shared) -> Option<Envelope> {
     Some(Envelope {
         platform: "qq",
         chat_id,
+        message_id: v.get("message_id").filter(|id| !id.is_null()).map(id_string),
         sender_id: user_id.to_string(),
         sender_name: name,
         sender_is_bot: false,
@@ -280,6 +281,7 @@ mod tests {
         });
         let env = parse_event(&ev, &s).unwrap();
         assert_eq!(env.chat_id, "group:34");
+        assert_eq!(env.message_id.as_deref(), Some("777"));
         assert_eq!(env.group_key().as_deref(), Some("qq:34"));
         assert_eq!(env.sender_name, "群名片");
         assert_eq!(env.text, "你怎么看[图片]");
@@ -304,6 +306,7 @@ mod tests {
         let private = json!({"post_type": "message", "message_type": "private", "user_id": 5, "message_id": "1", "message": [{"type": "text", "data": {"text": "在吗"}}]});
         let env = parse_event(&private, &s).unwrap();
         assert_eq!((env.chat_id.as_str(), env.mentions_me), ("private:5", true));
+        assert_eq!(env.message_id.as_deref(), Some("1"));
     }
 
     /// Talks to the local NapCat: reads login info only, sends nothing.

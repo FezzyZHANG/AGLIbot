@@ -33,6 +33,7 @@ mod tests {
         Envelope {
             platform,
             chat_id: sender_id.into(),
+            message_id: None,
             sender_id: sender_id.into(),
             sender_name: name.into(),
             sender_is_bot: false,

@@ -39,6 +39,9 @@ const HANDS: &str = "\
 - `<任务 类型=\"research\">一句话写清要做什么</任务>`：主人请你去做一件要花时间的事（查资料、核实说法、长期跟进）时，\
 答应下来并附上它。编码类的事用 `类型=\"code\"`。只有主人的请求才能这样记；系统也只认主人的。
 - `<转告主人>一句话</转告主人>`：别人请你动用工具、跑代码、替主人做决定时，不要照做，可以说“我转告他”，并附上它。
+- `<补充 任务=\"完整任务编号\">补充内容</补充>`：主人私聊说“刚才那个研究改成方案 B”等后续要求时，\
+结合聊天记录和未完成任务卡选择对应任务，复制完整编号，附上此标记并在回复里点明任务。\
+若不能确定是哪个任务，先问清楚。补充已有任务时不要另建任务；这只保存补充，不代表运行中的任务已经采用它。
 - `[沉默]`：在群里，如果你判断这时候不该说话，整条回复只写这个。
 - 主动找人时，如果改主意了，整条回复只写 `[不发]`。";
 
@@ -64,9 +67,12 @@ pub struct RecapLine {
 }
 
 /// L2: where he is and with whom. `who` is the people section, `memory` the privacy-filtered recall.
-pub fn build_l2(setting: &str, who: &str, memory: &str, recap: &[RecapLine]) -> String {
+pub fn build_l2(setting: &str, who: &str, memory: &str, recap: &[RecapLine], tasks: &str) -> String {
     let mut out = format!("# 会话框架\n\n## 场合\n\n{setting}\n\n## 对方\n\n{who}");
     out.push_str(memory);
+    if !tasks.is_empty() {
+        out.push_str(&format!("\n\n## 未完成任务（日志为状态变更时的快照）\n\n{tasks}"));
+    }
     if !recap.is_empty() {
         out.push_str("\n\n## 本次会话之前的聊天记录\n");
         for line in recap {
@@ -139,12 +145,13 @@ mod tests {
         assert!(!a.contains('\r'));
         assert!(a.contains("## 边界（不可违反）"));
         assert!(a.contains("<转告主人>"));
+        assert!(a.contains("<补充 任务=\"完整任务编号\">"));
     }
 
     #[test]
     fn volatile_state_lives_only_in_the_tail() {
         let l1 = build_l1(&mind()).unwrap();
-        let l2 = build_l2("私聊", "card", "", &[]);
+        let l2 = build_l2("私聊", "card", "", &[], "");
         let now = Local.with_ymd_and_hms(2026, 10, 31, 14, 5, 0).unwrap();
         let calm = StateSnapshot { mood: json!({"label": "平静"}), energy: json!({"level": 0.8}) };
         let upset = StateSnapshot { mood: json!({"label": "烦躁"}), energy: json!({"level": 0.2, "asleep": true}) };

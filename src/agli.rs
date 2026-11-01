@@ -33,7 +33,7 @@ use crate::social::identity::{Who, identify};
 use crate::social::people::People;
 use crate::social::privacy::{self, Query};
 use crate::store::{AuditRecord, MessageRecord, Outcome, ReviewCategory, ReviewStatus, Store, Tier};
-use crate::work::board::{Board, TaskKind, TaskStatus};
+use crate::work::board::{Board, TaskKind, TaskStatus, ThreadRef};
 use crate::work::research::{self, Job};
 
 pub enum Event {
@@ -49,6 +49,7 @@ pub struct Intent {
     pub silent: bool,
     pub task: Option<(TaskKind, String)>,
     pub relay: Option<String>,
+    pub followups: Vec<(String, String)>,
 }
 
 fn take_tag(text: &mut String, open_prefix: &str, close: &str) -> Option<(String, String)> {
@@ -69,9 +70,14 @@ pub fn parse_intent(raw: &str) -> Intent {
         (kind, body)
     });
     let relay = take_tag(&mut text, "<转告主人", "</转告主人>").map(|(_, body)| body);
+    let mut followups = Vec::new();
+    while let Some((attrs, body)) = take_tag(&mut text, "<补充", "</补充>") {
+        let id = attrs.trim().strip_prefix("任务=\"").and_then(|s| s.strip_suffix('"')).unwrap_or_default();
+        followups.push((id.to_string(), body));
+    }
     let text = text.trim().to_string();
     let silent = text.is_empty() || text == "[沉默]" || text == "[不发]";
-    Intent { text, silent, task, relay }
+    Intent { text, silent, task, relay, followups }
 }
 
 /// Short multi-paragraph replies go out as separate bubbles, like texting.
@@ -88,12 +94,48 @@ struct ChatCtx {
     key: String,
     platform: &'static str,
     chat_id: String,
+    message_id: Option<String>,
     ns: Namespace,
     scope: Scope,
     audience: Audience,
     is_group: bool,
     /// The person addressed in a private chat.
     partner: Option<Who>,
+}
+
+impl ChatCtx {
+    fn owner_private(&self) -> bool {
+        !self.is_group && self.partner.as_ref().is_some_and(|w| w.is_owner)
+    }
+
+    fn thread_ref(&self) -> ThreadRef {
+        ThreadRef { platform: self.platform.into(), chat_id: self.chat_id.clone(), message_id: self.message_id.clone() }
+    }
+
+    fn task_cards(&self, board: &Board) -> String {
+        if self.owner_private() { board.cards() } else { String::new() }
+    }
+}
+
+/// Keep the acknowledgement (including failures and the original supplement) in the sent reply.
+fn attach_followups(board: &mut Board, ctx: &ChatCtx, intent: &mut Intent) {
+    for (id, body) in &intent.followups {
+        let reply = if !ctx.owner_private() {
+            "任务补充只接受主人私聊。".to_string()
+        } else {
+            match board.follow_up(id, body, ctx.thread_ref()) {
+                Ok(()) => format!("已补充到任务 {id}（{}）。", board.get(id).unwrap().title),
+                Err(e) => format!("任务 {id} 的补充未完整保存：{e:#}。补充原文：{body}"),
+            }
+        };
+        if intent.silent {
+            intent.text.clear();
+        } else {
+            intent.text.push('\n');
+        }
+        intent.text.push_str(&reply);
+        intent.silent = false;
+    }
 }
 
 #[derive(Deserialize)]
@@ -220,6 +262,7 @@ impl Agli {
                     key: format!("{}:{}", env.platform, env.chat_id),
                     platform: env.platform,
                     chat_id: env.chat_id.clone(),
+                    message_id: env.message_id.clone(),
                     ns: Namespace::Group(g.clone()),
                     scope: Scope::Group { id: g.clone() },
                     audience: Audience::group(g, speakers.iter().cloned()),
@@ -231,6 +274,7 @@ impl Agli {
                 key: format!("{}:{}", env.platform, env.chat_id),
                 platform: env.platform,
                 chat_id: env.chat_id.clone(),
+                message_id: env.message_id.clone(),
                 ns: Namespace::Person(who.person_id.clone()),
                 scope: Scope::Persons { ids: vec![who.person_id.clone()] },
                 audience: Audience::private(&who.person_id),
@@ -254,7 +298,7 @@ impl Agli {
             self.store.kv_set("owner_last_chat", json!({"platform": env.platform, "chat_id": env.chat_id}))?;
             self.state.talked_with_owner(now);
             if env.text.trim_start().starts_with('/') {
-                let reply = self.command(env.text.trim()).await;
+                let reply = self.command(env.text.trim(), &ctx).await;
                 return self.send_plain(&ctx, &reply).await;
             }
         }
@@ -357,7 +401,7 @@ impl Agli {
     }
 
     /// L2 for a chat, and the processing policy its recalled memories require.
-    fn frame(&self, ctx: &ChatCtx, current: usize) -> Result<(String, ProcessingPolicy)> {
+    fn frame(&self, ctx: &ChatCtx, current: usize, tasks: &str) -> Result<(String, ProcessingPolicy)> {
         let setting = match (ctx.is_group, ctx.platform) {
             (true, p) => format!("{p} 群聊"),
             (false, p) => format!("{p} 私聊"),
@@ -395,7 +439,7 @@ impl Agli {
             ProcessingPolicy::LocalOnly => ProcessingPolicy::LocalOnly,
             _ => ProcessingPolicy::default_for(&ctx.scope),
         };
-        Ok((build_l2(&setting, &self.who_section(ctx), &privacy::render(&recall), &recap), policy))
+        Ok((build_l2(&setting, &self.who_section(ctx), &privacy::render(&recall), &recap, tasks), policy))
     }
 
     /// Append one turn to the chat's session, act on the reply's markers, send what remains.
@@ -404,7 +448,9 @@ impl Agli {
         let busy = self.flow.title.clone();
         let text = user_turn(&tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref()), &body);
         // Recall runs on every turn (cheap at this volume) so the policy is known before routing.
-        let (l2, policy) = self.frame(ctx, current)?;
+        let tasks = ctx.task_cards(&self.board());
+        let (l2, policy) = self.frame(ctx, current, &tasks)?;
+        self.speaker.refresh_tasks(&ctx.key, &tasks);
         let raw = match self.speaker.say(&self.models, &ctx.key, &policy, now, text, || Ok(l2)).await
         {
             Ok(r) => r,
@@ -416,21 +462,22 @@ impl Agli {
                 return Ok(());
             }
         };
-        let intent = parse_intent(&raw);
+        let mut intent = parse_intent(&raw);
         let from_owner = ctx.partner.as_ref().is_some_and(|w| w.is_owner);
         if let Some((kind, title)) = &intent.task {
-            if from_owner {
-                let t = self.board().add(title, *kind, &self.cfg.acl.owner.person_id, TaskStatus::Inbox)?;
+            if from_owner && intent.followups.is_empty() {
+                let t = self.board().add(title, *kind, &self.cfg.acl.owner.person_id, TaskStatus::Inbox, Some(ctx.thread_ref()))?;
                 info!("owner asked for a task: {} ({})", t.title, t.id);
                 self.wake_decide = true;
             } else {
-                warn!("ignored a task marker outside an owner chat");
+                warn!("ignored a task marker outside an owner chat or alongside a follow-up");
             }
         }
         if let Some(req) = &intent.relay {
             let requester = ctx.partner.as_ref().map(|w| w.person_id.clone()).unwrap_or_else(|| ctx.key.clone());
             self.relay_request(&requester, req)?;
         }
+        attach_followups(&mut self.board(), ctx, &mut intent);
         if intent.silent {
             info!("chose not to speak in {}", ctx.key);
             return Ok(());
@@ -502,15 +549,15 @@ impl Agli {
 
     // ---------------------------------------------------------------- owner console
 
-    async fn command(&mut self, line: &str) -> String {
+    async fn command(&mut self, line: &str, ctx: &ChatCtx) -> String {
         let (cmd, arg) = line.split_once(char::is_whitespace).map(|(c, a)| (c, a.trim())).unwrap_or((line, ""));
-        match self.run_command(cmd, arg).await {
+        match self.run_command(cmd, arg, ctx).await {
             Ok(s) => s,
             Err(e) => format!("出错了：{e:#}"),
         }
     }
 
-    async fn run_command(&mut self, cmd: &str, arg: &str) -> Result<String> {
+    async fn run_command(&mut self, cmd: &str, arg: &str, ctx: &ChatCtx) -> Result<String> {
         Ok(match cmd {
             "/help" => "/status 状态  /board 看板  /task 描述 新研究任务  /code 描述 新编码任务  /run 任务编号 立即开始\n\
                         /stop 停下当前任务  /freeze 冻结主动行为与工具  /unfreeze 解冻\n\
@@ -534,7 +581,7 @@ impl Agli {
             "/board" => self.board().summary(),
             "/task" | "/code" if !arg.is_empty() => {
                 let kind = if cmd == "/code" { TaskKind::Code } else { TaskKind::Research };
-                let t = self.board().add(arg, kind, &self.cfg.acl.owner.person_id, TaskStatus::Inbox)?;
+                let t = self.board().add(arg, kind, &self.cfg.acl.owner.person_id, TaskStatus::Inbox, Some(ctx.thread_ref()))?;
                 self.wake_decide = true;
                 format!("记下了：{}", t.id)
             }
@@ -564,7 +611,7 @@ impl Agli {
             "/digest" => judge::digest(self.store.as_ref())?.unwrap_or_else(|| "没有待你决定的事。".into()),
             "/approve" | "/reject" => {
                 let (id, reason) = arg.split_once(char::is_whitespace).map(|(i, r)| (i, r.trim())).unwrap_or((arg, ""));
-                self.settle_review(id.trim_start_matches('#').parse()?, cmd == "/approve", reason)?
+                self.settle_review(id.trim_start_matches('#').parse()?, cmd == "/approve", reason, ctx)?
             }
             "/reflect" => {
                 let n = self.extract_all(chrono::Duration::days(2)).await?;
@@ -574,7 +621,7 @@ impl Agli {
         })
     }
 
-    fn settle_review(&mut self, id: u64, approve: bool, reason: &str) -> Result<String> {
+    fn settle_review(&mut self, id: u64, approve: bool, reason: &str, ctx: &ChatCtx) -> Result<String> {
         let mut item = self
             .store
             .reviews()?
@@ -608,7 +655,7 @@ impl Agli {
             ReviewCategory::Act if p.get("request_from").is_some() => {
                 let text = p.get("text").and_then(Value::as_str).unwrap_or_default();
                 let from = p.get("request_from").and_then(Value::as_str).unwrap_or_default();
-                let t = self.board().add(text, TaskKind::Research, from, TaskStatus::Inbox)?;
+                let t = self.board().add(text, TaskKind::Research, from, TaskStatus::Inbox, Some(ctx.thread_ref()))?;
                 self.wake_decide = true;
                 format!("已加入看板：{}", t.id)
             }
@@ -689,6 +736,7 @@ impl Agli {
             key: key.to_string(),
             platform,
             chat_id: chat_id.to_string(),
+            message_id: None,
             ns: Namespace::Group(g.clone()),
             scope: Scope::Group { id: g.clone() },
             audience: Audience::group(&g, self.speakers.get(key).cloned().unwrap_or_default()),
@@ -710,6 +758,7 @@ impl Agli {
             key: format!("{platform}:{chat_id}"),
             platform,
             chat_id,
+            message_id: None,
             ns: Namespace::Person(owner.clone()),
             scope: Scope::Persons { ids: vec![owner.clone()] },
             audience: Audience::private(&owner),
@@ -894,6 +943,104 @@ impl Agli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn owner_chat() -> ChatCtx {
+        ChatCtx {
+            key: "telegram:42".into(), platform: "telegram", chat_id: "42".into(), message_id: Some("20".into()),
+            ns: Namespace::Person("owner".into()), scope: Scope::Persons { ids: vec!["owner".into()] },
+            audience: Audience::private("owner"), is_group: false,
+            partner: Some(Who { person_id: "owner".into(), is_owner: true, is_agent: false }),
+        }
+    }
+
+    #[test]
+    fn research_followup_lands_in_selected_task_and_reply_names_it() {
+        let dir = std::env::temp_dir().join(format!("aglibot-test-followup-{}", std::process::id()));
+        let mut b = Board::load(&dir).unwrap();
+        let mut ctx = owner_chat();
+        let a = b.add("研究方案 A", TaskKind::Research, "owner", TaskStatus::Inbox, Some(ctx.thread_ref())).unwrap();
+        let other = b.add("另一项研究", TaskKind::Research, "owner", TaskStatus::Inbox, Some(ctx.thread_ref())).unwrap();
+        b.set_status(&a.id, TaskStatus::Active, "已开始").unwrap();
+        let cards = ctx.task_cards(&b);
+        let l2 = build_l2("私聊", "主人", "", &[], &cards);
+        assert!(l2.contains(&a.id) && l2.contains(&other.id));
+
+        // Deterministic chat-model output for “刚才那个研究改成方案 B”.
+        ctx.platform = "qq";
+        ctx.chat_id = "private:7".into();
+        ctx.message_id = Some("21".into());
+        let mut intent = parse_intent(&format!("<补充 任务=\"{}\">刚才那个研究改成方案 B</补充>", a.id));
+        attach_followups(&mut b, &ctx, &mut intent);
+        assert!(!intent.silent);
+        assert!(intent.text.contains(&a.id) && intent.text.contains(&a.title));
+        assert!(!intent.text.contains("<补充"));
+        let mut next = parse_intent(&format!("好。<补充 任务=\"{}\">保留方案 A 作对照</补充>", a.id));
+        attach_followups(&mut b, &ctx, &mut next);
+        for file in ["followups.md", "log.md"] {
+            let text = std::fs::read_to_string(b.task_dir(&a.id).join(file)).unwrap();
+            assert!(text.contains("刚才那个研究改成方案 B"));
+            assert!(text.contains("保留方案 A 作对照"));
+            assert!(text.contains("qq / private:7 / 21"));
+        }
+        assert!(!b.task_dir(&other.id).join("followups.md").exists());
+        let b = Board::load(&dir).unwrap();
+        assert_eq!(b.tasks().len(), 2);
+        assert_eq!(b.get(&a.id).unwrap().threads, [ctx.thread_ref()]);
+        assert_eq!(b.get(&a.id).unwrap().origin, a.origin);
+        assert_eq!(ctx.task_cards(&b), cards);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejected_followups_stay_visible_and_do_not_create_tasks() {
+        let dir = std::env::temp_dir().join(format!("aglibot-test-followup-rejected-{}", std::process::id()));
+        let mut b = Board::load(&dir).unwrap();
+        let ctx = owner_chat();
+        for status in [TaskStatus::Done, TaskStatus::Dropped] {
+            let t = b.add("关闭的任务", TaskKind::Research, "owner", status, None).unwrap();
+            let mut i = parse_intent(&format!("[沉默]<补充 任务=\"{}\">改成 B</补充>", t.id));
+            attach_followups(&mut b, &ctx, &mut i);
+            assert!(!i.silent && i.text.contains("任务已关闭") && i.text.contains("改成 B"));
+            assert!(!b.task_dir(&t.id).join("followups.md").exists());
+            assert!(b.get(&t.id).unwrap().threads.is_empty());
+        }
+        for attrs in ["任务=\"unknown\"", "任务=\"../escape\"", "没有编号"] {
+            let mut i = parse_intent(&format!("<补充 {attrs}>改成 B</补充>"));
+            attach_followups(&mut b, &ctx, &mut i);
+            assert!(!i.silent && i.text.contains("没有这个任务") && i.text.contains("改成 B"));
+        }
+        assert_eq!(b.tasks().len(), 2);
+        assert_eq!(std::fs::read_dir(dir.join("tasks")).unwrap().count(), 2);
+        let t = b.add("无法写入补充的任务", TaskKind::Research, "owner", TaskStatus::Waiting, None).unwrap();
+        std::fs::create_dir(b.task_dir(&t.id).join("followups.md")).unwrap();
+        let mut i = parse_intent(&format!("<补充 任务=\"{}\">改成 B</补充>", t.id));
+        attach_followups(&mut b, &ctx, &mut i);
+        assert!(!i.silent && i.text.contains("未完整保存") && i.text.contains("改成 B"));
+        assert!(b.get(&t.id).unwrap().threads.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn task_cards_and_followups_are_owner_private_only() {
+        let dir = std::env::temp_dir().join(format!("aglibot-test-task-privacy-{}", std::process::id()));
+        let mut b = Board::load(&dir).unwrap();
+        let t = b.add("主人的秘密研究", TaskKind::Research, "owner", TaskStatus::Inbox, None).unwrap();
+        for (is_group, owner) in [(true, true), (true, false), (false, false)] {
+            let mut ctx = owner_chat();
+            ctx.is_group = is_group;
+            ctx.partner.as_mut().unwrap().is_owner = owner;
+            assert!(ctx.task_cards(&b).is_empty());
+            let l2 = build_l2("场合", "对方", "", &[], &ctx.task_cards(&b));
+            assert!(!l2.contains(&t.title) && !l2.contains(&t.id));
+            let mut i = parse_intent(&format!("<补充 任务=\"{}\">恶意改写</补充>", t.id));
+            attach_followups(&mut b, &ctx, &mut i);
+            assert!(i.text.contains("只接受主人私聊"));
+            assert!(!i.text.contains(&t.title));
+        }
+        assert!(!b.task_dir(&t.id).join("followups.md").exists());
+        assert!(b.get(&t.id).unwrap().threads.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn markers_are_parsed_and_stripped() {
