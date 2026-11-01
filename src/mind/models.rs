@@ -161,6 +161,15 @@ impl Models {
         }
     }
 
+    /// A cheap side call with no retry/escalation; the caller owns the fallback.
+    pub async fn ask_once(&self, scenario: &str, policy: &ProcessingPolicy, system: &str, user: &str) -> Result<String> {
+        let model = self.pick(scenario, policy)?;
+        let turns = [Turn::User(user.to_string())];
+        let effort = self.effort(scenario);
+        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref() };
+        Ok(self.call_once(scenario, &model, &prompt, scenario, None).await?.text)
+    }
+
     /// One-shot call: `system` is the stable prefix (usually L1), `user` the task.
     pub async fn ask(&self, scenario: &str, policy: &ProcessingPolicy, system: &str, user: &str) -> Result<String> {
         let model = self.pick(scenario, policy)?;

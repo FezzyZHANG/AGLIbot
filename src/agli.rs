@@ -22,7 +22,7 @@ use crate::channels::{Envelope, Outlets};
 use crate::config::{AclCfg, Config, DebounceCfg, SessionCfg};
 use crate::mind::context::{RecapLine, build_l1, build_l2, read_opt, tail, user_turn};
 use crate::mind::decide::{self, Action, Situation};
-use crate::mind::flow::{Bucket, Flow};
+use crate::mind::flow::{Bucket, Flow, TAG_SYSTEM};
 use crate::mind::judge;
 use crate::mind::models::Models;
 use crate::mind::reflect;
@@ -301,6 +301,8 @@ struct ChatCtx {
     message_id: Option<String>,
     ns: Namespace,
     scope: Scope,
+    /// Ephemeral bucketing tag, never used for storage, recall or the session's L2.
+    flow_ns: Option<Namespace>,
     audience: Audience,
     is_group: bool,
     /// The person addressed in a private chat.
@@ -455,9 +457,29 @@ impl Agli {
     // ---------------------------------------------------------------- messages
 
     async fn prepare_messages(&mut self, messages: Vec<Envelope>) -> ReplyBatch {
+        let models = self.models.clone();
+        let scope = Scope::Persons { ids: vec![self.cfg.acl.owner.person_id.clone()] };
+        self.prepare_messages_with_triage(messages, |user| async move {
+            models.ask_once("triage", &ProcessingPolicy::default_for(&scope), TAG_SYSTEM, &user).await
+        }).await
+    }
+
+    async fn prepare_messages_with_triage<F, Fut>(&mut self, messages: Vec<Envelope>, triage: F) -> ReplyBatch
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<String>>,
+    {
+        let source = Namespace::Person(self.cfg.acl.owner.person_id.clone());
+        let owner_private = messages.first().is_some_and(|first| messages.iter().all(|env| {
+            env.platform == first.platform && env.chat_id == first.chat_id && !env.is_group
+                && identify(&self.cfg.acl, env).is_owner && !owner_command(&self.cfg.acl, env)
+        }));
+        let texts: Vec<&str> = messages.iter().map(|env| env.text.as_str()).collect();
+        let tag = self.flow.tag_namespace(&source, owner_private, &texts, triage).await;
+        let flow_ns = (tag != source).then_some(tag);
         let mut batch = ReplyBatch::default();
         for env in messages {
-            if let Err(e) = self.on_message(env, &mut batch).await {
+            if let Err(e) = self.on_message(env, &mut batch, flow_ns.as_ref()).await {
                 error!("{e:#}");
             }
         }
@@ -479,7 +501,7 @@ impl Agli {
         Ok(())
     }
 
-    async fn on_message(&mut self, env: Envelope, batch: &mut ReplyBatch) -> Result<()> {
+    async fn on_message(&mut self, env: Envelope, batch: &mut ReplyBatch, flow_ns: Option<&Namespace>) -> Result<()> {
         let now = Utc::now();
         let who = identify(&self.cfg.acl, &env);
         let group_key = env.group_key();
@@ -517,6 +539,7 @@ impl Agli {
                     message_id: env.message_id.clone(),
                     ns: Namespace::Group(g.clone()),
                     scope: Scope::Group { id: g.clone() },
+                    flow_ns: None,
                     audience: Audience::group(g, speakers.iter().cloned()),
                     is_group: true,
                     partner: None,
@@ -529,6 +552,7 @@ impl Agli {
                 message_id: env.message_id.clone(),
                 ns: Namespace::Person(who.person_id.clone()),
                 scope: Scope::Persons { ids: vec![who.person_id.clone()] },
+                flow_ns: flow_ns.cloned(),
                 audience: Audience::private(&who.person_id),
                 is_group: false,
                 partner: Some(who.clone()),
@@ -555,9 +579,10 @@ impl Agli {
             }
         }
 
-        let bucket = self.flow.classify(&ctx.ns, who.is_owner);
+        let bucket_ns = ctx.flow_ns.as_ref().unwrap_or(&ctx.ns);
+        let bucket = self.flow.classify(&ctx.ns, who.is_owner, ctx.flow_ns.as_ref());
         if bucket == Some(Bucket::Pending) {
-            self.flow.hold(&ctx.ns);
+            self.flow.hold(bucket_ns);
         }
         let asleep = self.state.energy.asleep;
         let line = format!("{}：{}", self.people.name_of(&who.person_id), env.text);
@@ -635,6 +660,7 @@ impl Agli {
         let ctx = ChatCtx {
             key: format!("{platform}:{}", chat.chat_id), platform, chat_id: chat.chat_id.clone(), message_id: None,
             ns: Namespace::Person(who.person_id.clone()), scope: Scope::Persons { ids: vec![who.person_id.clone()] },
+            flow_ns: None,
             audience: Audience::private(&who.person_id), is_group: false, partner: Some(who),
         };
         let messages = self.store.messages_after(&ctx.ns, DateTime::UNIX_EPOCH)?;
@@ -782,7 +808,7 @@ impl Agli {
     /// Append one turn to the chat's session, act on the reply's markers, send what remains.
     async fn converse(&mut self, ctx: &ChatCtx, body: String, current: usize, unsolicited: bool) -> Result<()> {
         let now = Utc::now();
-        let busy = self.flow.title.clone();
+        let busy = if ctx.flow_ns.is_some() && ctx.flow_ns == self.flow.focus { None } else { self.flow.title.clone() };
         let text = user_turn(&tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref()), &body);
         // Recall runs on every turn (cheap at this volume) so the policy is known before routing.
         let tasks = ctx.task_cards(&self.board());
@@ -1096,6 +1122,7 @@ impl Agli {
             message_id: None,
             ns: Namespace::Group(g.clone()),
             scope: Scope::Group { id: g.clone() },
+            flow_ns: None,
             audience: Audience::group(&g, self.speakers.get(key).cloned().unwrap_or_default()),
             is_group: true,
             partner: None,
@@ -1118,6 +1145,7 @@ impl Agli {
             message_id: None,
             ns: Namespace::Person(owner.clone()),
             scope: Scope::Persons { ids: vec![owner.clone()] },
+            flow_ns: None,
             audience: Audience::private(&owner),
             is_group: false,
             partner: Some(Who { person_id: owner, is_owner: true, is_agent: false }),
@@ -1798,7 +1826,7 @@ mod tests {
             cfg.social.floor.check_every = 3;
             cfg.social.human_limit.max_replies = 10;
             cfg.social.human_limit.window_min = 10;
-            // Preparation never calls a model. No credentials, probes or live providers are used.
+            // No credentials, probes or live providers; focused tests inject triage explicitly.
             cfg.models.providers = std::collections::BTreeMap::from([("test".into(), crate::config::ProviderCfg {
                 kind: crate::config::ProviderKind::OpenaiCompat, base_url: None,
                 base_url_env: None, api_key_env: None,
@@ -2099,6 +2127,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn focused_owner_batch_tags_once_without_changing_storage_or_l2() {
+        let mut test = TestAgli::new("flow-tag").await;
+        let a = &mut test.agli;
+        let source = Namespace::Person("owner".into());
+        let focus = Namespace::Project("pvsnp".into());
+        let scope = Scope::Persons { ids: vec!["owner".into()] };
+        a.flow.enter(focus.clone(), "t1", "P vs NP", DateTime::UNIX_EPOCH);
+        for (reply, related) in [
+            (Ok(r#"{"ns":"project/pvsnp","reason":"task followup"}"#.into()), true),
+            (Ok(r#"{"ns":"source","reason":"unrelated"}"#.into()), false),
+            (Err(anyhow::anyhow!("offline")), false),
+            (Ok("garbage".into()), false),
+        ] {
+            let mut queue = WorkQueue::new();
+            for (i, text) in ["先查方案 A", "再对比方案 B", "给我结论"].iter().enumerate() {
+                queue.push(inbound("42", text, &i.to_string()), &a.cfg.runtime.session.debounce);
+            }
+            let work = next_work(&mut queue, &a.cfg.acl, &a.cfg.runtime.session).unwrap();
+            let mut calls = 0;
+            let batch = a.prepare_messages_with_triage(messages(work), |user| {
+                calls += 1;
+                let input: Value = serde_json::from_str(&user).unwrap();
+                assert_eq!(input["messages"], json!(["先查方案 A", "再对比方案 B", "给我结论"]));
+                async { reply }
+            }).await;
+            assert_eq!(calls, 1);
+            assert!(batch.speak);
+            assert_eq!(batch.current, 3);
+            let mut ctx = batch.ctx.unwrap();
+            assert_eq!(ctx.ns, source);
+            assert_eq!(ctx.scope, scope);
+            assert_eq!(ctx.flow_ns, related.then_some(focus.clone()));
+            assert_eq!(a.flow.classify(&ctx.ns, true, ctx.flow_ns.as_ref()), Some(if related { Bucket::Related } else { Bucket::Urgent }));
+            let (tagged_l2, tagged_policy) = a.frame(&ctx, 3, "").unwrap();
+            let tag = ctx.flow_ns.take();
+            let (source_l2, source_policy) = a.frame(&ctx, 3, "").unwrap();
+            assert_eq!(tagged_l2, source_l2);
+            assert_eq!(tagged_policy, source_policy);
+            ctx.flow_ns = tag;
+            a.test_chat = Some(TestChat::new(&["收到"], &[Outcome::Sent]));
+            a.converse(&ctx, batch.lines.join("\n"), 3, false).await.unwrap();
+            let turn = &a.test_chat.as_ref().unwrap().turns[0].1;
+            assert_eq!(turn.contains("你正在专心做：P vs NP"), !related);
+            let records = a.store.recent_in_ns(&source, 100).unwrap();
+            assert!(records.iter().all(|m| m.ns == source && m.scope == scope));
+            assert_eq!(records.last().unwrap().text, "收到");
+            assert!(records.last().unwrap().outgoing);
+            assert_eq!(records.iter().filter(|m| !m.outgoing).rev().take(3).map(|m| m.text.as_str()).collect::<Vec<_>>(),
+                ["给我结论", "再对比方案 B", "先查方案 A"]);
+            assert!(a.store.recent_in_ns(&focus, 100).unwrap().is_empty());
+            assert!(a.flow.pending.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_batches_skip_triage_outside_ambiguous_owner_private_chat() {
+        let mut test = TestAgli::new("flow-tag-skip").await;
+        let a = &mut test.agli;
+        let no_call = |_| async { panic!("unexpected triage") };
+        a.prepare_messages_with_triage(vec![private_message("42", "hello")], no_call).await;
+        a.flow.enter(Namespace::Person("owner".into()), "t1", "owner", DateTime::UNIX_EPOCH);
+        a.prepare_messages_with_triage(vec![private_message("42", "hello")], no_call).await;
+        a.flow.enter(Namespace::Project("pvsnp".into()), "t1", "P vs NP", DateTime::UNIX_EPOCH);
+        a.prepare_messages_with_triage(vec![private_message("7", "hello")], no_call).await;
+        let mut group = private_message("42", "hello");
+        group.is_group = true;
+        group.chat_id = "-7".into();
+        a.prepare_messages_with_triage(vec![group], no_call).await;
+        a.prepare_messages_with_triage(vec![private_message("42", "/status")], no_call).await;
+    }
+
+    #[tokio::test]
     async fn newly_arrived_messages_join_the_next_queued_batch_after_a_boundary() {
         let acl = acl();
         let (tx, mut rx) = mpsc::channel(16);
@@ -2172,6 +2272,7 @@ mod tests {
         ChatCtx {
             key: "telegram:42".into(), platform: "telegram", chat_id: "42".into(), message_id: Some("20".into()),
             ns: Namespace::Person("owner".into()), scope: Scope::Persons { ids: vec!["owner".into()] },
+            flow_ns: None,
             audience: Audience::private("owner"), is_group: false,
             partner: Some(Who { person_id: "owner".into(), is_owner: true, is_agent: false }),
         }
