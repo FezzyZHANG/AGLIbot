@@ -384,6 +384,7 @@ fn rule_checks(dir: &Path) -> String {
         Ok((n, names)) => {
             notes.push(format!("规则检查：保存了 {n} 个来源快照（已记录 SHA-256）。"));
             let claims = read(dir, "claims.yaml");
+            notes.extend(dsh_source_checks(dir, &names, &claims));
             if claims.trim().is_empty() {
                 notes.push("规则检查：claims.yaml 缺失或为空。".into());
             } else {
@@ -403,6 +404,68 @@ fn rule_checks(dir: &Path) -> String {
         notes.push("规则检查：report.md 缺失。".into());
     }
     notes.join("\n")
+}
+
+fn dsh_source_name(name: &str) -> bool {
+    name.strip_suffix("-dsh.md").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn dsh_source_checks(dir: &Path, names: &[String], claims: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    let mut unfetched = Vec::new();
+    let mut names: Vec<_> = names.iter().filter(|name| dsh_source_name(name)).collect();
+    names.sort();
+    for name in names {
+        let source = read(dir, &format!("sources/{name}"));
+        // Only AGLI's header is evidence, never a line in the model's excerpt.
+        if source.lines().next() == Some("fetched: yes") {
+            continue;
+        }
+        let reason = source.lines().nth(1).and_then(|line| line.strip_prefix("fetch_evidence: ")).unwrap_or("no fetch evidence");
+        notes.push(format!("规则检查：DSH 来源 {name} 未在本轮抓取（{reason}）。"));
+        unfetched.push(name.as_str());
+    }
+    if !unfetched.is_empty() && !claims.trim().is_empty() {
+        match serde_yaml::from_str::<serde_yaml::Value>(claims) {
+            Ok(value) => dsh_unverified_claims(&value, &unfetched, &mut notes),
+            Err(e) => notes.push(format!("规则检查：claims.yaml 无法解析，引用未抓取来源的论断均为 unverified：{e}")),
+        }
+    }
+    notes
+}
+
+fn dsh_unverified_claims(value: &serde_yaml::Value, unfetched: &[&str], notes: &mut Vec<String>) {
+    match value {
+        serde_yaml::Value::Mapping(fields) => {
+            if let Some(source) = fields.get("source").and_then(|value| value.as_str()) {
+                let source = source.replace('\\', "/");
+                let name = source.strip_prefix("./").unwrap_or(&source);
+                let name = name.strip_prefix("sources/").unwrap_or(name);
+                if unfetched.contains(&name) {
+                    let claim = fields.get("claim").and_then(|value| value.as_str()).unwrap_or("（未命名论断）");
+                    notes.push(format!("规则检查：论断 {claim:?} 标记为 unverified：引用未抓取来源 {name}（即使 claims.yaml 声称 verified）。"));
+                }
+            }
+            for value in fields.values() {
+                dsh_unverified_claims(value, unfetched, notes);
+            }
+        }
+        serde_yaml::Value::Sequence(items) => items.iter().for_each(|value| dsh_unverified_claims(value, unfetched, notes)),
+        _ => {}
+    }
+}
+
+fn normalized_source_url(raw: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    // Url already folds scheme/host case and removes default ports. Preserve query,
+    // path case, and encoding; only the trailing slash and fragment are immaterial.
+    url.set_fragment(None);
+    let path = url.path().strip_suffix('/').unwrap_or(url.path()).to_string();
+    url.set_path(&path);
+    Some(url.into())
 }
 
 fn gather_prompt(task: &Task, plan: &str, fixes: Option<&str>) -> String {
@@ -535,11 +598,37 @@ fn save_dsh_research(dir: &Path, text: &str) -> Result<String> {
     }
     let report: Report = serde_json::from_str(text).context("DSH research final answer must be the requested JSON report")?;
     anyhow::ensure!(!report.report.trim().is_empty(), "DSH research report is empty");
+    let (fetched, searched) = delegate::dsh_research_targets(&read(dir, "dsh-events.jsonl"));
+    let fetched: std::collections::HashSet<_> = fetched.iter().filter_map(|url| normalized_source_url(url)).collect();
+    let searched: std::collections::HashSet<_> = searched.iter().filter_map(|url| normalized_source_url(url)).collect();
     std::fs::create_dir_all(dir.join("sources"))?;
+    // Each response replaces the full DSH source set; obsolete verdicts must not
+    // survive a later gather that returns fewer sources.
+    let names: Vec<_> = (1..=report.sources.len()).map(|i| format!("{i:02}-dsh.md")).collect();
+    for entry in std::fs::read_dir(dir.join("sources"))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type()?.is_file() && dsh_source_name(&name) && !names.contains(&name) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
     for (i, source) in report.sources.iter().enumerate() {
+        let url = normalized_source_url(&source.url);
+        let (fetched, reason) = if url.as_ref().is_some_and(|url| fetched.contains(url)) {
+            ("yes", "fetch tool targeted this URL in this run; excerpt not byte-verified")
+        } else if url.as_ref().is_some_and(|url| searched.contains(url)) {
+            ("no", "found via search, not fetched")
+        } else {
+            ("no", "no fetch tool targeted this URL in this run")
+        };
         std::fs::write(
             dir.join(format!("sources/{:02}-dsh.md", i + 1)),
-            format!("URL: {}\nRetrieved: {}\n\n{}", source.url, chrono::Utc::now().to_rfc3339(), source.content),
+            format!(
+                "fetched: {fetched}\nfetch_evidence: {reason}\nURL: {}\nRetrieved: {}\n\n{}",
+                source.url.replace('\r', "\\r").replace('\n', "\\n"),
+                chrono::Utc::now().to_rfc3339(),
+                source.content
+            ),
         )?;
     }
     std::fs::write(dir.join("claims.yaml"), report.claims)?;
@@ -939,6 +1028,84 @@ mod tests {
         assert!(save_dsh_research(&dir, "not a report").is_err());
         assert!(read(&dir, "report.md").starts_with("# Findings"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn dsh_fixture_report(urls: &[&str]) -> String {
+        json!({
+            "summary": "fixture summary", "report": "# Fixture evidence",
+            "claims": urls.iter().enumerate().map(|(i, _)| format!(
+                "- {{claim: 'finding {}', source: 'sources/{:02}-dsh.md', status: verified}}\n", i + 1, i + 1
+            )).collect::<String>(),
+            "sources": urls.iter().map(|url| json!({"url": url, "content": "An excerpt\nfetched: yes"})).collect::<Vec<_>>()
+        }).to_string()
+    }
+
+    #[test]
+    fn dsh_unfetched_source_and_claim_are_flagged_in_judge_rule_evidence() {
+        let dir = std::env::temp_dir().join(format!("agli-dsh-source-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dsh-events.jsonl"), include_str!("../hands/fixtures/dsh-source-check-events.jsonl")).unwrap();
+        let report = dsh_fixture_report(&["https://example.org/fetched?a=1&b=2", "https://example.org/not-fetched"]);
+        save_dsh_research(&dir, &report).unwrap();
+        assert!(read(&dir, "sources/01-dsh.md").starts_with("fetched: yes\n"));
+        assert!(read(&dir, "sources/02-dsh.md").starts_with("fetched: no\n"));
+        // research() prepends this result verbatim to the judge's report/claims evidence.
+        let evidence = rule_checks(&dir);
+        assert_eq!(evidence.matches("未在本轮抓取").count(), 1, "{evidence}");
+        assert!(evidence.contains("DSH 来源 02-dsh.md 未在本轮抓取"));
+        assert!(evidence.contains("论断 \"finding 2\" 标记为 unverified"));
+        assert!(!evidence.contains("01-dsh.md") && !evidence.contains("finding 1"));
+        assert!(read(&dir, "sources/index.txt").contains("02-dsh.md"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dsh_search_only_missing_events_and_replaced_sources_remain_unverified() {
+        let dir = std::env::temp_dir().join(format!("agli-dsh-search-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dsh-events.jsonl"), include_str!("../hands/fixtures/dsh-source-check-events.jsonl")).unwrap();
+        let report = dsh_fixture_report(&["http://EXAMPLE.ORG/alias/#fragment", "https://example.org/search-only"]);
+        save_dsh_research(&dir, &report).unwrap();
+        assert!(read(&dir, "sources/01-dsh.md").starts_with("fetched: yes\n"));
+        assert!(read(&dir, "sources/02-dsh.md").contains("fetch_evidence: found via search, not fetched"));
+        let evidence = rule_checks(&dir);
+        assert_eq!(evidence.matches("未在本轮抓取").count(), 1);
+        assert!(evidence.contains("found via search, not fetched") && evidence.contains("finding 2"));
+        std::fs::remove_file(dir.join("dsh-events.jsonl")).unwrap();
+        std::fs::write(dir.join("sources/03-codex.md"), "URL: https://example.org/codex").unwrap();
+        save_dsh_research(&dir, &dsh_fixture_report(&["http://example.org/alias"])).unwrap();
+        assert!(!dir.join("sources/02-dsh.md").exists());
+        assert!(dir.join("sources/03-codex.md").exists());
+        assert!(read(&dir, "sources/01-dsh.md").starts_with("fetched: no\n"));
+        let evidence = rule_checks(&dir);
+        assert!(evidence.contains("finding 1") && evidence.contains("unverified"));
+        assert!(!evidence.contains("03-codex.md"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dsh_source_urls_normalize_only_equivalent_targets() {
+        for (left, right) in [
+            ("HTTPS://EXAMPLE.ORG:443/path/#fragment", "https://example.org/path"),
+            ("http://EXAMPLE.org:80", "http://example.org/"),
+            ("https://example.org/path/?b=2&a=1#fragment", "https://example.org/path?b=2&a=1"),
+            ("https://example.org/a%2Fb/#one", "https://example.org/a%2Fb#two"),
+        ] {
+            assert_eq!(normalized_source_url(left), normalized_source_url(right), "{left}");
+        }
+        for (left, right) in [
+            ("http://example.org/path", "https://example.org/path"),
+            ("https://example.org:444/path", "https://example.org/path"),
+            ("https://example.org/Path", "https://example.org/path"),
+            ("https://example.org/path?a=1", "https://example.org/path?a=2"),
+            ("https://example.org/path?a=1&b=2", "https://example.org/path?b=2&a=1"),
+            ("https://example.org/a%2Fb", "https://example.org/a/b"),
+        ] {
+            assert_ne!(normalized_source_url(left), normalized_source_url(right), "{left}");
+        }
+        for invalid in ["", "not a URL", "/relative", "file:///local/path"] {
+            assert!(normalized_source_url(invalid).is_none());
+        }
     }
 
     #[test]
