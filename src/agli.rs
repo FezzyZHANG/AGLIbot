@@ -872,6 +872,10 @@ impl Agli {
 
     /// L2 for a chat, and the processing policy its recalled memories require.
     fn frame(&self, ctx: &ChatCtx, current: usize, tasks: &str) -> Result<(String, ProcessingPolicy)> {
+        self.frame_with_embedding(ctx, current, tasks, None)
+    }
+
+    fn frame_with_embedding(&self, ctx: &ChatCtx, current: usize, tasks: &str, vector: Option<&[f32]>) -> Result<(String, ProcessingPolicy)> {
         let setting = match (ctx.is_group, ctx.platform) {
             (true, p) => format!("{p} 群聊"),
             (false, p) => format!("{p} 私聊"),
@@ -882,18 +886,25 @@ impl Agli {
         };
         let partners: Vec<&crate::store::Person> = partner_ids.iter().filter_map(|id| self.people.get(id)).collect();
         let mem = &self.cfg.runtime.memory;
-        let recall = privacy::recall(
-            self.store.as_ref(),
-            &Query {
-                audience: &ctx.audience,
-                ns: &ctx.ns,
-                partners: &partners,
-                max_episodes: mem.episodes_in_context,
-                max_facts: mem.facts_in_context,
-                include_lessons: false,
-                half_life_days: mem.half_life_days,
+        let query = Query {
+            audience: &ctx.audience,
+            ns: &ctx.ns,
+            partners: &partners,
+            max_episodes: mem.episodes_in_context,
+            max_facts: mem.facts_in_context,
+            include_lessons: false,
+            half_life_days: mem.half_life_days,
+        };
+        let recall = match (self.models.embedding(), vector) {
+            (Some(cfg), Some(vector)) => match privacy::recall_semantic(self.store.as_ref(), &query, cfg, vector) {
+                Ok(recall) => recall,
+                Err(e) => {
+                    self.models.warn_embedding(&e);
+                    privacy::recall(self.store.as_ref(), &query)?
+                }
             },
-        )?;
+            _ => privacy::recall(self.store.as_ref(), &query)?,
+        };
         let n = self.cfg.runtime.session.recap_messages;
         let mut recent = self.store.recent_in_ns(&ctx.ns, n + current)?;
         recent.truncate(recent.len().saturating_sub(current));
@@ -922,7 +933,14 @@ impl Agli {
         let text = user_turn(&tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref()), &body);
         // Recall runs on every turn (cheap at this volume) so the policy is known before routing.
         let tasks = ctx.task_cards(&self.board());
-        let (l2, policy) = self.frame(ctx, current, &tasks)?;
+        let embedded = match self.models.embed(&ProcessingPolicy::default_for(&ctx.scope), &body).await {
+            Ok(vector) => vector,
+            Err(e) => { self.models.warn_embedding(&e); None }
+        };
+        let (l2, policy) = match embedded {
+            Some(vector) => self.frame_with_embedding(ctx, current, &tasks, Some(&vector))?,
+            None => self.frame(ctx, current, &tasks)?,
+        };
         self.speaker.refresh_tasks(&ctx.key, &tasks);
         #[cfg(test)]
         let response = if let Some(test) = &mut self.test_chat {
@@ -1496,6 +1514,7 @@ impl Agli {
             &self.cfg.social, date, Utc::now()).await {
             warn!("nightly archive failed: {e:#}");
         }
+        crate::mind::embedding::nightly(&self.models, self.store.as_ref()).await;
         self.state.last_reflect = Some(date);
         self.speaker.reset_all();
         Ok(())
@@ -2120,6 +2139,44 @@ mod tests {
                 assert!(measure_reply(&text[..end], usize::MAX).0 <= cap);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn semantic_query_uses_incoming_batch_and_failures_preserve_the_frame() {
+        let mut test = TestAgli::new("semantic-query").await;
+        let a = &mut test.agli;
+        let batch = a.prepare_messages(group_messages(&["Rust", "async"], true)).await;
+        let mut ctx = batch.ctx.unwrap();
+        let cfg: crate::mind::embedding::EmbeddingCfg = serde_yaml::from_str("provider: test\nmodel: embed").unwrap();
+        let model_id = cfg.model_id();
+        let good = json!({"data": [{"index": 0, "embedding": [1.0, 0.0]}]}).to_string();
+        a.models = Arc::new(Models::stub(a.store.clone(), vec![good.clone(), "bad response".into(), good]).with_embedding(cfg));
+        let e = crate::store::Episode { id: "semantic-cross".into(), ts: Utc::now(), participants: vec![],
+            summary: "Cross-namespace Rust memory".into(), emotion: String::new(), salience: 0.9,
+            ns: "project/rust".parse().unwrap(), scope: Scope::Public, sources: vec![] };
+        a.store.append_episode(&e).unwrap();
+        a.store.save_embedding(&crate::store::EpisodeEmbedding { episode_id: e.id.clone(), model_id: model_id.clone(), vector: vec![1.0, 0.0] }).unwrap();
+        a.test_chat = Some(TestChat::new(&["收到", "收到", "收到", "收到"], &[Outcome::Sent; 4]));
+        let body = "群里的新消息：\nRust\nasync".to_string();
+        a.converse(&ctx, body.clone(), batch.current, false).await.unwrap();
+        assert!(a.test_chat.as_ref().unwrap().turns[0].2.contains(&e.summary));
+        assert_eq!(a.models.stub_prompts(), [("embed".into(), ProcessingPolicy::Any, body.clone())]);
+
+        let baseline = a.frame(&ctx, 0, &ctx.task_cards(&a.board())).unwrap().0;
+        a.converse(&ctx, body.clone(), 0, false).await.unwrap();
+        assert_eq!(a.test_chat.as_ref().unwrap().turns[1].2, baseline);
+
+        // A bad cached vector also falls back, without losing the ordinary context.
+        a.store.save_embedding(&crate::store::EpisodeEmbedding { episode_id: e.id, model_id, vector: vec![1.0] }).unwrap();
+        let baseline = a.frame(&ctx, 0, &ctx.task_cards(&a.board())).unwrap().0;
+        a.converse(&ctx, body.clone(), 0, false).await.unwrap();
+        assert_eq!(a.test_chat.as_ref().unwrap().turns[2].2, baseline);
+
+        ctx.scope = Scope::SelfOnly;
+        let baseline = a.frame(&ctx, 0, &ctx.task_cards(&a.board())).unwrap().0;
+        a.converse(&ctx, body, 0, false).await.unwrap();
+        assert_eq!(a.test_chat.as_ref().unwrap().turns[3].2, baseline);
+        assert_eq!(a.models.stub_prompts().len(), 3); // No private query sent remotely.
     }
 
     #[test]
