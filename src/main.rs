@@ -21,8 +21,6 @@ use channels::Outlets;
 use channels::telegram::Telegram;
 use config::Config;
 use mind::models::Models;
-use store::Store;
-use store::jsonl::JsonlStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,7 +37,7 @@ async fn main() -> Result<()> {
     if owner.telegram_user_id == 0 && owner.qq_user_id == 0 {
         warn!("没有设置主人的 ID（OWNER_TELEGRAM_ID / OWNER_QQ_ID）：没人能使用主人权限，日志会打印发信人的 ID");
     }
-    let store: Arc<dyn Store> = Arc::new(JsonlStore::open(&cfg.data_dir())?);
+    let store = store::open(&cfg.runtime.mongo, &cfg.data_dir())?;
     let models = Arc::new(Models::new(&cfg, store.clone()).await?);
 
     let (events_tx, mut events) = mpsc::channel::<Event>(256);
