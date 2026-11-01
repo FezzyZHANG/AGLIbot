@@ -2,7 +2,7 @@
 id: "n-agli-dec-intent"
 title: "Intentions via reply markers and an owner console"
 kind: "decision"
-state: "proposed"
+state: "accepted"
 relations: [{"type": "relates", "target": "note:n-agli-dec-no-group-speculation"}]
 abstract_zh: "聊天模型用回复里的标记表达“记任务/转告主人”，运行时只认主人私聊里的任务标记；斜杠命令是确定性的控制通道，非主人只能用已发布的能力命令。"
 abstract_en: "Reply markers carry intentions (honoured only from the owner); slash commands are the deterministic control path, and non-owners may use only published capability commands."

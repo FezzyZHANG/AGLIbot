@@ -2,7 +2,7 @@
 id: "n-agli-dec-no-group-speculation"
 title: "Others may call published capabilities only; no speculative work from group messages"
 kind: "decision"
-state: "proposed"
+state: "accepted"
 relations: [{"type": "relates", "target": "note:n-src-deepseek-superagent"}, {"type": "relates", "target": "note:n-agli-dec-intent"}, {"type": "relates", "target": "note:n-agli-dec-groups"}]
 abstract_zh: "群友和其他 agent 可以调用已经程序化发布的能力；更高级的调用（委派 hands、DSH、自由任务）和任何修改都不对外开放，只能进 board 等主人确认。不因群消息投机开工，主动接活先走 observe 模式。"
 abstract_en: "Non-owners may invoke programmatically published capabilities; advanced invocations and any modification stay owner-only. No speculative work from group messages; self-initiated task-taking starts in observe mode."

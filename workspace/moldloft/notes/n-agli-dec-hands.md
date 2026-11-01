@@ -2,7 +2,7 @@
 id: "n-agli-dec-hands"
 title: "Delegation: DSH is the main hand; Codex is transitional; Claude Code is the owner's; core code goes through Moldloft"
 kind: "decision"
-state: "proposed"
+state: "accepted"
 relations: [{"type": "relates", "target": "ticket:22"}, {"type": "relates", "target": "ticket:26"}, {"type": "relates", "target": "note:n-agli-dec-two-layer"}, {"type": "relates", "target": "ticket:25"}]
 abstract_zh: "Claude Code 只归主人用，AGLI 不调用。DSH 是主要的可编程对象，常规研究、闲逛和工作区任务交给它；Codex 作为过渡路径保留。涉及核心代码的工作走 Moldloft 辅助层：AGLI 只提交工单/提案，主人审阅后再动手。只有 Astra 和 Opus 能直接写核心代码；deepseek-v4.1-flash-1017 只能做由 Astra 或 Opus 指导的良定义任务。"
 abstract_en: "Claude Code is reserved for the owner. DSH is the main programmable hand for routine research, browsing and workspace tasks; Codex stays as a transitional path. Core-code work goes through the Moldloft layer as reviewed tickets/proposals. Only Astra and Opus write core code directly; deepseek-v4.1-flash-1017 only for well-defined tasks directed by Astra or Opus."

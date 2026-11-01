@@ -2,7 +2,7 @@
 id: "n-agli-dec-groups"
 title: "Joined groups are read-only by default; only allowlisted groups get replies"
 kind: "decision"
-state: "proposed"
+state: "accepted"
 relations: [{"type": "relates", "target": "ticket:6"}, {"type": "relates", "target": "note:n-agli-dec-no-group-speculation"}]
 abstract_zh: "默认只读：加入的群都静默学习（记录、夜间反思），但不接话；只有白名单里的群才走发言流程。"
 abstract_en: "Read-only by default: every joined group is learned from silently; only allowlisted groups go through the reply path."
