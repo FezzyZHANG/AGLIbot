@@ -2,7 +2,7 @@
 
 AGLI（Artificial Guy-Like Intelligence）：一个像受过良好教育的普通人那样生活的桌面 agent。设计见 [docs/DESIGN.md](docs/DESIGN.md)。
 
-现在是第一版：Telegram 和 QQ（NapCat）双通道，私聊和群聊，有记忆、作息、驱力，会主动找你，能接研究和编码任务并交给 Codex / Claude Code 去做。
+现在是第一版：Telegram 和 QQ（NapCat）双通道，私聊和群聊，有记忆、作息、驱力，会主动找你，能接研究和编码任务并交给 Codex 去做（Claude Code 只归主人用，他不调用）。
 还没做的部分记在 Moldloft 的图谱里（见下文“开发管理”）。
 
 ## 运行
@@ -39,7 +39,7 @@ Telegram 的收发消息走环境变量 `TELEGRAM_PROXY` 指定的代理（例�
 - **主动性**：社交需求、好奇心随时间增长，越过阈值或有新任务时，他用廉价模型决定做什么：找你聊几句、开始一个任务，或者什么都不做。
   主动找你至少间隔 `proactive_gap_hours`。
 - **工作**：你请他查东西或写代码时，他会在回复里答应并记到看板（`work/board.yaml`）。他决定开工后，先写计划，
-  再交给 Codex（或 Claude Code）在 `work/tasks/<id>/` 里取证、写 `claims.yaml` 和报告；来源快照记 SHA-256；
+  再交给 Codex 在 `work/tasks/<id>/` 里取证、写 `claims.yaml` 和报告；来源快照记 SHA-256；
   之后经过规则检查和审查模型复核，最后用他自己的话告诉你结论。
 - **审查**：需要你拍板的事（别人请他动用工具、审查模型拿不准的结论）攒成每日汇总，`judge.digest_at` 时发给你。
 

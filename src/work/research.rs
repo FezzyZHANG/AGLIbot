@@ -150,15 +150,10 @@ fn gather_prompt(task: &Task, plan: &str, fixes: Option<&str>) -> String {
 async fn gather(job: &Job, dir: &Path, plan: &str, fixes: Option<&str>) -> Result<String> {
     let prompt = gather_prompt(&job.task, plan, fixes);
     match job.hands.research {
-        DelegateTool::Claude => {
-            let r = delegate::claude(dir, &prompt, job.hands.claude_budget_usd, job.timeout()).await?;
-            job.log(&format!("Claude Code 完成取证（花费 {:?} USD）", r.cost_usd));
-            Ok(r.text)
-        }
         DelegateTool::Codex => {
-            let r = delegate::codex(dir, &prompt, true, job.timeout()).await?;
+            let text = delegate::codex(dir, &prompt, &job.hands.codex_model, true, job.timeout()).await?;
             job.log("Codex 完成取证");
-            Ok(r.text)
+            Ok(text)
         }
         DelegateTool::Off => {
             // No hands: say so plainly instead of pretending to have sources.
@@ -226,23 +221,22 @@ async fn code(job: &Job) -> Result<Outcome> {
         "任务：{}\n只在当前目录里工作。完成后用几句话说明做了什么、怎么验证的、还有什么没做。",
         job.task.title
     );
-    let r = match job.hands.code {
-        DelegateTool::Codex => delegate::codex(&dir, &prompt, false, job.timeout()).await?,
-        DelegateTool::Claude => delegate::claude(&dir, &prompt, job.hands.claude_budget_usd, job.timeout()).await?,
+    let text = match job.hands.code {
+        DelegateTool::Codex => delegate::codex(&dir, &prompt, &job.hands.codex_model, false, job.timeout()).await?,
         DelegateTool::Off => anyhow::bail!("编码委托已关闭（config/runtime.yaml 的 hands.code）"),
     };
     job.log("编码委托完成");
     let files: Vec<String> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok().and_then(|e| e.file_name().to_str().map(String::from)))
         .collect();
-    let evidence = format!("产出文件：{}\n\n执行者的说明：\n{}", files.join("、"), r.text);
+    let evidence = format!("产出文件：{}\n\n执行者的说明：\n{}", files.join("、"), text);
     let j = judge::review(&job.models, ReviewCategory::Act, &job.task.title, &evidence).await?;
     let item = judge::file(job.store.as_ref(), ReviewCategory::Act, &job.task.title, &evidence, &j, false, json!({"task_id": job.task.id}))?;
     Ok(Outcome {
         task_id: job.task.id.clone(),
         title: job.task.title.clone(),
         ok: true,
-        summary: format!("{}\n产出在：{}", r.text.trim(), dir.display()),
+        summary: format!("{}\n产出在：{}", text.trim(), dir.display()),
         verdict: Some(format!("#{} {}", item.id, j.verdict.zh())),
     })
 }

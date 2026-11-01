@@ -21,9 +21,9 @@ memory:
   facts_in_context: 20    # 最多带几条关于对方的事实
 
 hands:
-  research: codex         # 研究任务交给谁：claude / codex / off（claude 需先在终端 claude /login）
-  code: codex             # 编码任务交给谁
-  claude_budget_usd: 2.0  # 单次委托给 Claude Code 的花费上限
+  research: codex         # 研究任务交给谁：codex / off。Claude Code 只归你用，他不调用
+  code: codex             # 编码任务交给谁：codex / off（只在 work/tasks/<id>/scratch/ 里写）
+  codex_model: gpt-6-astra  # 固定 Codex 用的模型，不跟随 ~/.codex/config.toml 的默认值
   timeout_min: 30
 
 judge:

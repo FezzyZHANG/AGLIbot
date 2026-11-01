@@ -198,7 +198,6 @@ pub struct MemoryCfg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegateTool {
-    Claude,
     Codex,
     Off,
 }
@@ -207,7 +206,7 @@ pub enum DelegateTool {
 pub struct HandsCfg {
     pub research: DelegateTool,
     pub code: DelegateTool,
-    pub claude_budget_usd: f64,
+    pub codex_model: String,
     pub timeout_min: u64,
 }
 

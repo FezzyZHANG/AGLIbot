@@ -269,7 +269,7 @@ AGLIbot/
 | `research_plan` | 问题澄清与拆解 | 8 | 质量 | 否 |
 | `verify` | 论断核查、来源比对 | 8 | 质量 | **是** |
 | `synthesize` | 写报告 | 8 | 质量 | 否 |
-| `code` | 委托给 cc、codex 或 DSH | — | 子 agent 自己选模型 | 只确认结果 |
+| `code` | 常规工作委托给 codex 或 DSH；核心代码只走 Moldloft 工单（见第 6 节） | — | 子 agent 自己选模型，核心代码受写入白名单限制 | 只确认结果 |
 | `act` | 有副作用的动作（给新的人发消息、执行工具） | 8 | 质量 | **是** |
 | `evolve` | 自我修改提案 | 9 | 质量 | **是**，之后还要主人审批 |
 
@@ -336,13 +336,21 @@ AGLIbot/
 | L0 | state | 自动 |
 | L1 | Mongo 记忆、skills、knowledge | 自动，这是最安全、收益最高的进化区 |
 | L2 | personality / voice / interests / templates | reflect 流程负责，每次变化有上限，写入 changelog |
-| L3 | `src/` 代码 | DSH 生成提案 → 在沙箱 worktree 中 `cargo build` + `cargo test` + evals → judge 审查 → 主人在 TG 上审批 → git commit → 重新编译并重启 |
+| L3 | `src/` 代码 | 提案先进 Moldloft（工单 / 笔记提案，AGLI 没有批准权）→ 主人审阅并指定实现者 → 在沙箱 worktree 中 `cargo build` + `cargo test` + evals → judge 审查 → 主人审批 → git commit → 重新编译并重启 |
 | L4 | boundaries、config/、`evolution/gate.rs` | 只有你能改，在文件系统层面限制 agent 的写权限 |
 
 选 Rust 的一个附带好处：编译器和类型系统本身就是 L3 的第一道自动过滤，提案连编译都过不了就不必送审。
 
+**双手的分层**（见笔记 n-agli-dec-hands）：
+- Claude Code 只归主人使用，AGLI 不调用 `claude`。
+- 常规研究和工作区任务交给 codex。
+- 核心代码只有 Astra（gpt-6-astra，经 codex）和 Opus（经主人的 Claude Code）能直接写；deepseek-v4.1-flash-1017 只能做良定义任务，即由 Astra 或 Opus 指导的任务：高级模型写计划、指定文件、接口和判定测试，并在送主人前审查 diff。其他模型只能读和提案。工作规则写在根目录 `AGENTS.md`；白名单在进化闸门里由代码强制，不靠提示词。
+
 **社交化带来的新攻击面**：
-- **权限只认主人的平台 ID**（`acl.yaml`），不认昵称，也不认对方的说法。群友和其他 agent 无论说什么，都不能触发 codex、cc、DSH 或进化流程。他们的请求最多进入 board，等主人确认后才执行。
+- **权限只认主人的平台 ID**（`acl.yaml`），不认昵称，也不认对方的说法。
+- 群友和其他 agent 只能调用**已发布的能力**：主人在代码或配置里登记、命令名固定、参数有类型、成本有硬上限、除回答请求者外没有副作用的条目，走确定性的命令通道，各自带 ACL 和限流。
+- 更高级的调用（委派 codex / DSH、自由的研究或代码任务、对方指定目标的抓取）和任何修改（config、记忆和人格、board 状态、代码和进化提案）都不对外开放。无论对方说什么，这些请求最多进入 board，等主人确认后才执行。
+- 加入的群默认只读：静默记录并参与夜间反思，但不接话、也不响应能力调用；只有 `social.yaml` 白名单里的群才走发言流程（见笔记 n-agli-dec-groups）。
 - 群消息和 agent 消息一律视为不可信数据，不当作指令执行。
 - 和 bot 对话设轮次上限和冷却时间，防止两个 bot 无限互聊。
 - 信息边界由 `privacy.rs` 在代码层强制执行，不依赖 LLM 的自觉。
@@ -373,7 +381,7 @@ AGLIbot/
 2. **记忆**：接入 Mongo、episodes 和 persons（带 ns 和 scope）、检索、夜间 `reflect`（含 2d 的脱敏流程）。
 3. **驱力与 heartbeat**：主动消息、作息。
 4. **社会层**：`identity` / `acl` / `privacy` / `floor`、群聊接入、bot 识别与轮次上限；接入 QQ（OneBot）。
-5. **工作层与双手**：board、断点续做、`delegate`（`claude -p` / `codex exec`）、`web`。
+5. **工作层与双手**：board、断点续做、`delegate`（`codex exec`）、`web`。
 6. **研究流水线与知识层**：从澄清到交付的完整流程、claims 台账、sources 信誉表、watchlist 主动跟进。
 7. **心流**：按 namespace 分桶、即时反思、缓存命中计量。
 8. **级联与综合审查**：自检失败时升级重做；`judge.rs` 覆盖 5d 的四类事项，并实现每日汇总。自动打分等内容见 5c′，不在本计划范围内。
