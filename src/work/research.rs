@@ -613,11 +613,11 @@ fn save_dsh_research(dir: &Path, text: &str) -> Result<String> {
     for (i, source) in report.sources.iter().enumerate() {
         let url = normalized_source_url(&source.url);
         let (fetched, reason) = if url.as_ref().is_some_and(|url| fetched.contains(url)) {
-            ("yes", "fetch tool targeted this URL in this run; excerpt not byte-verified")
+            ("yes", "fetch tool targeted this URL in this DSH session; excerpt not byte-verified")
         } else if url.as_ref().is_some_and(|url| searched.contains(url)) {
             ("no", "found via search, not fetched")
         } else {
-            ("no", "no fetch tool targeted this URL in this run")
+            ("no", "no fetch tool targeted this URL in this DSH session")
         };
         std::fs::write(
             dir.join(format!("sources/{:02}-dsh.md", i + 1)),
@@ -1229,5 +1229,32 @@ mod tests {
         assert!(notes.contains("1 个来源") && notes.contains("02-missing.md"), "{notes}");
         assert!(read(&dir, "sources/index.txt").contains("01-openai.md"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Live end-to-end run of the configured research hand (DSH with the agli profile):
+    /// real models, real web search, temporary board and store. Needs the keys in .env and
+    /// `hands.research: dsh`. Run with `--ignored --test-threads=1`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live: real models and web search, costs tokens"]
+    async fn live_dsh_research_end_to_end() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let _ = dotenvy::from_path(root.join(".env"));
+        let cfg = crate::config::Config::load(root).unwrap();
+        assert_eq!(cfg.runtime.hands.research, DelegateTool::Dsh, "hands.research must be dsh");
+        let base = std::env::temp_dir().join(format!("aglibot-live-research-{}", std::process::id()));
+        let store: Arc<dyn Store> = Arc::new(crate::store::jsonl::JsonlStore::open(&base.join("data")).unwrap());
+        let models = Arc::new(Models::new(&cfg, store.clone()).await.unwrap());
+        let mut board = Board::load(&base.join("work")).unwrap();
+        let task = board.add("Rust 2024 edition 正式发布于哪个 Rust 版本、哪一天？给出官方来源", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
+        let board = Arc::new(Mutex::new(board));
+        let dir = board.lock().unwrap().task_dir(&task.id);
+        let job = Job { models, store, board, l1: "zh".into(), hands: cfg.runtime.hands.clone(), task };
+        let outcome = run(job).await;
+        println!("dir: {}
+ok: {} verdict: {:?}
+summary: {}", dir.display(), outcome.ok, outcome.verdict, outcome.summary);
+        assert!(outcome.ok, "{outcome:?}");
+        assert!(read(&dir, "dsh-events.jsonl").contains("web_search"));
+        assert!(dir.join("sources").read_dir().unwrap().next().is_some(), "no sources saved");
     }
 }

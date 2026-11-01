@@ -304,25 +304,40 @@ impl DshEvents {
     }
 }
 
-/// Audit files append invocations, including resumes of the same session. Never let
-/// an earlier invocation's tool calls vouch for the current answer.
+/// Audit files append invocations, including resumes of the same session. A resumed
+/// session still holds its earlier fetches in its transcript, so they keep vouching for the
+/// answer; a different (fresh) session, or a run that never reported one, starts over.
 pub(crate) fn dsh_research_targets(raw: &str) -> (Vec<String>, Vec<String>) {
+    #[derive(Default, Clone)]
+    struct Run {
+        session: Option<String>,
+        fetched: Vec<String>,
+        searched: Vec<String>,
+    }
     let mut events = DshEvents::default();
-    let mut fetched = Vec::new();
-    let mut searched = Vec::new();
+    let mut previous = Run::default();
+    let mut run = Run::default();
     for line in raw.lines() {
         let event = serde_json::from_str::<serde_json::Value>(line).unwrap_or_default();
-        if line.trim().is_empty() || matches!(event["type"].as_str(), Some("agli_run_start" | "session")) {
+        if line.trim().is_empty() || event["type"] == "agli_run_start" {
+            if run.session.is_some() {
+                previous = std::mem::take(&mut run);
+            }
+            run = Run::default();
             events = DshEvents::default();
-            fetched.clear();
-            searched.clear();
+            continue;
+        }
+        if event["type"] == "session" {
+            let id = event["sessionId"].as_str().map(String::from);
+            run = if id.is_some() && id == previous.session { Run { session: id, ..previous.clone() } } else { Run { session: id, ..Run::default() } };
+            continue;
         }
         let count = events.calls.len();
         events.line(line.as_bytes());
         if let Some(call) = events.calls.get(count) {
             match call.tool.as_deref().unwrap_or_default().to_ascii_lowercase().as_str() {
-                "web_fetch" | "webfetch" => fetched.extend(call.targets.iter().cloned()),
-                "web_search" | "websearch" => searched.extend(call.targets.iter().cloned()),
+                "web_fetch" | "webfetch" => run.fetched.extend(call.targets.iter().cloned()),
+                "web_search" | "websearch" => run.searched.extend(call.targets.iter().cloned()),
                 _ => {}
             }
         }
@@ -334,10 +349,10 @@ pub(crate) fn dsh_research_targets(raw: &str) -> (Vec<String>, Vec<String>) {
                 })
             })
         {
-            search_result_urls(&event["result"], &mut searched);
+            search_result_urls(&event["result"], &mut run.searched);
         }
     }
-    (fetched, searched)
+    (run.fetched, run.searched)
 }
 
 fn search_result_urls(value: &serde_json::Value, out: &mut Vec<String>) {
@@ -648,6 +663,24 @@ mod tests {
         // A cancelled run can leave a partial line; the explicit marker still clears it.
         let raw = format!("{DSH_EVENTS}{{broken\n{{\"type\":\"agli_run_start\"}}\n");
         assert_eq!(dsh_research_targets(&raw), (vec![], vec![]));
+    }
+
+    #[test]
+    fn dsh_research_targets_carry_over_only_within_the_same_resumed_session() {
+        let resume = |id: &str| format!("{DSH_EVENTS}
+{{\"type\":\"agli_run_start\"}}
+{{\"type\":\"session\",\"sessionId\":\"{id}\"}}
+{{\"type\":\"final\",\"text\":\"revised\"}}
+");
+        let (fetched, searched) = dsh_research_targets(&resume("session-research-25"));
+        assert_eq!((fetched, searched), (vec!["https://example.org/source".to_string()], vec!["https://example.org/source".to_string()]));
+        assert_eq!(dsh_research_targets(&resume("session-fresh")), (vec![], vec![]));
+        // A run that never reported a session (failed early) does not break the chain.
+        let raw = format!("{DSH_EVENTS}
+{{\"type\":\"agli_run_start\"}}
+{{broken
+{}", resume("session-research-25").trim_start_matches(DSH_EVENTS));
+        assert_eq!(dsh_research_targets(&raw).0, ["https://example.org/source"]);
     }
 
     #[test]

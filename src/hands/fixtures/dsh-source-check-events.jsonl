@@ -1,4 +1,4 @@
-{"type":"session","sessionId":"session-research-44"}
+{"type":"session","sessionId":"session-research-43"}
 {"type":"tool_call","callId":"old-1","tool":"web_fetch","input":{"url":"https://example.org/not-fetched"}}
 {"type":"tool_call","callId":"old-2","tool":"web_fetch","input":{"url":"https://example.org/search-only"}}
 {"type":"final","text":"old answer"}
