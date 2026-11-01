@@ -248,6 +248,8 @@ pub struct HandsCfg {
     pub codex_model: String,
     #[serde(default = "default_dsh_profile")]
     pub dsh_profile: String,
+    #[serde(default = "default_dsh_home")]
+    pub dsh_home: PathBuf,
     pub timeout_min: u64,
     #[serde(default = "default_stall_minutes")]
     pub stall_minutes: u64,
@@ -260,6 +262,17 @@ fn default_total_budget_minutes() -> u64 { 90 }
 
 fn default_dsh_profile() -> String {
     "agli".into()
+}
+
+fn default_dsh_home() -> PathBuf {
+    "data/dsh-home".into()
+}
+
+impl HandsCfg {
+    fn resolve_dsh_home(&mut self, root: &Path) -> Result<()> {
+        self.dsh_home = std::path::absolute(root.join(&self.dsh_home)).context("resolving AGLI DSH home")?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -345,6 +358,7 @@ impl Config {
             social: read_yaml(&dir.join("social.yaml"))?,
             runtime: read_yaml(&dir.join("runtime.yaml"))?,
         };
+        cfg.runtime.hands.resolve_dsh_home(root)?;
         cfg.resolve_env()?;
         cfg.validate()?;
         crate::ns::secrets::register_config(&cfg);
@@ -447,6 +461,7 @@ mod tests {
         let hands: HandsCfg = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(hands.research, DelegateTool::Codex);
         assert_eq!(hands.dsh_profile, "agli");
+        assert_eq!(hands.dsh_home, Path::new("data/dsh-home"));
         assert_eq!((hands.stall_minutes, hands.total_budget_minutes), (20, 90));
         let hands: HandsCfg = serde_yaml::from_str(&format!("{yaml}research: dsh\ndsh_profile: agli-research")).unwrap();
         assert_eq!(hands.research, DelegateTool::Dsh);
@@ -454,6 +469,22 @@ mod tests {
         assert_eq!(hands.dsh_profile, "agli-research");
         let hands: HandsCfg = serde_yaml::from_str(&format!("{yaml}stall_minutes: 3\ntotal_budget_minutes: 15")).unwrap();
         assert_eq!((hands.stall_minutes, hands.total_budget_minutes), (3, 15));
+    }
+
+    #[test]
+    fn dsh_home_resolves_against_root_not_task_directory() {
+        let yaml = "code: codex\ncodex_model: pinned\ntimeout_min: 10\n";
+        let root = Path::new("agli root");
+        for configured in [None, Some("data/custom home")] {
+            let setting = configured.map(|p| format!("dsh_home: {p}")).unwrap_or_default();
+            let mut hands: HandsCfg = serde_yaml::from_str(&format!("{yaml}{setting}")).unwrap();
+            hands.resolve_dsh_home(root).unwrap();
+            assert_eq!(hands.dsh_home, std::path::absolute(root.join(configured.unwrap_or("data/dsh-home"))).unwrap());
+            assert!(hands.dsh_home.is_absolute());
+            let resolved = hands.dsh_home.clone();
+            hands.resolve_dsh_home(Path::new("another root")).unwrap();
+            assert_eq!(hands.dsh_home, resolved);
+        }
     }
 
     #[test]
@@ -486,6 +517,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let cfg = Config::load(root).expect("config/ should parse");
         assert!(!cfg.models.models.is_empty());
+        assert_eq!(cfg.runtime.hands.dsh_home, root.join("data/dsh-home"));
         assert!(cfg.scenarios.contains_key("verify"));
         assert_ne!(cfg.runtime.routine.sleep_at, cfg.runtime.routine.wake_at);
     }
