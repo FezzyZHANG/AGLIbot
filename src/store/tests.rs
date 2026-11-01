@@ -196,6 +196,10 @@ pub(super) fn contract(store: &dyn Store) {
 }
 
 pub(super) fn persisted(store: &dyn Store) {
+    let audit = store.audits().unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].outcome, Outcome::Denied);
+    assert_eq!(audit[0].reason, "denied");
     assert_eq!(store.recent_in_ns(&"person/a".parse().unwrap(), 100).unwrap().len(), 5);
     assert_eq!(store.episodes().unwrap().len(), 2);
     assert_eq!(store.lessons().unwrap().len(), 2);

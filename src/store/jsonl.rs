@@ -189,6 +189,12 @@ impl Store for JsonlStore {
         self.append(AUDIT, a)
     }
 
+    fn audits(&self) -> Result<Vec<AuditRecord>> {
+        let _g = self.guard();
+        // A corrupt outcome must not disappear during a resume inspection.
+        self.scan_mode(AUDIT, true)
+    }
+
     fn reviews(&self) -> Result<Vec<ReviewItem>> {
         let _g = self.guard();
         self.read_doc(REVIEWS)
