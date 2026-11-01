@@ -305,6 +305,57 @@ impl DshEvents {
     }
 }
 
+/// Audit files append invocations, including resumes of the same session. Never let
+/// an earlier invocation's tool calls vouch for the current answer.
+pub(crate) fn dsh_research_targets(raw: &str) -> (Vec<String>, Vec<String>) {
+    let mut events = DshEvents::default();
+    let mut fetched = Vec::new();
+    let mut searched = Vec::new();
+    for line in raw.lines() {
+        let event = serde_json::from_str::<serde_json::Value>(line).unwrap_or_default();
+        if line.trim().is_empty() || matches!(event["type"].as_str(), Some("agli_run_start" | "session")) {
+            events = DshEvents::default();
+            fetched.clear();
+            searched.clear();
+        }
+        let count = events.calls.len();
+        events.line(line.as_bytes());
+        if let Some(call) = events.calls.get(count) {
+            match call.tool.as_deref().unwrap_or_default().to_ascii_lowercase().as_str() {
+                "web_fetch" | "webfetch" => fetched.extend(call.targets.iter().cloned()),
+                "web_search" | "websearch" => searched.extend(call.targets.iter().cloned()),
+                _ => {}
+            }
+        }
+        if event["type"] == "tool_result"
+            && event["callId"].as_str().is_some_and(|id| {
+                events.calls.iter().any(|call| {
+                    call.call_id.as_deref() == Some(id)
+                        && matches!(call.tool.as_deref().unwrap_or_default().to_ascii_lowercase().as_str(), "web_search" | "websearch")
+                })
+            })
+        {
+            search_result_urls(&event["result"], &mut searched);
+        }
+    }
+    (fetched, searched)
+}
+
+fn search_result_urls(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            for word in text.split(|c: char| c.is_whitespace() || "\"<>`([".contains(c)) {
+                if word.to_ascii_lowercase().starts_with("https://") || word.to_ascii_lowercase().starts_with("http://") {
+                    out.push(word.trim_end_matches([')', ']', ',', '.', ';']).to_string());
+                }
+            }
+        }
+        serde_json::Value::Object(fields) => fields.values().for_each(|value| search_result_urls(value, out)),
+        serde_json::Value::Array(items) => items.iter().for_each(|value| search_result_urls(value, out)),
+        _ => {}
+    }
+}
+
 fn valid_dsh_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 256 && !id.starts_with('-') && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
@@ -339,6 +390,7 @@ impl<'a> DshAudit<'a> {
         let mut raw = append("dsh-events.jsonl")?;
         // A cancelled invocation may have ended on a partial line. Keep the next run separate.
         writeln!(raw)?;
+        writeln!(raw, "{{\"type\":\"agli_run_start\"}}")?;
         Ok(Self {
             events: DshEvents::default(),
             raw,
@@ -565,6 +617,28 @@ mod tests {
     }
 
     #[test]
+    fn dsh_research_targets_only_include_current_fetches_and_search_results() {
+        let (fetched, searched) = dsh_research_targets(include_str!("fixtures/dsh-source-check-events.jsonl"));
+        assert_eq!(fetched, ["HTTPS://EXAMPLE.ORG:443/fetched/?a=1&b=2#section", "http://example.org:80/alias"]);
+        assert_eq!(searched, ["https://example.org/search-only"]);
+        let (fetched, searched) = dsh_research_targets(DSH_EVENTS);
+        assert_eq!(fetched, ["https://example.org/source"]);
+        assert_eq!(searched, ["https://example.org/source"]);
+    }
+
+    #[test]
+    fn dsh_research_run_boundaries_clear_old_targets_even_without_a_session_id() {
+        for boundary in ["\n", "{\"type\":\"agli_run_start\"}\n", "{\"type\":\"session\",\"sessionId\":\"session-research-25\"}\n"] {
+            let raw = format!("{DSH_EVENTS}{boundary}{{\"type\":\"final\",\"text\":\"no tools this run\"}}\n");
+            let (fetched, searched) = dsh_research_targets(&raw);
+            assert!(fetched.is_empty() && searched.is_empty(), "{boundary:?}");
+        }
+        // A cancelled run can leave a partial line; the explicit marker still clears it.
+        let raw = format!("{DSH_EVENTS}{{broken\n{{\"type\":\"agli_run_start\"}}\n");
+        assert_eq!(dsh_research_targets(&raw), (vec![], vec![]));
+    }
+
+    #[test]
     fn dsh_missing_malformed_and_future_events_are_safe() {
         let mut events = DshEvents::default();
         for line in [
@@ -708,6 +782,8 @@ mod tests {
         assert_eq!(calls[0].cost_usd, 0.0);
         assert_eq!(std::fs::read_to_string(dir.join("dsh-tool-calls.jsonl"))?.lines().count(), 10);
         assert_eq!(std::fs::read_to_string(dir.join("dsh-events.jsonl"))?.matches(DSH_EVENTS).count(), 2);
+        assert_eq!(std::fs::read_to_string(dir.join("dsh-events.jsonl"))?.matches("agli_run_start").count(), 3);
+        assert_eq!(dsh_research_targets(&std::fs::read_to_string(dir.join("dsh-events.jsonl"))?), (vec![], vec![]));
         assert!(std::fs::read_to_string(dir.join("log.md"))?.contains("usage not reported"));
         std::fs::remove_dir_all(dir)?;
         Ok(())

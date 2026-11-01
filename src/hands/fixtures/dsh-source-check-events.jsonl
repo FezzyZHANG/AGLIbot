@@ -1,0 +1,15 @@
+{"type":"session","sessionId":"session-research-44"}
+{"type":"tool_call","callId":"old-1","tool":"web_fetch","input":{"url":"https://example.org/not-fetched"}}
+{"type":"tool_call","callId":"old-2","tool":"web_fetch","input":{"url":"https://example.org/search-only"}}
+{"type":"final","text":"old answer"}
+
+{"type":"agli_run_start"}
+{"type":"session","sessionId":"session-research-44"}
+{"type":"tool_call","callId":"search-1","tool":"web_search","input":{"queries":["primary evidence"]}}
+{"type":"tool_result","callId":"search-1","status":"completed","result":{"results":[{"url":"https://example.org/search-only","snippet":"Search evidence only"}]}}
+{"type":"tool_call","callId":"fetch-1","tool":"web_fetch","input":"{\"url\":\"HTTPS://EXAMPLE.ORG:443/fetched/?a=1&b=2#section\"}"}
+{"type":"tool_call","callId":"fetch-2","tool":"WebFetch","input":{"url":"http://example.org:80/alias"}}
+{"type":"tool_call","callId":"read-1","tool":"read","input":{"url":"https://example.org/not-fetched"}}
+{"type":"tool_call","callId":"fetch-3","tool":"web_fetch","input":"{broken","truncated":true}
+{"type":"tool_call","callId":"fetch-4","tool":"web_fetch","truncated":true}
+{"type":"final","text":"current answer"}
