@@ -14,7 +14,7 @@
 //! |---|---|
 //! | text | as is |
 //! | at | `@名字 `; @him sets `mentions_me` instead; `all` is `@全体成员 ` |
-//! | reply | nothing; a reply to his message sets `mentions_me` |
+//! | reply | `[回复 名字: 前40字…]`, else `[回复]`; replies to him set `mentions_me`; hidden in forwards |
 //! | face | `[表情:微笑]` from `raw.faceText`, else `[表情]` |
 //! | mface | `[表情:summary]` (market sticker) |
 //! | image | `[图片]`; stickers (`sub_type` 1) `[动画表情]` |
@@ -52,6 +52,7 @@ const CHUNK_CHARS: usize = 1500;
 const ACTION_TIMEOUT: Duration = Duration::from_secs(20);
 /// How many of his own message ids to remember, to recognise replies to him.
 const OWN_MESSAGES: usize = 300;
+const RECENT_MESSAGES: usize = 500;
 /// Forwards nested deeper than this show only their header.
 const FORWARD_DEPTH: usize = 2;
 /// Per forward: nodes and characters shown before `…(省略 K 条)`.
@@ -76,11 +77,36 @@ struct Request {
 struct Shared {
     self_id: AtomicI64,
     own_messages: Mutex<VecDeque<String>>,
+    recent: Mutex<VecDeque<(String, Quoted)>>,
     /// Unknown segment types already logged.
     unknown_types: Mutex<HashSet<String>>,
 }
 
+#[derive(Clone)]
+struct Quoted {
+    name: String,
+    text: String,
+}
+
 impl Shared {
+    fn cache(&self, id: String, message: Quoted) {
+        let mut q = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        q.retain(|(key, _)| key != &id);
+        q.push_back((id, message));
+        if q.len() > RECENT_MESSAGES {
+            q.pop_front();
+        }
+    }
+
+    fn cached(&self, id: &str) -> Option<Quoted> {
+        let mut q = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        let i = q.iter().position(|(key, _)| key == id)?;
+        let entry = q.remove(i)?;
+        let message = entry.1.clone();
+        q.push_back(entry);
+        Some(message)
+    }
+
     fn note_unknown(&self, kind: &str) {
         if self.unknown_types.lock().unwrap_or_else(|e| e.into_inner()).insert(kind.to_string()) {
             info!("qq: unhandled segment type `{kind}`, shown as [{kind}]");
@@ -131,10 +157,20 @@ async fn enrich(mut raw: mpsc::Receiver<Pending>, qq: QqHandle, inbound: mpsc::S
         } else {
             Forwards::new()
         };
-        if let Some(env) = finish(p, &forwards, &qq.shared)
-            && inbound.send(env).await.is_err()
-        {
-            return;
+        let reply = resolve_reply(&p.message, &qq.shared, |id| {
+            let qq = qq.clone();
+            async move { qq.get_message(&id).await }
+        })
+        .await;
+        if let Some(env) = finish(p, &forwards, &qq.shared, &reply) {
+            if let Some(id) = &env.message_id {
+                // Cache the body only, so quoting a reply does not nest prefixes.
+                let body = env.text.strip_prefix(reply.as_str()).unwrap_or(&env.text).trim().to_string();
+                qq.shared.cache(id.clone(), Quoted { name: env.sender_name.clone(), text: body });
+            }
+            if inbound.send(env).await.is_err() {
+                return;
+            }
         }
     }
 }
@@ -163,9 +199,14 @@ impl QqHandle {
             let data = self.call(action, params).await?;
             if let Some(mid) = data.get("message_id") {
                 self.shared.remember(id_string(mid));
+                self.shared.cache(id_string(mid), Quoted { name: "我".into(), text: chunk.to_string() });
             }
         }
         Ok(())
+    }
+
+    async fn get_message(&self, id: &str) -> Result<Value> {
+        tokio::time::timeout(FORWARD_TIMEOUT, self.call("get_msg", json!({ "message_id": id }))).await.map_err(|_| anyhow!("get_msg timed out"))?
     }
 
     /// The nodes of a merged forward.
@@ -326,14 +367,58 @@ fn parse_event(v: &Value, shared: &Shared) -> Option<Pending> {
 }
 
 /// Render the text; `None` when nothing readable is left.
-fn finish(p: Pending, forwards: &Forwards, shared: &Shared) -> Option<Envelope> {
+fn finish(p: Pending, forwards: &Forwards, shared: &Shared, reply: &str) -> Option<Envelope> {
     let r = Render { self_id: shared.self_id.load(Ordering::Relaxed).to_string(), shared, forwards };
     let mut mentions_me = false;
-    let text = r.segments(&p.message, 0, Some(&mut mentions_me)).trim().to_string();
+    let body = r.segments(&p.message, 0, Some(&mut mentions_me));
+    let text = format!("{reply}{}", body.trim());
     if text.is_empty() {
         return None;
     }
     Some(Envelope { text, mentions_me: p.env.mentions_me || mentions_me, ..p.env })
+}
+
+fn reply_segment(message: &[Value]) -> Option<&Value> {
+    message.iter().find(|s| s.get("type").and_then(Value::as_str) == Some("reply"))
+}
+
+async fn resolve_reply<F, Fut>(message: &[Value], shared: &Shared, mut fetch: F) -> String
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Value>>,
+{
+    let Some(seg) = reply_segment(message) else {
+        return String::new();
+    };
+    let Some(id) = seg.pointer("/data/id").filter(|id| !id.is_null()).map(id_string).filter(|id| !id.is_empty()) else {
+        return "[回复]".into();
+    };
+    let quoted = match shared.cached(&id) {
+        Some(message) => Some(message),
+        None => match fetch(id.clone()).await {
+            Ok(data) if data.get("message").is_some_and(|m| m.is_array() || m.is_string()) => {
+                let forwards = Forwards::new();
+                let r = Render { self_id: shared.self_id.load(Ordering::Relaxed).to_string(), shared, forwards: &forwards };
+                let name = if shared.is_mine(&id) || data.pointer("/sender/user_id").map(id_string).as_deref() == Some(&r.self_id) {
+                    "我".into()
+                } else {
+                    node_name(&data)
+                };
+                let message = Quoted { name, text: r.segments(&node_segments(&data), FORWARD_DEPTH, None).trim().to_string() };
+                shared.cache(id, message.clone());
+                Some(message)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                warn!("qq: reply {id} unreadable: {e:#}");
+                None
+            }
+        },
+    };
+    match quoted {
+        Some(q) => format!("[回复 {}: {}]", q.name, cut(&q.text.replace("\r\n", " ").replace(['\r', '\n'], " "), 40)),
+        None => "[回复]".into(),
+    }
 }
 
 fn sender_name(sender: &Value) -> Option<String> {
@@ -570,7 +655,7 @@ mod tests {
     }
 
     fn parse_with(v: &Value, s: &Shared, forwards: &Forwards) -> Option<Envelope> {
-        finish(super::parse_event(v, s)?, forwards, s)
+        finish(super::parse_event(v, s)?, forwards, s, if reply_segment(v["message"].as_array()?).is_some() { "[回复]" } else { "" })
     }
 
     fn group(message: Value) -> Value {
@@ -616,7 +701,7 @@ mod tests {
         });
         let env = parse_event(&reply, &s).unwrap();
         assert!(env.mentions_me);
-        assert_eq!(env.text, "@老王 对");
+        assert_eq!(env.text, "[回复]@老王 对");
     }
 
     #[test]
@@ -736,8 +821,143 @@ mod tests {
     #[test]
     fn message_without_readable_segments_is_dropped() {
         let s = shared(99);
-        assert!(parse_event(&group(json!([{"type": "reply", "data": {"id": "1"}}])), &s).is_none());
+        assert_eq!(text_of(&s, json!([{"type": "reply", "data": {"id": "1"}}])), "[回复]");
         assert!(parse_event(&group(json!([text("  ")])), &s).is_none());
+    }
+
+    fn reply(id: &str) -> Value {
+        json!({"type": "reply", "data": {"id": id}})
+    }
+
+    #[tokio::test]
+    async fn reply_uses_cache_and_preserves_own_mention() {
+        let s = shared(99);
+        s.remember("555".into());
+        s.cache("555".into(), Quoted { name: "我".into(), text: "你好\r\n世界".into() });
+        let msg = json!([reply("555"), text("对")]);
+        let prefix = resolve_reply(msg.as_array().unwrap(), &s, |_| async { panic!("cache hit must not fetch") }).await;
+        let env = finish(super::parse_event(&group(msg), &s).unwrap(), &Forwards::new(), &s, &prefix).unwrap();
+        assert_eq!(env.text, "[回复 我: 你好 世界]对");
+        assert!(env.mentions_me);
+    }
+
+    #[tokio::test]
+    async fn reply_fetches_and_cuts_unicode_text() {
+        let s = shared(99);
+        for n in [39, 40, 41] {
+            let msg = json!([reply(&n.to_string())]);
+            let prefix = resolve_reply(msg.as_array().unwrap(), &s, |id| async move {
+                assert_eq!(id, n.to_string());
+                Ok(node("甲", json!([text(&"字".repeat(n))])))
+            })
+            .await;
+            assert_eq!(prefix, format!("[回复 甲: {}{}]", "字".repeat(n.min(40)), if n > 40 { "…" } else { "" }));
+            let env = finish(super::parse_event(&group(msg), &s).unwrap(), &Forwards::new(), &s, &prefix).unwrap();
+            assert_eq!(env.text, prefix);
+            assert!(!env.mentions_me);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_reply_keeps_body_and_reply_only_message() {
+        let s = shared(99);
+        for data in [None, Some(Value::Null), Some(json!({}))] {
+            let msg = json!([reply("123"), text("原文")]);
+            let prefix = resolve_reply(msg.as_array().unwrap(), &s, |_| {
+                let data = data.clone();
+                async move { data.ok_or_else(|| anyhow!("boom")) }
+            })
+            .await;
+            let env = finish(super::parse_event(&group(msg), &s).unwrap(), &Forwards::new(), &s, &prefix).unwrap();
+            assert_eq!(env.text, "[回复]原文");
+        }
+        let msg = json!([reply("123")]);
+        let prefix = resolve_reply(msg.as_array().unwrap(), &s, |_| async { Err(anyhow!("missing")) }).await;
+        assert_eq!(finish(super::parse_event(&group(msg), &s).unwrap(), &Forwards::new(), &s, &prefix).unwrap().text, "[回复]");
+    }
+
+    #[tokio::test]
+    async fn quoted_forwards_show_only_headers() {
+        let s = shared(99);
+        let msg = json!([reply("123")]);
+        let prefix = resolve_reply(msg.as_array().unwrap(), &s, |_| async {
+            Ok(node(
+                "甲",
+                json!([
+                    reply("555"),
+                    {"type": "forward", "data": {"id": "a", "content": [node("甲", json!([text("原文")]))]}},
+                    {"type": "forward", "data": {"id": "b"}}
+                ]),
+            ))
+        })
+        .await;
+        assert_eq!(prefix, "[回复 甲: [合并转发 1条] [合并转发]]");
+    }
+
+    #[test]
+    fn recent_messages_evict_least_recently_used_and_replace() {
+        let s = shared(99);
+        for i in 0..RECENT_MESSAGES {
+            s.cache(i.to_string(), Quoted { name: "我".into(), text: i.to_string() });
+        }
+        assert_eq!(s.cached("0").unwrap().text, "0");
+        s.cache("500".into(), Quoted { name: "我".into(), text: "new".into() });
+        assert!(s.cached("1").is_none());
+        s.cache("0".into(), Quoted { name: "我".into(), text: "updated".into() });
+        assert_eq!(s.cached("0").unwrap().text, "updated");
+        assert_eq!(s.recent.lock().unwrap().len(), RECENT_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn send_caches_each_chunk_as_me() {
+        let (tx, mut rx) = mpsc::channel::<Request>(8);
+        let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+        let respond = async {
+            for i in 0..2 {
+                let req = rx.recv().await.unwrap();
+                assert_eq!(req.action, "send_group_msg");
+                req.reply.send(Ok(json!({"message_id": i}))).unwrap();
+            }
+        };
+        let body = "字".repeat(CHUNK_CHARS + 1);
+        let (sent, ()) = tokio::join!(qq.send("group:34", &body), respond);
+        sent.unwrap();
+        for (i, len) in [(0, CHUNK_CHARS), (1, 1)] {
+            let q = qq.shared.cached(&i.to_string()).unwrap();
+            assert_eq!(q.name, "我");
+            assert_eq!(q.text, "字".repeat(len));
+            assert!(qq.shared.is_mine(&i.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn enrich_caches_envelopes_for_later_replies() {
+        let (tx, mut requests) = mpsc::channel(8);
+        let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+        let (raw_tx, raw_rx) = mpsc::channel(8);
+        let (in_tx, mut in_rx) = mpsc::channel(8);
+        raw_tx.send(super::parse_event(&group(json!([text("原文")])), &qq.shared).unwrap()).await.unwrap();
+        let mut next = group(json!([reply("1"), text("原文")]));
+        next["message_id"] = json!(2);
+        raw_tx.send(super::parse_event(&next, &qq.shared).unwrap()).await.unwrap();
+        drop(raw_tx);
+        enrich(raw_rx, qq.clone(), in_tx).await;
+        assert_eq!(in_rx.recv().await.unwrap().text, "原文");
+        assert_eq!(in_rx.recv().await.unwrap().text, "[回复 nick: 原文]原文");
+        assert!(requests.try_recv().is_err());
+        assert_eq!(qq.shared.cached("2").unwrap().text, "原文");
+    }
+
+    /// Reads one real quoted message; sends nothing.
+    #[tokio::test]
+    #[ignore = "requires NapCat with ONEBOT_URL / ONEBOT_TOKEN and REPLY_ID"]
+    async fn live_get_msg() -> Result<()> {
+        dotenvy::dotenv().ok();
+        let (tx, _rx) = mpsc::channel(8);
+        let qq = spawn(std::env::var("ONEBOT_URL")?, std::env::var("ONEBOT_TOKEN").ok(), tx);
+        let data = qq.get_message(&std::env::var("REPLY_ID")?).await?;
+        assert!(data.get("message").is_some_and(|m| m.is_array() || m.is_string()));
+        Ok(())
     }
 
     /// Reads one real merged forward, read-only: set FORWARD_ID to a forward segment's `data.id`.
