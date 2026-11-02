@@ -5,6 +5,28 @@ pub mod telegram;
 
 use anyhow::{Result, bail};
 
+/// A platform media reference; QQ URLs expire within hours.
+/// NapCat can refetch via `get_image {file}`, `get_record {file, out_format}`,
+/// or `get_file {file_id}`. References are not persisted to the store.
+#[allow(dead_code)] // Carried for future multimodal consumers.
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub kind: AttachmentKind,
+    pub url: Option<String>,
+    pub file_id: Option<String>,
+    pub name: Option<String>,
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AttachmentKind {
+    Image,
+    Sticker,
+    Voice,
+    Video,
+    File,
+}
+
 #[derive(Debug, Clone)]
 pub struct Envelope {
     /// `telegram` or `qq`.
@@ -21,6 +43,9 @@ pub struct Envelope {
     /// Someone @-ed him or replied to one of his messages.
     pub mentions_me: bool,
     pub text: String,
+    /// Top-level media references; empty when the channel supplies none.
+    #[allow(dead_code)] // Carried for future multimodal consumers.
+    pub attachments: Vec<Attachment>,
     /// When the channel received it. Messages can wait in the event queue while a reply is
     /// generated; the debounce window measures gaps from arrival, not from dequeueing.
     pub arrived: Option<tokio::time::Instant>,

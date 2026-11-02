@@ -620,7 +620,7 @@ impl Agli {
     }
 
     fn focus_ctx(&self, platform: &'static str, chat_id: &str, sender_id: &str) -> Option<ChatCtx> {
-        let env = Envelope { platform, chat_id: chat_id.into(), sender_id: sender_id.into(),
+        let env = Envelope { attachments: Vec::new(), platform, chat_id: chat_id.into(), sender_id: sender_id.into(),
             sender_name: String::new(), sender_is_bot: false, is_group: false, mentions_me: false,
             text: String::new(), message_id: None, arrived: None };
         let who = identify(&self.cfg.acl, &env);
@@ -880,6 +880,7 @@ impl Agli {
             _ => return Ok(None),
         };
         let env = Envelope {
+            attachments: Vec::new(),
             platform, chat_id: chat.chat_id.clone(), sender_id: chat.sender_id.clone(), sender_name: String::new(),
             sender_is_bot: chat.is_agent, is_group: false, mentions_me: false, text: String::new(), message_id: None, arrived: None,
         };
@@ -1903,6 +1904,7 @@ mod tests {
 
     fn inbound(chat: &str, text: &str, id: &str) -> Event {
         Event::Inbound(Envelope {
+            attachments: Vec::new(),
             platform: "telegram", chat_id: chat.into(), message_id: Some(id.into()),
             sender_id: "42".into(), sender_name: "主人".into(), sender_is_bot: false,
             is_group: false, mentions_me: false, text: text.into(), arrived: None,
