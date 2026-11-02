@@ -268,7 +268,7 @@ impl Models {
         prompt: &Prompt<'_>,
         session_id: &str,
     ) -> Result<(Reply, String)> {
-        let model = self.router.model(model_id).ok_or_else(|| anyhow!("model `{model_id}` is not available"))?.clone();
+        let model = self.router.select_for_call(scenario, policy, model_id, self.budget_exhausted())?.clone();
         match self.call_once(scenario, &model, prompt, session_id, None).await {
             Ok(r) => Ok((r, model.id)),
             Err(first) => {

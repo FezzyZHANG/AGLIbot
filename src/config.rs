@@ -76,6 +76,9 @@ pub enum Priority {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Scenario {
+    /// Optional exact model ID. Removing it restores normal Q/C/L routing.
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub q_min: f64,
     pub priority: Priority,
@@ -488,6 +491,12 @@ impl Config {
         for m in &self.models.models {
             if !self.models.providers.contains_key(&m.provider) {
                 bail!("model `{}` references unknown provider `{}`", m.id, m.provider);
+            }
+        }
+        for (name, scenario) in &self.scenarios {
+            if let Some(id) = &scenario.model {
+                anyhow::ensure!(self.models.models.iter().any(|m| &m.id == id),
+                    "scenario `{name}` pins unknown model `{id}`");
             }
         }
         for name in ["chat", "triage", "extract", "consolidate", "research_plan", "verify", "synthesize"] {

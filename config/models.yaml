@@ -10,6 +10,7 @@ daily_budget_usd: 2.0
 providers:
   anthropic:
     kind: anthropic
+    base_url_env: ANTHROPIC_BASE_URL
     api_key_env: ANTHROPIC_API_KEY
   deepseek:
     kind: openai_compat
@@ -20,39 +21,42 @@ providers:
     base_url: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
     base_url_env: BAILIAN_BASE_URL_OAI
     api_key_env: BAILIAN_API_KEY
+  gemini_relay:
+    kind: openai_compat
+    base_url_env: GEMINI_RELAY_BASE_URL
+    api_key_env: GEMINI_RELAY_API_KEY
   local:
     kind: openai_compat
     base_url: http://localhost:11434/v1   # 例如 Ollama；没跑本地模型也无妨，只是 local_only 的信息将无模型可用
 
 models:
+  # Claude 中转：只启用报价表中的非 high 5.5 型号；沿用 1 USD = 6.65 CNY 的路由估值。
+  # 折后人民币/M tokens（输入/输出/缓存读/5 分钟缓存写）：
+  # Opus ¥2.80/¥14/¥0.14/¥3.50；Sonnet ¥1.40/¥7/¥0.14/¥1.75，不再乘折扣倍率。
+  # 当前客户端使用默认 ephemeral 缓存时长；不使用报价中的 1 小时缓存价。
+  # 中转兼容性已按普通 Messages 请求检查，不启用官方 beta fallbacks 参数。
   - id: opus
     provider: anthropic
     model: claude-opus-5-5
-    q: 9.5
-    c: { input: 4.0, cached: 0.20, output: 20.0 }
+    q: 8.8
+    c: { input: 0.421053, cached: 0.021053, output: 2.105263, cache_write: 0.526316 }
     l: 3.0
-    fallbacks: default        # 服务端拒答回退（beta），Anthropic 推荐默认开启
   - id: sonnet
     provider: anthropic
     model: claude-sonnet-5-5
-    q: 8.5
-    c: { input: 2.0, cached: 0.20, output: 10.0 }
-    l: 1.5
-    fallbacks: default
-  - id: haiku
-    provider: anthropic
-    model: claude-haiku-5-5
     q: 7.0
-    c: { input: 0.10, cached: 0.01, output: 0.50 }
-    l: 0.7
-  - id: deepseek
-    provider: deepseek
-    model: deepseek-chat
-    q: 7.5
-    c: { input: 0.27, cached: 0.07, output: 1.10 }
+    c: { input: 0.210526, cached: 0.021053, output: 1.052632, cache_write: 0.263158 }
     l: 1.5
   # Token Plan 支持的模型以账户 /models 返回为准；q/l 是可调的路由估计。
-  # c 仅为路由使用的美元等效估值，不是套餐报价或 Credits 余额；请按实际消耗调整。
+  # c 统一为 USD/M tokens：以下北京区按量原价（CNY/M tokens）除以 6.65。
+  # 沿用本文件 2026-11-02 的固定估算汇率 1 USD = 6.65 CNY；非实时汇率。
+  # 2026-11-03 核对原价（输入/缓存命中/输出）：Flash ¥0.8/¥0.1/¥2.7；Max ¥12/¥1.5/¥36。
+  # DeepSeek Flash 取忙时 ¥2/¥0.2/¥8；闲时为其一半，此静态表不按时段切换。
+  # 来源：https://help.aliyun.com/zh/model-studio/qwen3-8-flash
+  #       https://help.aliyun.com/zh/model-studio/qwen3-8-max
+  #       https://help.aliyun.com/zh/model-studio/deepseek-v4-1-flash
+  # 仅为路由与预算统计的美元等效估值，不是 Token Plan 实付费用或 Credits 余额。
+  # Qwen 显式缓存创建原价：Flash ¥1.25/M、Max ¥15/M；cached 使用普通缓存命中价。
   # Qwen 思考模式使用 SSE；内部收齐正文后再发给 Telegram，不发送推理内容。
   - id: qwen-flash
     provider: bailian
@@ -60,38 +64,66 @@ models:
     stream: true
     enable_thinking: true
     q: 8.0
-    c: { input: 0.10, cached: 0.01, output: 0.50 }
+    c: { input: 0.120301, cached: 0.015038, output: 0.406015, cache_write: 0.187970 }
     l: 0.6
-  - id: qwen-plus
-    provider: bailian
-    model: qwen3.7-plus
-    stream: true
-    enable_thinking: true
-    q: 8.5
-    c: { input: 0.50, cached: 0.05, output: 2.0 }
-    l: 1.2
   - id: qwen-max
     provider: bailian
     model: qwen3.8-max
     stream: true
     enable_thinking: true
-    q: 9.5
-    c: { input: 2.0, cached: 0.20, output: 10.0 }
+    q: 8.5
+    c: { input: 1.804511, cached: 0.225564, output: 5.413534, cache_write: 2.255639 }
     l: 3.0
   - id: bailian-deepseek-flash
     provider: bailian
     model: deepseek-v4.1-flash
     stream: true
-    q: 8.5
-    c: { input: 0.27, cached: 0.07, output: 1.10 }
+    q: 8.2
+    c: { input: 0.300752, cached: 0.030075, output: 1.203008 }
     l: 1.5
-  - id: bailian-deepseek-pro
-    provider: bailian
-    model: deepseek-v4-pro
-    stream: true
-    q: 9.0
-    c: { input: 0.50, cached: 0.05, output: 2.0 }
-    l: 2.0
+  # 第三方 Gemini：按主人提供的折后实付价格计，不再乘折扣倍率。
+  # c = 人民币价格 / 6.65，单位仍为 USD/M tokens；汇率为 2026-11-02 的近似估值。
+  # 汇率参考：https://www.investing.com/currencies/usd-cny-historical-data
+  # Flash 输入/输出/缓存读取：¥0.375 / ¥1.875 / ¥0.0375；缓存写入免费。
+  # Argon 全部变体输入/输出/缓存读取：¥1 / ¥5 / ¥0.05；未提供独立缓存写入价。
+  # q/l 均为待实测的路由估计；Argon 各别名暂用相同估计，不推断档位效果。
+  # low/medium/high 作为供应商独立 model ID 原样发送，不附加 enable_thinking。
+  # 先使用非流式请求；添加到共享候选池不代表 chat 固定选用 Gemini。
+  - id: gemini-3.8-flash
+    provider: gemini_relay
+    model: gemini-3.8-flash
+    stream: false
+    q: 8.3
+    c: { input: 0.056391, cached: 0.005639, output: 0.281955, cache_write: 0 }
+    l: 1.0
+  - id: gemini-4-argon
+    provider: gemini_relay
+    model: gemini-4-argon
+    stream: false
+    q: 9.5
+    c: { input: 0.150376, cached: 0.007519, output: 0.751880 }
+    l: 3.0
+  - id: gemini-4-argon-low
+    provider: gemini_relay
+    model: gemini-4-argon-low
+    stream: false
+    q: 9.5
+    c: { input: 0.150376, cached: 0.007519, output: 0.751880 }
+    l: 3.0
+  - id: gemini-4-argon-medium
+    provider: gemini_relay
+    model: gemini-4-argon-medium
+    stream: false
+    q: 9.5
+    c: { input: 0.150376, cached: 0.007519, output: 0.751880 }
+    l: 3.0
+  - id: gemini-4-argon-high
+    provider: gemini_relay
+    model: gemini-4-argon-high
+    stream: false
+    q: 9.5
+    c: { input: 0.150376, cached: 0.007519, output: 0.751880 }
+    l: 3.0
   - id: local
     provider: local
     model: qwen3:8b

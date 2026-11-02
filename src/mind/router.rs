@@ -61,6 +61,14 @@ impl Router {
 
     pub fn select(&self, scenario: &str, policy: &ProcessingPolicy, budget_exhausted: bool) -> Result<&ModelEntry> {
         let sc = self.scenario(scenario)?;
+        if let Some(id) = &sc.model {
+            anyhow::ensure!(!budget_exhausted || sc.budget_exempt,
+                "scenario `{scenario}` is pinned to `{id}` but its daily budget is exhausted");
+            let model = self.model(id).ok_or_else(|| anyhow!("pinned model `{id}` is not available for scenario `{scenario}`"))?;
+            anyhow::ensure!(policy.allows(model), "pinned model `{id}` is not allowed by {policy:?}");
+            anyhow::ensure!(model.q >= sc.q_min, "pinned model `{id}` does not meet scenario `{scenario}` Q floor {}", sc.q_min);
+            return Ok(model);
+        }
         let front = self.front(sc, policy);
         if front.is_empty() {
             bail!("no model satisfies scenario `{scenario}` (q_min {}) under {policy:?}", sc.q_min);
@@ -70,9 +78,20 @@ impl Router {
         pick.ok_or_else(|| anyhow!("empty Pareto front for `{scenario}`"))
     }
 
+    /// Recheck an explicit scenario pin at the call boundary, including cached sessions.
+    /// Unpinned sessions retain their existing model until normal session rotation.
+    pub fn select_for_call(&self, scenario: &str, policy: &ProcessingPolicy, session_model: &str, budget_exhausted: bool) -> Result<&ModelEntry> {
+        if self.scenario(scenario)?.model.is_some() {
+            self.select(scenario, policy, budget_exhausted)
+        } else {
+            self.model(session_model).ok_or_else(|| anyhow!("model `{session_model}` is not available"))
+        }
+    }
+
     /// The next model up in Q on the Pareto front, for escalation after a failure.
     pub fn next_stronger(&self, scenario: &str, policy: &ProcessingPolicy, current_id: &str) -> Option<&ModelEntry> {
         let sc = self.scenario(scenario).ok()?;
+        if sc.model.is_some() { return None; }
         let current_q = self.model(current_id)?.q;
         self.front(sc, policy)
             .into_iter()
@@ -133,7 +152,7 @@ mod tests {
     }
 
     fn scenario(q_min: f64, priority: Priority, budget_exempt: bool) -> Scenario {
-        Scenario { q_min, priority, review: false, budget_exempt, effort: None }
+        Scenario { model: None, q_min, priority, review: false, budget_exempt, effort: None }
     }
 
     /// The 4-row sample table from docs/DESIGN.md 5b, plus one deliberately dominated row.
@@ -162,6 +181,64 @@ mod tests {
         assert_eq!(r.select("chat", &any, false).unwrap().id, "cheap");
         assert_eq!(r.select("extract", &any, false).unwrap().id, "local");
         assert_eq!(r.select("verify", &any, false).unwrap().id, "top");
+    }
+
+    #[test]
+    fn scenario_pin_selects_exact_alias_even_when_dominated_and_does_not_change_other_scenarios() {
+        let mut r = router();
+        r.models.extend([
+            model("argon", "a", 9.5, 0.1, 0.5, 3.0, false),
+            model("argon-low", "a", 9.5, 0.1, 0.5, 3.0, false),
+            model("argon-medium", "a", 9.5, 0.1, 0.5, 3.0, false),
+            model("argon-high", "a", 9.5, 0.1, 0.5, 3.0, false),
+        ]);
+        let any = ProcessingPolicy::Any;
+        let research = r.select("research", &any, false).unwrap().id.clone();
+        r.scenarios.get_mut("chat").unwrap().model = Some("argon-medium".into());
+        assert_eq!(r.select("chat", &any, false).unwrap().id, "argon-medium");
+        assert_eq!(r.select("research", &any, false).unwrap().id, research);
+        r.scenarios.get_mut("chat").unwrap().model = Some("dominated".into());
+        assert_eq!(r.select("chat", &any, false).unwrap().id, "dominated");
+        r.scenarios.get_mut("chat").unwrap().model = None;
+        assert_eq!(r.select("chat", &any, false).unwrap().id, "cheap");
+    }
+
+    #[test]
+    fn pin_rejects_missing_unavailable_policy_and_q_failures_without_escalation() {
+        let mut r = router();
+        let any = ProcessingPolicy::Any;
+        r.scenarios.get_mut("chat").unwrap().model = Some("missing-or-disabled".into());
+        assert!(r.select("chat", &any, false).is_err());
+        r.scenarios.get_mut("chat").unwrap().model = Some("local".into());
+        assert!(r.select("chat", &any, false).is_err());
+        r.scenarios.get_mut("chat").unwrap().model = Some("mid".into());
+        assert!(r.select("chat", &ProcessingPolicy::LocalOnly, false).is_err());
+        assert!(r.select("chat", &ProcessingPolicy::Providers { names: vec!["b".into()] }, false).is_err());
+        assert!(r.next_stronger("chat", &any, "mid").is_none());
+        r.scenarios.get_mut("chat").unwrap().model = None;
+        assert_eq!(r.next_stronger("chat", &any, "mid").unwrap().id, "top");
+    }
+
+    #[test]
+    fn pin_is_rechecked_for_cached_session_and_budget() {
+        let mut r = router();
+        let any = ProcessingPolicy::Any;
+        r.scenarios.get_mut("chat").unwrap().model = Some("mid".into());
+        assert_eq!(r.select_for_call("chat", &any, "cheap", false).unwrap().id, "mid");
+        assert!(r.select_for_call("chat", &any, "cheap", true).is_err());
+        assert!(r.select_for_call("chat", &ProcessingPolicy::LocalOnly, "mid", false).is_err());
+        r.scenarios.get_mut("chat").unwrap().budget_exempt = true;
+        assert_eq!(r.select_for_call("chat", &any, "cheap", true).unwrap().id, "mid");
+        r.scenarios.get_mut("chat").unwrap().model = None;
+        assert_eq!(r.select_for_call("chat", &any, "mid", false).unwrap().id, "mid");
+    }
+
+    #[test]
+    fn scenario_pin_yaml_is_optional_and_exact() {
+        let old: Scenario = serde_yaml::from_str("q_min: 6\npriority: fast\neffort: low\n").unwrap();
+        assert!(old.model.is_none());
+        let pin: Scenario = serde_yaml::from_str("q_min: 6\npriority: fast\nmodel: gemini-4-argon-medium\n").unwrap();
+        assert_eq!(pin.model.as_deref(), Some("gemini-4-argon-medium"));
     }
 
     #[test]
@@ -205,9 +282,12 @@ mod tests {
     #[test]
     fn bailian_alone_covers_repo_scenarios() {
         let cfg = crate::config::Config::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let full = Router::new(cfg.models.models.clone(), cfg.scenarios.clone());
         let models = cfg.models.models.into_iter().filter(|m| m.provider == "bailian").collect();
         let r = Router::new(models, cfg.scenarios);
-        for name in r.scenarios.keys() {
+        // `evolve` is owner-triggered and falls back to owner review, so it may need a non-bailian model.
+        assert!(full.select("evolve", &ProcessingPolicy::Any, false).is_ok());
+        for name in r.scenarios.keys().filter(|n| *n != "evolve") {
             for exhausted in [false, true] {
                 assert_eq!(r.select(name, &ProcessingPolicy::Any, exhausted).unwrap().provider, "bailian");
             }
