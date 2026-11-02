@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
-use crate::channels::{Envelope, Outlets};
+use crate::channels::{Envelope, Outlets, ReplyPiece, reply_prefix, reply_text};
 use crate::config::{AclCfg, Config, DebounceCfg, HandsCfg, SessionCfg};
 use crate::mind::context::{RecapLine, build_l1, build_l2, read_opt, tail, user_turn};
 use crate::mind::decide::{self, Action, Situation};
@@ -253,6 +253,7 @@ pub fn next_work(queue: &mut WorkQueue, acl: &AclCfg, session: &SessionCfg) -> O
 #[derive(Debug, Default, PartialEq)]
 pub struct Intent {
     pub text: String,
+    pub pieces: Vec<ReplyPiece>,
     pub silent: bool,
     pub tasks: Vec<(TaskKind, String)>,
     pub relay: Option<String>,
@@ -284,9 +285,53 @@ pub fn parse_intent(raw: &str) -> Intent {
         let id = attrs.trim().strip_prefix("任务=\"").and_then(|s| s.strip_suffix('"')).unwrap_or_default();
         followups.push((id.to_string(), body));
     }
-    let text = text.trim().to_string();
+    let pieces = parse_mentions(text.trim());
+    let text = reply_text(&pieces);
     let silent = text.is_empty() || text == "[沉默]" || text == "[不发]";
-    Intent { text, silent, tasks, relay, followups }
+    Intent { text, pieces, silent, tasks, relay, followups }
+}
+
+fn parse_mentions(text: &str) -> Vec<ReplyPiece> {
+    let (open, close) = ("<提及>", "</提及>");
+    let mut pieces = Vec::new();
+    let (mut literal, mut cursor) = (0, 0);
+    while let Some(start) = text[cursor..].find(open).map(|i| cursor + i) {
+        let body = start + open.len();
+        let Some(end) = text[body..].find(close).map(|i| body + i) else { break };
+        cursor = end + close.len();
+        let name = text[body..end].trim();
+        // Empty, nested or multiline tags are malformed and stay entirely literal.
+        if name.is_empty() || text[body..end].contains(['<', '>', '\n', '\r']) { continue; }
+        if start > literal { pieces.push(ReplyPiece::Text(text[literal..start].into())); }
+        pieces.push(ReplyPiece::Mention { name: name.into(), qq_id: None });
+        literal = cursor;
+    }
+    if literal < text.len() { pieces.push(ReplyPiece::Text(text[literal..].into())); }
+    pieces
+}
+
+/// Resolve only against this chat's recent speakers, never against arbitrary QQ ids in prose.
+fn resolve_mentions(pieces: &mut [ReplyPiece], ctx: &ChatCtx, speakers: &[String], people: &People, self_id: i64) {
+    let mut resolved = 0;
+    for piece in pieces {
+        let ReplyPiece::Mention { name, qq_id } = piece else { continue };
+        *qq_id = None;
+        if ctx.platform != "qq" || !ctx.is_group || !ctx.chat_id.starts_with("group:") { continue; }
+        let matches: Vec<_> = speakers.iter().filter_map(|id| people.get(id))
+            .filter(|person| person.name == *name).collect();
+        let target = if let [person] = matches.as_slice() {
+            let ids: HashSet<i64> = person.platform_ids.iter().filter_map(|id| id.strip_prefix("qq:"))
+                .filter_map(|id| id.parse().ok()).collect();
+            if ids.len() == 1 { ids.into_iter().next() } else { None }
+        } else { None };
+        if resolved < 2 && name != "all" && name != "全体成员" && self_id > 0
+            && let Some(id) = target.filter(|id| *id > 0 && *id != self_id) {
+            *qq_id = Some(id);
+            resolved += 1;
+        } else {
+            debug!(chat = %ctx.key, %name, matches = matches.len(), "mention left as plain text: no unique eligible target or reply limit reached");
+        }
+    }
 }
 
 /// Short multi-paragraph replies go out as separate bubbles, like texting.
@@ -297,6 +342,12 @@ pub fn bubbles(text: &str) -> Vec<String> {
     } else {
         vec![text.trim().to_string()]
     }
+}
+
+fn reply_bubbles(pieces: &[ReplyPiece]) -> Vec<Vec<ReplyPiece>> {
+    bubbles(&reply_text(pieces)).into_iter().enumerate().map(|(i, text)| {
+        if i == 0 { reply_prefix(pieces, text.len()) } else { vec![ReplyPiece::Text(text)] }
+    }).collect()
 }
 
 /// Return the total units and the UTF-8 end of the longest prefix within the cap.
@@ -405,11 +456,12 @@ fn attach_followups(board: &mut Board, ctx: &ChatCtx, intent: &mut Intent) {
             }
         };
         if intent.silent {
-            intent.text.clear();
+            intent.pieces.clear();
         } else {
-            intent.text.push('\n');
+            intent.pieces.push(ReplyPiece::Text("\n".into()));
         }
-        intent.text.push_str(&reply);
+        intent.pieces.push(ReplyPiece::Text(reply));
+        intent.text = reply_text(&intent.pieces);
         intent.silent = false;
     }
 }
@@ -1128,14 +1180,18 @@ impl Agli {
             info!("chose not to speak in {}", ctx.key);
             return Ok(());
         }
-        intent.text = self.cap_group_reply(ctx, unsolicited, &policy, intent.text).await;
+        intent.pieces = self.cap_group_reply(ctx, unsolicited, &policy, intent.pieces).await;
+        intent.text = reply_text(&intent.pieces);
         if intent.text.is_empty() { return Ok(()) }
         if ctx.is_group {
             self.floor.spoke(&ctx.key, unsolicited, now);
         }
         // Claim only after successful generation, before delivery. Uncertain sends are never retried.
         if let Some(key) = claim { self.store.kv_set(key, json!(true))?; }
-        let outcome = self.send_bubbles(ctx, &intent.text).await;
+        let speakers = self.speakers.get(&ctx.key).map(Vec::as_slice).unwrap_or_default();
+        let self_id = self.outlets.qq.as_ref().map_or(0, |qq| qq.self_id());
+        resolve_mentions(&mut intent.pieces, ctx, speakers, &self.people, self_id);
+        let outcome = self.send_bubbles(ctx, &intent.pieces).await;
         if unsolicited {
             self.audit("me", "group_chime_in", true, &ctx.key, outcome)?;
         }
@@ -1162,11 +1218,12 @@ impl Agli {
         Ok(())
     }
 
-    async fn cap_group_reply(&self, ctx: &ChatCtx, unsolicited: bool, policy: &ProcessingPolicy, mut text: String) -> String {
-        if !ctx.is_group { return text }
+    async fn cap_group_reply(&self, ctx: &ChatCtx, unsolicited: bool, policy: &ProcessingPolicy, mut pieces: Vec<ReplyPiece>) -> Vec<ReplyPiece> {
+        if !ctx.is_group { return pieces }
+        let mut text = reply_text(&pieces);
         let cap = if unsolicited { self.cfg.social.interjection_max } else { self.cfg.social.group_reply_max };
         let (units, _) = measure_reply(&text, cap);
-        if units <= cap { return text }
+        if units <= cap { return pieces }
         info!(chat = %ctx.key, units, cap, "group reply over cap; rewriting once");
         let user = format!("太长了，压到 {cap} 以内重说。汉字每字计 1，其他连续字母或数字计 1，标点不计。只输出改写后的正文。\n\n{text}");
         #[cfg(test)]
@@ -1184,32 +1241,44 @@ impl Agli {
         match rewrite {
             Ok(raw) => {
                 let intent = parse_intent(&raw);
-                if !intent.silent { text = intent.text; }
+                if !intent.silent {
+                    text = intent.text;
+                    pieces = intent.pieces;
+                }
             }
             Err(e) => warn!(chat = %ctx.key, "group reply rewrite failed: {e:#}"),
         }
         let (units, _) = measure_reply(&text, cap);
         if units > cap {
             warn!(chat = %ctx.key, units, cap, "group reply still over cap; truncating");
-            text = truncate_reply(&text, cap);
+            let truncated = truncate_reply(&text, cap);
+            if text.starts_with(&truncated) {
+                pieces = reply_prefix(&pieces, truncated.len());
+            } else {
+                // truncate_reply adds an ellipsis only after a literal prefix.
+                pieces = reply_prefix(&pieces, truncated.len() - '…'.len_utf8());
+                pieces.push(ReplyPiece::Text("…".into()));
+            }
         }
-        text
+        pieces
     }
 
-    async fn send_bubbles(&self, ctx: &ChatCtx, text: &str) -> Outcome {
+    async fn send_bubbles(&self, ctx: &ChatCtx, pieces: &[ReplyPiece]) -> Outcome {
+        #[cfg(test)]
+        let text = reply_text(pieces);
         let reply_to = if ctx.is_group { ctx.message_id.as_deref() } else { None };
         #[cfg(test)]
         if let Some(test) = &self.test_chat {
             test.sent_texts.lock().unwrap().push(text.to_string());
-            test.reply_targets.lock().unwrap().extend(bubbles(text).iter().enumerate()
+            test.reply_targets.lock().unwrap().extend(bubbles(&text).iter().enumerate()
                 .map(|(i, _)| if i == 0 { reply_to.map(str::to_owned) } else { None }));
             return test.sends.lock().unwrap().pop_front().expect("unexpected send");
         }
-        for (i, b) in bubbles(text).iter().enumerate() {
+        for (i, body) in reply_bubbles(pieces).iter().enumerate() {
             if i > 0 {
                 tokio::time::sleep(Duration::from_millis(700)).await;
             }
-            if let Err(e) = self.outlets.send_reply(ctx.platform, &ctx.chat_id, b, if i == 0 { reply_to } else { None }).await {
+            if let Err(e) = self.outlets.send_reply(ctx.platform, &ctx.chat_id, body, if i == 0 { reply_to } else { None }).await {
                 error!("send failed: {e:#}");
                 return if i == 0 { Outcome::Failed } else { Outcome::Unknown };
             }
@@ -2773,7 +2842,8 @@ mod tests {
             a.test_chat = Some(TestChat::new(&[], &[]));
             let chat = a.test_chat.as_ref().unwrap();
             chat.rewrites.lock().unwrap().push_back(rewrite);
-            let result = a.cap_group_reply(&ctx, false, &ProcessingPolicy::LocalOnly, "原文也很长".into()).await;
+            let result = reply_text(&a.cap_group_reply(&ctx, false, &ProcessingPolicy::LocalOnly,
+                vec![ReplyPiece::Text("原文也很长".into())]).await);
             assert_eq!(result, expected);
             assert!(measure_reply(&result, 3).0 <= 3);
             let prompts = chat.rewrite_prompts.lock().unwrap();
@@ -4108,6 +4178,110 @@ mod tests {
         assert!(!b.task_dir(&t.id).join("followups.md").exists());
         assert!(b.get(&t.id).unwrap().threads.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mention_markers_preserve_position_and_plain_text() {
+        let i = parse_intent("  先说<提及>小明</提及>，再问<提及>小红</提及><提及>小蓝</提及>。<任务>查资料</任务> ");
+        assert_eq!(i.text, "先说@小明，再问@小红@小蓝。");
+        assert_eq!(i.pieces, vec![
+            ReplyPiece::Text("先说".into()),
+            ReplyPiece::Mention { name: "小明".into(), qq_id: None },
+            ReplyPiece::Text("，再问".into()),
+            ReplyPiece::Mention { name: "小红".into(), qq_id: None },
+            ReplyPiece::Mention { name: "小蓝".into(), qq_id: None },
+            ReplyPiece::Text("。".into()),
+        ]);
+        assert_eq!(reply_text(&i.pieces), i.text);
+        assert_eq!(i.tasks.len(), 1);
+        assert!(!i.silent);
+        for raw in ["[CQ:at,qq=42] @小明", "<提及>小明", "小明</提及>", "<提及 >小明</提及>",
+            "<提及 name=\"小明\">小明</提及>", "<提及>小明</提及 >", "<提及></提及>",
+            "<提及> \n </提及>", "<提及>小\n明</提及>", "<提及><提及>小明</提及></提及>"] {
+            let i = parse_intent(raw);
+            assert_eq!(i.text, raw);
+            assert_eq!(i.pieces, [ReplyPiece::Text(raw.into())]);
+        }
+        let mixed = parse_intent("<提及></提及><提及>小明</提及>");
+        assert_eq!(mixed.text, "<提及></提及>@小明");
+        assert!(matches!(&mixed.pieces[1], ReplyPiece::Mention { name, .. } if name == "小明"));
+    }
+
+    #[tokio::test]
+    async fn mention_resolution_is_unique_recent_group_only_and_capped() {
+        let mut test = TestAgli::new("mentions").await;
+        let a = &mut test.agli;
+        Arc::make_mut(&mut a.cfg).social.groups = vec!["qq:7".into()];
+        let names = ["小明", "重名", "重名", "自己", "小红", "小蓝", "all", "全体成员"];
+        let envs = group_messages(&["hi"; 8], true).into_iter().enumerate().map(|(i, mut e)| {
+            e.platform = "qq";
+            e.chat_id = "group:7".into();
+            e.sender_name = names[i].into();
+            e
+        }).collect();
+        let mut ctx = a.prepare_messages(envs).await.ctx.unwrap();
+        let speakers = &a.speakers[&ctx.key];
+        let raw = "<提及>未知</提及><提及>重名</提及><提及>自己</提及><提及>all</提及><提及>全体成员</提及>\
+            <提及>小明</提及> / <提及>小红</提及> / <提及>小蓝</提及>";
+        let mut i = parse_intent(raw);
+        resolve_mentions(&mut i.pieces, &ctx, speakers, &a.people, 103);
+        let targets = |pieces: &[ReplyPiece]| pieces.iter().filter_map(|p| match p {
+            ReplyPiece::Mention { qq_id: Some(id), .. } => Some(*id), _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(targets(&i.pieces), [100, 104]);
+        assert_eq!(reply_text(&i.pieces), i.text);
+        // A known person outside the recent speakers of this chat is not addressable.
+        resolve_mentions(&mut i.pieces, &ctx, &speakers[1..], &a.people, 103);
+        assert_eq!(targets(&i.pieces), [104, 105]);
+        resolve_mentions(&mut i.pieces, &ctx, speakers, &a.people, 0);
+        assert!(targets(&i.pieces).is_empty());
+        ctx.is_group = false;
+        resolve_mentions(&mut i.pieces, &ctx, speakers, &a.people, 103);
+        assert!(targets(&i.pieces).is_empty());
+        ctx.is_group = true;
+        ctx.platform = "telegram";
+        resolve_mentions(&mut i.pieces, &ctx, speakers, &a.people, 103);
+        assert!(targets(&i.pieces).is_empty());
+        // Owner identity can differ from the platform id; read the stored QQ mapping.
+        ctx.platform = "qq";
+        a.people.ensure(a.store.as_ref(), "linked-owner", "主人", Tier::Owner).unwrap();
+        let mut person = a.people.get("linked-owner").unwrap().clone();
+        person.platform_ids = vec!["telegram:42".into(), "qq:777".into()];
+        a.people.save(a.store.as_ref(), person).unwrap();
+        let mut i = parse_intent("<提及>主人</提及>");
+        resolve_mentions(&mut i.pieces, &ctx, &["linked-owner".into()], &a.people, 103);
+        assert_eq!(targets(&i.pieces), [777]);
+    }
+
+    #[test]
+    fn mentions_only_survive_in_first_bubble_and_complete_prefixes() {
+        let i = parse_intent("<提及>小明</提及>，好。\n\n<提及>小红</提及>，收到。");
+        let bodies = reply_bubbles(&i.pieces);
+        assert_eq!(bodies.len(), 2);
+        assert!(matches!(&bodies[0][0], ReplyPiece::Mention { name, .. } if name == "小明"));
+        assert_eq!(bodies[1], [ReplyPiece::Text("@小红，收到。".into())]);
+        assert_eq!(reply_prefix(&i.pieces, "@小".len()), [ReplyPiece::Text("@小".into())]);
+        assert_eq!(reply_prefix(&i.pieces, "@小明".len()), [i.pieces[0].clone()]);
+    }
+
+    #[tokio::test]
+    async fn mention_pieces_survive_caps_without_parsing_plain_at_names() {
+        let mut test = TestAgli::new("mention-caps").await;
+        let a = &mut test.agli;
+        Arc::make_mut(&mut a.cfg).social.group_reply_max = 3;
+        let ctx = a.prepare_messages(group_messages(&["hi"], true)).await.ctx.unwrap();
+        a.test_chat = Some(TestChat::new(&[], &[]));
+        for (rewrite, expected, mention) in [
+            (Err(anyhow::anyhow!("offline")), "@小明，答…", true),
+            (Ok("<提及>小红</提及>，好。".into()), "@小红，好。", true),
+            (Ok("@小明，好。".into()), "@小明，好。", false),
+        ] {
+            a.test_chat.as_ref().unwrap().rewrites.lock().unwrap().push_back(rewrite);
+            let pieces = a.cap_group_reply(&ctx, false, &ProcessingPolicy::LocalOnly,
+                parse_intent("<提及>小明</提及>，答复很长").pieces).await;
+            assert_eq!(reply_text(&pieces), expected);
+            assert_eq!(pieces.iter().any(|p| matches!(p, ReplyPiece::Mention { .. })), mention);
+        }
     }
 
     #[test]

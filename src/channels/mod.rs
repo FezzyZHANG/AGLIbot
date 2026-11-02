@@ -3,7 +3,47 @@
 pub mod qq;
 pub mod telegram;
 
+use std::borrow::Cow;
+
 use anyhow::{Result, bail};
+
+/// Explicit reply markup only; ordinary prose and CQ codes always remain text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyPiece {
+    Text(String),
+    Mention { name: String, qq_id: Option<i64> },
+}
+
+impl ReplyPiece {
+    pub fn plain(&self) -> Cow<'_, str> {
+        match self {
+            Self::Text(text) => Cow::Borrowed(text),
+            Self::Mention { name, .. } => Cow::Owned(format!("@{name}")),
+        }
+    }
+}
+
+/// The shared rendering for Telegram, storage, size limits and QQ fallbacks.
+pub fn reply_text(pieces: &[ReplyPiece]) -> String {
+    pieces.iter().map(ReplyPiece::plain).collect()
+}
+
+/// A UTF-8 byte prefix of the plain rendering. A cut mention becomes literal text.
+pub fn reply_prefix(pieces: &[ReplyPiece], mut end: usize) -> Vec<ReplyPiece> {
+    let mut prefix = Vec::new();
+    for piece in pieces {
+        if end == 0 { break; }
+        let plain = piece.plain();
+        if plain.len() <= end {
+            prefix.push(piece.clone());
+            end -= plain.len();
+        } else {
+            prefix.push(ReplyPiece::Text(plain[..end].to_string()));
+            break;
+        }
+    }
+    prefix
+}
 
 /// A platform media reference; QQ URLs expire within hours.
 /// NapCat can refetch via `get_image {file}`, `get_record {file, out_format}`,
@@ -74,21 +114,21 @@ pub struct Outlets {
 
 impl Outlets {
     pub async fn send(&self, platform: &str, chat_id: &str, text: &str) -> Result<()> {
-        self.send_reply(platform, chat_id, text, None).await
+        if let ("qq", Some(qq)) = (platform, &self.qq) {
+            return qq.send(chat_id, text).await;
+        }
+        self.send_reply(platform, chat_id, &[ReplyPiece::Text(text.into())], None).await
     }
 
     /// Telegram currently ignores the optional reply target.
-    pub async fn send_reply(&self, platform: &str, chat_id: &str, text: &str, reply_to: Option<&str>) -> Result<()> {
+    pub async fn send_reply(&self, platform: &str, chat_id: &str, pieces: &[ReplyPiece], reply_to: Option<&str>) -> Result<()> {
         match platform {
             "telegram" => match &self.telegram {
-                Some(tg) => tg.send(chat_id, text).await,
+                Some(tg) => tg.send(chat_id, &reply_text(pieces)).await,
                 None => bail!("telegram is not connected"),
             },
             "qq" => match &self.qq {
-                Some(qq) => match reply_to {
-                    Some(id) => qq.send_reply(chat_id, text, Some(id)).await,
-                    None => qq.send(chat_id, text).await,
-                },
+                Some(qq) => qq.send_reply(chat_id, pieces, reply_to).await,
                 None => bail!("qq is not connected"),
             },
             other => bail!("unknown platform {other}"),

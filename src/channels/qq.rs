@@ -55,7 +55,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{info, warn};
 
-use super::{Attachment, AttachmentKind, Envelope};
+use super::{Attachment, AttachmentKind, Envelope, ReplyPiece, reply_prefix, reply_text};
 
 const CHUNK_CHARS: usize = 1500;
 const ACTION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -194,6 +194,10 @@ async fn enrich(mut raw: mpsc::Receiver<Pending>, qq: QqHandle, inbound: mpsc::S
 }
 
 impl QqHandle {
+    pub fn self_id(&self) -> i64 {
+        self.shared.self_id.load(Ordering::Relaxed)
+    }
+
     async fn call(&self, action: &'static str, params: Value) -> Result<Value> {
         let (reply, rx) = oneshot::channel();
         self.tx.send(Request { action, params, reply }).await.map_err(|_| anyhow!("qq task stopped"))?;
@@ -206,17 +210,18 @@ impl QqHandle {
     /// `chat_id` is `private:<user>` or `group:<group>`. Text goes as a text segment, so CQ codes
     /// in model output are never interpreted.
     pub async fn send(&self, chat_id: &str, text: &str) -> Result<()> {
-        self.send_reply(chat_id, text, None).await
+        self.send_reply(chat_id, &[ReplyPiece::Text(text.into())], None).await
     }
 
-    pub async fn send_reply(&self, chat_id: &str, text: &str, reply_to: Option<&str>) -> Result<()> {
+    pub async fn send_reply(&self, chat_id: &str, pieces: &[ReplyPiece], reply_to: Option<&str>) -> Result<()> {
         let (action, forward_action, key, id) = match chat_id.split_once(':') {
             Some(("private", id)) => ("send_private_msg", "send_private_forward_msg", "user_id", id),
             Some(("group", id)) => ("send_group_msg", "send_group_forward_msg", "group_id", id),
             _ => bail!("bad qq chat id `{chat_id}`"),
         };
         let id: i64 = id.parse().with_context(|| format!("bad qq chat id `{chat_id}`"))?;
-        let chunks = super::telegram::chunks(text, CHUNK_CHARS);
+        let text = reply_text(pieces);
+        let chunks = super::telegram::chunks(&text, CHUNK_CHARS);
         if chunks.len() > 2 {
             let nickname = self.nickname().await;
             let params = forward_params(key, id, self.shared.self_id.load(Ordering::Relaxed), &nickname, &chunks);
@@ -229,15 +234,15 @@ impl QqHandle {
             }
         }
         for (i, chunk) in chunks.iter().enumerate() {
-            let mut message = Vec::new();
-            if i == 0 && key == "group_id" && let Some(target) = reply_to {
+            let quote = if i == 0 && key == "group_id" && let Some(target) = reply_to {
                 let last = self.shared.last_inbound.lock().unwrap_or_else(|e| e.into_inner());
-                if last.get(chat_id).and_then(|id| id.as_deref()) != Some(target) {
-                    message.push(json!({"type": "reply", "data": {"id": target}}));
-                }
-            }
-            message.push(json!({"type": "text", "data": {"text": chunk}}));
-            let data = self.call(action, json!({key: id, "message": message})).await?;
+                (last.get(chat_id).and_then(|id| id.as_deref()) != Some(target)).then_some(target)
+            } else { None };
+            // Forward messages (including failure fallback) and later chunks stay plain.
+            let body = if i == 0 && chunks.len() <= 2 {
+                reply_prefix(pieces, chunk.len())
+            } else { vec![ReplyPiece::Text(chunk.clone())] };
+            let data = self.call(action, reply_params(key, id, self.self_id(), &body, quote)).await?;
             self.cache_sent(&data, chunk);
         }
         Ok(())
@@ -275,6 +280,31 @@ impl QqHandle {
             _ => bail!("get_forward_msg returned no messages: {data}"),
         }
     }
+}
+
+fn reply_params(key: &str, id: i64, self_id: i64, pieces: &[ReplyPiece], quote: Option<&str>) -> Value {
+    let mut message = Vec::new();
+    if key == "group_id" && let Some(target) = quote {
+        message.push(json!({"type": "reply", "data": {"id": target}}));
+    }
+    let (mut text, mut mentions) = (String::new(), 0);
+    for piece in pieces {
+        if key == "group_id" && mentions < 2 && self_id > 0
+            && let ReplyPiece::Mention { qq_id: Some(qq), .. } = piece
+            && *qq > 0 && *qq != self_id {
+            if !text.is_empty() {
+                message.push(json!({"type": "text", "data": {"text": std::mem::take(&mut text)}}));
+            }
+            message.push(json!({"type": "at", "data": {"qq": qq.to_string()}}));
+            mentions += 1;
+        } else {
+            text.push_str(&piece.plain());
+        }
+    }
+    if !text.is_empty() {
+        message.push(json!({"type": "text", "data": {"text": text}}));
+    }
+    json!({key: id, "message": message})
 }
 
 /// Only explicit text segments: model output cannot create CQ segments.
@@ -900,6 +930,10 @@ mod tests {
         json!({"type": "text", "data": {"text": t}})
     }
 
+    fn at(id: &str) -> Value {
+        json!({"type": "at", "data": {"qq": id}})
+    }
+
     /// A node as `get_forward_msg` returns it: a whole message.
     fn node(name: &str, message: Value) -> Value {
         json!({"user_id": 7, "sender": {"user_id": 7, "nickname": name, "card": ""}, "message_format": "array", "message": message})
@@ -1257,10 +1291,82 @@ mod tests {
                     req.reply.send(Ok(json!({"message_id": i}))).unwrap();
                 }
             };
-            let (sent, ()) = tokio::join!(qq.send_reply(chat, &body, target), respond);
+            let pieces = [ReplyPiece::Text(body.clone())];
+            let (sent, ()) = tokio::join!(qq.send_reply(chat, &pieces, target), respond);
             sent.unwrap();
             assert!(rx.try_recv().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn mention_segments_keep_order_quotes_and_first_chunk_only() {
+        for (chat, last, quoted) in [("group:34", "2", true), ("group:34", "1", false), ("private:34", "2", false)] {
+            let (tx, mut rx) = mpsc::channel::<Request>(8);
+            let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+            qq.shared.last_inbound.lock().unwrap().insert(chat.into(), Some(last.into()));
+            let pieces = vec![
+                ReplyPiece::Text("先说：".into()),
+                ReplyPiece::Mention { name: "小明".into(), qq_id: Some(42) },
+                ReplyPiece::Text("，再问".into()),
+                ReplyPiece::Mention { name: "小红".into(), qq_id: Some(43) },
+                ReplyPiece::Text(format!("[CQ:at,qq=44] @原样{}", "字".repeat(CHUNK_CHARS))),
+                ReplyPiece::Mention { name: "后面".into(), qq_id: Some(44) },
+            ];
+            let plain = reply_text(&pieces);
+            let chunks = super::super::telegram::chunks(&plain, CHUNK_CHARS);
+            let respond = async {
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let req = rx.recv().await.unwrap();
+                    let mut expected = if i == 0 && chat.starts_with("group:") {
+                        vec![text("先说："), at("42"), text("，再问"), at("43"), text(&chunk["先说：@小明，再问@小红".len()..])]
+                    } else { vec![text(chunk)] };
+                    if quoted && i == 0 { expected.insert(0, reply("1")); }
+                    assert_eq!(req.params["message"], json!(expected));
+                    req.reply.send(Ok(json!({"message_id": i}))).unwrap();
+                }
+            };
+            let (sent, ()) = tokio::join!(qq.send_reply(chat, &pieces, Some("1")), respond);
+            sent.unwrap();
+            assert!(rx.try_recv().is_err());
+            assert_eq!(qq.shared.cached("0").unwrap().text, chunks[0]);
+        }
+    }
+
+    #[test]
+    fn mention_params_enforce_private_self_invalid_and_two_mention_limits() {
+        let pieces = vec![
+            ReplyPiece::Mention { name: "自己".into(), qq_id: Some(99) },
+            ReplyPiece::Mention { name: "all".into(), qq_id: None },
+            ReplyPiece::Mention { name: "坏id".into(), qq_id: Some(-1) },
+            ReplyPiece::Mention { name: "零".into(), qq_id: Some(0) },
+            ReplyPiece::Mention { name: "未知".into(), qq_id: None },
+            ReplyPiece::Mention { name: "小明".into(), qq_id: Some(42) },
+            ReplyPiece::Mention { name: "小红".into(), qq_id: Some(43) },
+            ReplyPiece::Mention { name: "小蓝".into(), qq_id: Some(44) },
+        ];
+        assert_eq!(reply_params("group_id", 34, 99, &pieces, None), json!({"group_id":34, "message":[
+            text("@自己@all@坏id@零@未知"), at("42"), at("43"), text("@小蓝")
+        ]}));
+        assert_eq!(reply_params("user_id", 34, 99, &pieces, Some("1")),
+            json!({"user_id":34, "message":[text(&reply_text(&pieces))]}));
+        assert_eq!(reply_params("group_id", 34, 0, &pieces, None),
+            json!({"group_id":34, "message":[text(&reply_text(&pieces))]}));
+        let cut = reply_prefix(&[ReplyPiece::Mention { name: "小明".into(), qq_id: Some(42) }], "@小".len());
+        assert_eq!(reply_params("group_id", 34, 99, &cut, None), json!({"group_id":34, "message":[text("@小")]}));
+    }
+
+    /// Manual live-shaped payload preview; builds parameters only, with no socket or credentials.
+    #[test]
+    #[ignore = "manual mention params preview, sends nothing"]
+    fn live_build_mention_params() {
+        let pieces = vec![
+            ReplyPiece::Mention { name: "小明".into(), qq_id: Some(42) },
+            ReplyPiece::Text("，你怎么看？[CQ:at,qq=all]".into()),
+        ];
+        for quote in [None, Some("123456")] {
+            println!("{}", serde_json::to_string_pretty(&reply_params("group_id", 34, 99, &pieces, quote)).unwrap());
+        }
+        println!("{}", serde_json::to_string_pretty(&forward_params("group_id", 34, 99, "小庄", &[reply_text(&pieces)])).unwrap());
     }
 
     #[tokio::test]
@@ -1273,7 +1379,9 @@ mod tests {
                 let (tx, mut rx) = mpsc::channel::<Request>(8);
                 let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
                 *qq.shared.nickname.lock().unwrap() = Some("小庄".into());
-                let body = format!("[CQ:at,qq=42]{}", "字".repeat(CHUNK_CHARS * 2));
+                let pieces = vec![ReplyPiece::Mention { name: "小明".into(), qq_id: Some(42) },
+                    ReplyPiece::Text(format!("[CQ:at,qq=42]{}", "字".repeat(CHUNK_CHARS * 2)))];
+                let body = reply_text(&pieces);
                 let chunks = super::super::telegram::chunks(&body, CHUNK_CHARS);
                 assert_eq!(chunks.len(), 3);
                 let respond = async {
@@ -1298,7 +1406,7 @@ mod tests {
                         req.reply.send(Ok(json!({"message_id":"forward-id"}))).unwrap();
                     }
                 };
-                let (sent, ()) = tokio::join!(qq.send(chat, &body), respond);
+                let (sent, ()) = tokio::join!(qq.send_reply(chat, &pieces, None), respond);
                 sent.unwrap();
                 assert!(rx.try_recv().is_err());
                 let mid = if fail { "0" } else { "forward-id" };
