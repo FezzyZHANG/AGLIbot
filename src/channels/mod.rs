@@ -29,6 +29,8 @@ pub enum AttachmentKind {
 
 #[derive(Debug, Clone)]
 pub struct Envelope {
+    /// Platform notice rendered as a transcript line, not a chat message.
+    pub notice: bool,
     /// `telegram` or `qq`.
     pub platform: &'static str,
     /// Platform-native send target. Telegram: the chat id. QQ: `private:<user>` or `group:<group>`.

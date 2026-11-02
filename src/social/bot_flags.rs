@@ -73,7 +73,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("agli-bot-flags-{}", std::process::id()));
         let store = JsonlStore::open(&dir).unwrap();
         let who = Who { person_id: "qq:7".into(), is_owner: false, is_agent: false };
-        let mut env = Envelope { attachments: Vec::new(), platform: "qq", chat_id: "group:1".into(), message_id: None,
+        let mut env = Envelope { notice: false, attachments: Vec::new(), platform: "qq", chat_id: "group:1".into(), message_id: None,
             sender_id: "7".into(), sender_name: "sender".into(), sender_is_bot: false, is_group: true,
             mentions_me: false, text: "模板自动播报当前状态正常序号123".into(), arrived: None };
         let now = Utc::now();

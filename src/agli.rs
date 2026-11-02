@@ -620,7 +620,7 @@ impl Agli {
     }
 
     fn focus_ctx(&self, platform: &'static str, chat_id: &str, sender_id: &str) -> Option<ChatCtx> {
-        let env = Envelope { attachments: Vec::new(), platform, chat_id: chat_id.into(), sender_id: sender_id.into(),
+        let env = Envelope { notice: false, attachments: Vec::new(), platform, chat_id: chat_id.into(), sender_id: sender_id.into(),
             sender_name: String::new(), sender_is_bot: false, is_group: false, mentions_me: false,
             text: String::new(), message_id: None, arrived: None };
         let who = identify(&self.cfg.acl, &env);
@@ -743,7 +743,7 @@ impl Agli {
         }
         self.people.observe(self.store.as_ref(), &env, &who, now)?;
         let observed_at = env.arrived.and_then(|t| chrono::Duration::from_std(t.elapsed()).ok()).map_or(now, |age| now - age);
-        if let Err(e) = bot_flags::observe(self.store.as_ref(), &env, &who, observed_at) {
+        if !env.notice && let Err(e) = bot_flags::observe(self.store.as_ref(), &env, &who, observed_at) {
             warn!("QQ agent heuristic failed: {e:#}");
         }
 
@@ -842,7 +842,12 @@ impl Agli {
         self.unseen.entry(ctx.key.clone()).or_default().push(line);
         let busy = self.flow.is_focused() || asleep;
         let addressed = env.mentions_me && (!asleep || who.is_owner);
-        match self.floor.on_group_message(&self.cfg.social, &ctx.key, addressed, busy, now) {
+        let decision = if env.notice {
+            if addressed { FloorDecision::Speak } else { FloorDecision::Silent("notice") }
+        } else {
+            self.floor.on_group_message(&self.cfg.social, &ctx.key, addressed, busy, now)
+        };
+        match decision {
             FloorDecision::Speak => {
                 if self.floor.allow_reply(&self.cfg.social, &ctx.key, &who.person_id, who.is_agent, now) {
                     batch.speak = true;
@@ -880,7 +885,7 @@ impl Agli {
             _ => return Ok(None),
         };
         let env = Envelope {
-            attachments: Vec::new(),
+            notice: false, attachments: Vec::new(),
             platform, chat_id: chat.chat_id.clone(), sender_id: chat.sender_id.clone(), sender_name: String::new(),
             sender_is_bot: chat.is_agent, is_group: false, mentions_me: false, text: String::new(), message_id: None, arrived: None,
         };
@@ -1904,7 +1909,7 @@ mod tests {
 
     fn inbound(chat: &str, text: &str, id: &str) -> Event {
         Event::Inbound(Envelope {
-            attachments: Vec::new(),
+            notice: false, attachments: Vec::new(),
             platform: "telegram", chat_id: chat.into(), message_id: Some(id.into()),
             sender_id: "42".into(), sender_name: "主人".into(), sender_is_bot: false,
             is_group: false, mentions_me: false, text: text.into(), arrived: None,
@@ -3605,6 +3610,39 @@ mod tests {
         assert!(matches!(crate::recv_work(&mut rx, &mut queue, &acl, &session).await, Some(WorkItem::Tick)));
         assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["second", "third"]);
         assert!(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn notices_respect_read_only_groups_and_do_not_advance_floor_or_bot_samples() {
+        let mut test = TestAgli::new("notice-gates").await;
+        let a = &mut test.agli;
+        let mut env = group_messages(&["notice"], true).remove(0);
+        env.platform = "qq";
+        env.chat_id = "group:34".into();
+        env.notice = true;
+        for notice in [true, false] {
+            env.notice = notice;
+            let batch = a.prepare_messages(vec![env.clone()]).await;
+            assert!(batch.ctx.is_none() && !batch.speak && !batch.consider);
+        }
+        assert_eq!(a.store.messages_after(&Namespace::Group("qq:34".into()), DateTime::<Utc>::MIN_UTC).unwrap().len(), 2);
+        let sample_key = format!("qq_bot_samples:{}", env.sender_key());
+        let samples = a.store.kv_get(&sample_key).unwrap();
+        assert!(samples.is_some());
+        Arc::make_mut(&mut a.cfg).social.groups.push("qq:34".into());
+        env.notice = true;
+        let batch = a.prepare_messages(vec![env.clone()]).await;
+        assert!(batch.speak && !batch.consider);
+        env.mentions_me = false;
+        for _ in 0..5 {
+            let batch = a.prepare_messages(vec![env.clone()]).await;
+            assert!(!batch.speak && !batch.consider);
+        }
+        assert_eq!(a.store.kv_get(&sample_key).unwrap(), samples);
+        env.notice = false;
+        for expected in [false, false, true] {
+            assert_eq!(a.prepare_messages(vec![env.clone()]).await.consider, expected);
+        }
     }
 
     fn group_messages(texts: &[&str], mention_first: bool) -> Vec<Envelope> {
