@@ -85,6 +85,9 @@ struct Request {
 #[derive(Default)]
 struct Shared {
     self_id: AtomicI64,
+    last_inbound: Mutex<HashMap<String, Option<String>>>,
+    /// His QQ nickname, for self-authored forward nodes.
+    nickname: Mutex<Option<String>>,
     pokes: Mutex<HashMap<(String, i64), tokio::time::Instant>>,
     own_messages: Mutex<VecDeque<String>>,
     recent: Mutex<VecDeque<(String, Quoted)>>,
@@ -158,6 +161,11 @@ pub fn spawn(url: String, token: Option<String>, inbound: mpsc::Sender<Envelope>
 /// Resolve what an event needs from NapCat, in arrival order, then hand it on.
 async fn enrich(mut raw: mpsc::Receiver<Pending>, qq: QqHandle, inbound: mpsc::Sender<Envelope>) {
     while let Some(p) = raw.recv().await {
+        // Record arrival before potentially slow reply/forward lookups; notices never replace it.
+        if !p.env.notice {
+            qq.shared.last_inbound.lock().unwrap_or_else(|e| e.into_inner())
+                .insert(p.env.chat_id.clone(), p.env.message_id.clone());
+        }
         let forwards = if has_forward(&p.message) {
             collect_forwards(&p.message, |id| {
                 let qq = qq.clone();
@@ -198,21 +206,59 @@ impl QqHandle {
     /// `chat_id` is `private:<user>` or `group:<group>`. Text goes as a text segment, so CQ codes
     /// in model output are never interpreted.
     pub async fn send(&self, chat_id: &str, text: &str) -> Result<()> {
-        let (action, key, id) = match chat_id.split_once(':') {
-            Some(("private", id)) => ("send_private_msg", "user_id", id),
-            Some(("group", id)) => ("send_group_msg", "group_id", id),
+        self.send_reply(chat_id, text, None).await
+    }
+
+    pub async fn send_reply(&self, chat_id: &str, text: &str, reply_to: Option<&str>) -> Result<()> {
+        let (action, forward_action, key, id) = match chat_id.split_once(':') {
+            Some(("private", id)) => ("send_private_msg", "send_private_forward_msg", "user_id", id),
+            Some(("group", id)) => ("send_group_msg", "send_group_forward_msg", "group_id", id),
             _ => bail!("bad qq chat id `{chat_id}`"),
         };
         let id: i64 = id.parse().with_context(|| format!("bad qq chat id `{chat_id}`"))?;
-        for chunk in super::telegram::chunks(text, CHUNK_CHARS) {
-            let params = json!({ key: id, "message": [{"type": "text", "data": {"text": chunk}}] });
-            let data = self.call(action, params).await?;
-            if let Some(mid) = data.get("message_id") {
-                self.shared.remember(id_string(mid));
-                self.shared.cache(id_string(mid), Quoted { name: "我".into(), text: chunk.to_string() });
+        let chunks = super::telegram::chunks(text, CHUNK_CHARS);
+        if chunks.len() > 2 {
+            let nickname = self.nickname().await;
+            let params = forward_params(key, id, self.shared.self_id.load(Ordering::Relaxed), &nickname, &chunks);
+            match self.call(forward_action, params).await {
+                Ok(data) => {
+                    self.cache_sent(&data, &chunks[0]);
+                    return Ok(());
+                }
+                Err(e) => warn!("qq forward failed, falling back to chunks: {e:#}"),
             }
         }
+        for (i, chunk) in chunks.iter().enumerate() {
+            let mut message = Vec::new();
+            if i == 0 && key == "group_id" && let Some(target) = reply_to {
+                let last = self.shared.last_inbound.lock().unwrap_or_else(|e| e.into_inner());
+                if last.get(chat_id).and_then(|id| id.as_deref()) != Some(target) {
+                    message.push(json!({"type": "reply", "data": {"id": target}}));
+                }
+            }
+            message.push(json!({"type": "text", "data": {"text": chunk}}));
+            let data = self.call(action, json!({key: id, "message": message})).await?;
+            self.cache_sent(&data, chunk);
+        }
         Ok(())
+    }
+
+    /// Asked once; an empty name lets NapCat fall back to the account's own.
+    async fn nickname(&self) -> String {
+        if let Some(n) = self.shared.nickname.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return n;
+        }
+        let Ok(info) = self.call("get_login_info", json!({})).await else { return String::new() };
+        let n = info.get("nickname").and_then(Value::as_str).unwrap_or_default().to_string();
+        *self.shared.nickname.lock().unwrap_or_else(|e| e.into_inner()) = Some(n.clone());
+        n
+    }
+
+    fn cache_sent(&self, data: &Value, text: &str) {
+        if let Some(mid) = data.get("message_id") {
+            self.shared.remember(id_string(mid));
+            self.shared.cache(id_string(mid), Quoted { name: "我".into(), text: text.to_string() });
+        }
     }
 
     async fn get_message(&self, id: &str) -> Result<Value> {
@@ -229,6 +275,15 @@ impl QqHandle {
             _ => bail!("get_forward_msg returned no messages: {data}"),
         }
     }
+}
+
+/// Only explicit text segments: model output cannot create CQ segments.
+fn forward_params(key: &str, id: i64, self_id: i64, nickname: &str, chunks: &[String]) -> Value {
+    let nodes: Vec<_> = chunks.iter().map(|chunk| json!({
+        "type": "node", "data": {"user_id": self_id, "nickname": nickname,
+            "content": [{"type": "text", "data": {"text": chunk}}]}
+    })).collect();
+    json!({key: id, "messages": nodes})
 }
 
 fn id_string(v: &Value) -> String {
@@ -1181,6 +1236,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reply_only_quotes_ambiguous_groups_on_first_chunk() {
+        for (chat, last, target, quoted) in [
+            ("group:34", "2", Some("1"), true),
+            ("group:34", "1", Some("1"), false),
+            ("private:34", "2", Some("1"), false),
+            ("group:34", "2", None, false),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<Request>(8);
+            let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+            qq.shared.last_inbound.lock().unwrap().insert(chat.into(), Some(last.into()));
+            let body = format!("[CQ:at,qq=42]{}", "字".repeat(CHUNK_CHARS));
+            let chunks = super::super::telegram::chunks(&body, CHUNK_CHARS);
+            let respond = async {
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let req = rx.recv().await.unwrap();
+                    let mut expected = vec![text(chunk)];
+                    if quoted && i == 0 { expected.insert(0, reply("1")); }
+                    assert_eq!(req.params["message"], json!(expected));
+                    req.reply.send(Ok(json!({"message_id": i}))).unwrap();
+                }
+            };
+            let (sent, ()) = tokio::join!(qq.send_reply(chat, &body, target), respond);
+            sent.unwrap();
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn long_forward_actions_nodes_cache_and_fallback() {
+        for (chat, key, forward, plain) in [
+            ("group:34", "group_id", "send_group_forward_msg", "send_group_msg"),
+            ("private:34", "user_id", "send_private_forward_msg", "send_private_msg"),
+        ] {
+            for fail in [false, true] {
+                let (tx, mut rx) = mpsc::channel::<Request>(8);
+                let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+                *qq.shared.nickname.lock().unwrap() = Some("小庄".into());
+                let body = format!("[CQ:at,qq=42]{}", "字".repeat(CHUNK_CHARS * 2));
+                let chunks = super::super::telegram::chunks(&body, CHUNK_CHARS);
+                assert_eq!(chunks.len(), 3);
+                let respond = async {
+                    let req = rx.recv().await.unwrap();
+                    assert_eq!(req.action, forward);
+                    assert_eq!(req.params[key], 34);
+                    let nodes = req.params["messages"].as_array().unwrap();
+                    assert_eq!(nodes.len(), chunks.len());
+                    for (node, chunk) in nodes.iter().zip(&chunks) {
+                        assert_eq!(*node, json!({"type":"node", "data":{
+                            "user_id":99, "nickname":"小庄", "content":[text(chunk)]}}));
+                    }
+                    if fail {
+                        req.reply.send(Err(anyhow!("forward rejected"))).unwrap();
+                        for (i, chunk) in chunks.iter().enumerate() {
+                            let req = rx.recv().await.unwrap();
+                            assert_eq!(req.action, plain);
+                            assert_eq!(req.params, json!({key:34, "message":[text(chunk)]}));
+                            req.reply.send(Ok(json!({"message_id": i}))).unwrap();
+                        }
+                    } else {
+                        req.reply.send(Ok(json!({"message_id":"forward-id"}))).unwrap();
+                    }
+                };
+                let (sent, ()) = tokio::join!(qq.send(chat, &body), respond);
+                sent.unwrap();
+                assert!(rx.try_recv().is_err());
+                let mid = if fail { "0" } else { "forward-id" };
+                assert!(qq.shared.is_mine(mid));
+                let cached = qq.shared.cached(mid).unwrap();
+                assert_eq!(cached.name, "我");
+                assert_eq!(cached.text, chunks[0]);
+            }
+        }
+    }
+
+    /// Manual live-payload preview; never connects or sends anything.
+    #[test]
+    #[ignore = "manual forward params preview, sends nothing"]
+    fn live_build_forward_params() {
+        let chunks = super::super::telegram::chunks(&"sample text ".repeat(300), CHUNK_CHARS);
+        println!("{}", serde_json::to_string_pretty(&forward_params("group_id", 34, 99, "小庄", &chunks)).unwrap());
+    }
+
+    #[tokio::test]
     async fn enrich_caches_envelopes_for_later_replies() {
         let (tx, mut requests) = mpsc::channel(8);
         let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
@@ -1196,6 +1334,33 @@ mod tests {
         assert_eq!(in_rx.recv().await.unwrap().text, "[回复 nick: 原文]原文");
         assert!(requests.try_recv().is_err());
         assert_eq!(qq.shared.cached("2").unwrap().text, "原文");
+    }
+
+    #[tokio::test]
+    async fn enrich_tracks_each_chat_but_not_notices() {
+        let (tx, _requests) = mpsc::channel(8);
+        let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+        let (raw_tx, raw_rx) = mpsc::channel(8);
+        let (in_tx, _in_rx) = mpsc::channel(8);
+        for (chat, mid, notice) in [
+            ("group:34", Some("1"), false),
+            ("private:5", Some("2"), false),
+            ("group:34", Some("3"), false),
+            ("group:34", None, true),
+            ("private:5", None, false),
+        ] {
+            let mut p = super::parse_event(&group(json!([text("body")])), &qq.shared).unwrap();
+            p.env.chat_id = chat.into();
+            p.env.message_id = mid.map(str::to_owned);
+            p.env.notice = notice;
+            if notice { p.env.sender_name.clear(); }
+            raw_tx.send(p).await.unwrap();
+        }
+        drop(raw_tx);
+        enrich(raw_rx, qq.clone(), in_tx).await;
+        let last = qq.shared.last_inbound.lock().unwrap();
+        assert_eq!(last.get("group:34"), Some(&Some("3".into())));
+        assert_eq!(last.get("private:5"), Some(&None));
     }
 
     /// Reads one real quoted message; sends nothing.

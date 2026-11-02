@@ -74,13 +74,21 @@ pub struct Outlets {
 
 impl Outlets {
     pub async fn send(&self, platform: &str, chat_id: &str, text: &str) -> Result<()> {
+        self.send_reply(platform, chat_id, text, None).await
+    }
+
+    /// Telegram currently ignores the optional reply target.
+    pub async fn send_reply(&self, platform: &str, chat_id: &str, text: &str, reply_to: Option<&str>) -> Result<()> {
         match platform {
             "telegram" => match &self.telegram {
                 Some(tg) => tg.send(chat_id, text).await,
                 None => bail!("telegram is not connected"),
             },
             "qq" => match &self.qq {
-                Some(qq) => qq.send(chat_id, text).await,
+                Some(qq) => match reply_to {
+                    Some(id) => qq.send_reply(chat_id, text, Some(id)).await,
+                    None => qq.send(chat_id, text).await,
+                },
                 None => bail!("qq is not connected"),
             },
             other => bail!("unknown platform {other}"),

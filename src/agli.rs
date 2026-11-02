@@ -1129,7 +1129,7 @@ impl Agli {
         }
         // Claim only after successful generation, before delivery. Uncertain sends are never retried.
         if let Some(key) = claim { self.store.kv_set(key, json!(true))?; }
-        let outcome = self.send_bubbles(ctx.platform, &ctx.chat_id, &intent.text).await;
+        let outcome = self.send_bubbles(ctx, &intent.text).await;
         if unsolicited {
             self.audit("me", "group_chime_in", true, &ctx.key, outcome)?;
         }
@@ -1190,17 +1190,20 @@ impl Agli {
         text
     }
 
-    async fn send_bubbles(&self, platform: &str, chat_id: &str, text: &str) -> Outcome {
+    async fn send_bubbles(&self, ctx: &ChatCtx, text: &str) -> Outcome {
+        let reply_to = if ctx.is_group { ctx.message_id.as_deref() } else { None };
         #[cfg(test)]
         if let Some(test) = &self.test_chat {
             test.sent_texts.lock().unwrap().push(text.to_string());
+            test.reply_targets.lock().unwrap().extend(bubbles(text).iter().enumerate()
+                .map(|(i, _)| if i == 0 { reply_to.map(str::to_owned) } else { None }));
             return test.sends.lock().unwrap().pop_front().expect("unexpected send");
         }
         for (i, b) in bubbles(text).iter().enumerate() {
             if i > 0 {
                 tokio::time::sleep(Duration::from_millis(700)).await;
             }
-            if let Err(e) = self.outlets.send(platform, chat_id, b).await {
+            if let Err(e) = self.outlets.send_reply(ctx.platform, &ctx.chat_id, b, if i == 0 { reply_to } else { None }).await {
                 error!("send failed: {e:#}");
                 return if i == 0 { Outcome::Failed } else { Outcome::Unknown };
             }
@@ -2346,6 +2349,7 @@ mod tests {
         pub(super) rewrites: Mutex<VecDeque<Result<String>>>,
         pub(super) rewrite_prompts: Mutex<Vec<(ProcessingPolicy, String)>>,
         pub(super) sent_texts: Mutex<Vec<String>>,
+        pub(super) reply_targets: Mutex<Vec<Option<String>>>,
     }
 
     impl TestChat {
@@ -2354,7 +2358,7 @@ mod tests {
                 replies: replies.iter().map(|s| Ok((*s).into())).collect(), turns: Vec::new(),
                 sends: Mutex::new(sends.iter().copied().collect()),
                 rewrites: Mutex::new(VecDeque::new()), rewrite_prompts: Mutex::new(Vec::new()),
-                sent_texts: Mutex::new(Vec::new()),
+                sent_texts: Mutex::new(Vec::new()), reply_targets: Mutex::new(Vec::new()),
             }
         }
     }
@@ -2661,6 +2665,22 @@ mod tests {
         assert_eq!(truncate_reply("hello world", 1), "hello…");
         assert_eq!(truncate_reply("刚好。", 2), "刚好。");
         assert_eq!(truncate_reply("超出", 0), "");
+    }
+
+    #[tokio::test]
+    async fn group_reply_passes_trigger_id_only_to_first_bubble() {
+        let mut test = TestAgli::new("reply-target").await;
+        let a = &mut test.agli;
+        for is_group in [true, false] {
+            let envs = if is_group { group_messages(&["hello"], true) }
+                else { vec![private_message("42", "hello")] };
+            let mut ctx = a.prepare_messages(envs).await.ctx.unwrap();
+            ctx.message_id = Some("trigger-76".into());
+            a.test_chat = Some(TestChat::new(&["first\n\nsecond"], &[Outcome::Sent]));
+            a.converse(&ctx, "hello".into(), 0, false).await.unwrap();
+            let expected = if is_group { Some("trigger-76".to_string()) } else { None };
+            assert_eq!(*a.test_chat.as_ref().unwrap().reply_targets.lock().unwrap(), [expected, None]);
+        }
     }
 
     #[tokio::test]
