@@ -46,7 +46,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{info, warn};
 
-use super::Envelope;
+use super::{Attachment, AttachmentKind, Envelope};
 
 const CHUNK_CHARS: usize = 1500;
 const ACTION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -361,9 +361,43 @@ fn parse_event(v: &Value, shared: &Shared) -> Option<Pending> {
             is_group,
             mentions_me: !is_group,
             text: String::new(),
+            attachments: attachments(&message),
         },
         message,
     })
+}
+
+/// Collect only this message's segments, never forward nodes or quoted messages.
+fn attachments(message: &[Value]) -> Vec<Attachment> {
+    message.iter().filter_map(|seg| {
+        let data = &seg["data"];
+        let field = |key: &str| match data.get(key)? {
+            Value::String(s) if !s.is_empty() => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        };
+        let kind = match seg.get("type")?.as_str()? {
+            "image" if field("sub_type").as_deref() == Some("1") => AttachmentKind::Sticker,
+            "image" => AttachmentKind::Image,
+            "mface" => AttachmentKind::Sticker,
+            "record" => AttachmentKind::Voice,
+            "video" => AttachmentKind::Video,
+            "file" => AttachmentKind::File,
+            _ => return None,
+        };
+        let file_id = if seg["type"] == "mface" {
+            None
+        } else {
+            field("file_id").or_else(|| field("file_unique")).or_else(|| field("file"))
+        };
+        Some(Attachment {
+            kind,
+            url: field("url"),
+            file_id,
+            name: field("name").or_else(|| (seg["type"] == "file").then(|| field("file")).flatten()),
+            size: field("file_size").and_then(|s| s.parse().ok()),
+        })
+    }).collect()
 }
 
 /// Render the text; `None` when nothing readable is left.
@@ -674,6 +708,78 @@ mod tests {
 
     fn text_of(s: &Shared, message: Value) -> String {
         parse_event(&group(message), s).unwrap().text
+    }
+
+    #[test]
+    fn top_level_media_references_preserve_metadata() {
+        let env = parse_event(&group(json!([
+            {"type": "image", "data": {"file": "ABC.jpg", "sub_type": 0, "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&rkey=image", "file_size": "12345"}},
+            {"type": "image", "data": {"file": "DEF.gif", "sub_type": "1", "url": "https://example.test/sticker", "file_size": 42}},
+            {"type": "mface", "data": {"summary": "[sticker]", "url": "https://gxh.vip.qq.com/club/item/parcel/item.gif"}},
+            {"type": "record", "data": {"file": "voice.amr", "url": "https://grouptalk.c2c.qq.com/voice", "file_size": 128}},
+            {"type": "video", "data": {"file": "video.mp4", "url": "https://example.test/video", "file_size": "2048"}},
+            {"type": "file", "data": {"file": "report.pdf", "file_id": "/group/file-id", "file_unique": "unique-id", "name": "Report.pdf", "url": "https://example.test/file", "file_size": "2621440"}}
+        ])), &shared(99)).unwrap();
+        let a = &env.attachments;
+        assert_eq!(a.len(), 6);
+        assert!(matches!(a[0].kind, AttachmentKind::Image));
+        assert!(matches!(a[1].kind, AttachmentKind::Sticker));
+        assert!(matches!(a[2].kind, AttachmentKind::Sticker));
+        assert!(matches!(a[3].kind, AttachmentKind::Voice));
+        assert!(matches!(a[4].kind, AttachmentKind::Video));
+        assert!(matches!(a[5].kind, AttachmentKind::File));
+        for (i, id, size) in [(0, "ABC.jpg", 12345), (1, "DEF.gif", 42), (3, "voice.amr", 128), (4, "video.mp4", 2048), (5, "/group/file-id", 2621440)] {
+            assert_eq!(a[i].file_id.as_deref(), Some(id));
+            assert_eq!(a[i].size, Some(size));
+            assert!(a[i].url.as_deref().unwrap().starts_with("https://"));
+        }
+        assert_eq!(a[2].url.as_deref(), Some("https://gxh.vip.qq.com/club/item/parcel/item.gif"));
+        assert!(a[2].file_id.is_none());
+        assert_eq!(a[5].name.as_deref(), Some("Report.pdf"));
+    }
+
+    #[test]
+    fn media_missing_or_invalid_fields_are_tolerated() {
+        for kind in ["image", "mface", "record", "video", "file"] {
+            for data in [json!({}), Value::Null, json!({"url": null, "file": {}, "file_id": [], "name": false, "file_size": "invalid"})] {
+                let env = parse_event(&group(json!([{"type": kind, "data": data}])), &shared(99)).unwrap();
+                let a = &env.attachments[0];
+                assert_eq!(env.attachments.len(), 1);
+                assert!(a.url.is_none() && a.file_id.is_none() && a.name.is_none() && a.size.is_none());
+            }
+        }
+        for (data, id, name) in [
+            (json!({"file": "report.pdf"}), "report.pdf", Some("report.pdf")),
+            (json!({"file_unique": "unique-id"}), "unique-id", None),
+            (json!({"file_id": 123, "file_size": -1}), "123", None),
+        ] {
+            let env = parse_event(&group(json!([{"type": "file", "data": data}])), &shared(99)).unwrap();
+            assert_eq!(env.attachments[0].file_id.as_deref(), Some(id));
+            assert_eq!(env.attachments[0].name.as_deref(), name);
+            assert!(env.attachments[0].size.is_none());
+        }
+        assert!(parse_event(&group(json!([text("hello")])), &shared(99)).unwrap().attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forwarded_and_quoted_media_do_not_become_attachments() {
+        let s = shared(99);
+        let media = json!([{"type": "image", "data": {"file": "nested.jpg", "url": "https://example.test/nested"}}]);
+        let msg = json!([
+            reply("123"),
+            {"type": "forward", "data": {"content": [node("inline", media.clone())]}},
+            {"type": "forward", "data": {"id": "fetched"}}
+        ]);
+        let prefix = resolve_reply(msg.as_array().unwrap(), &s, |_| async { Ok(node("quoted", media.clone())) }).await;
+        let forwards = Forwards::from([("fetched".into(), Some(vec![node("fetched", media)]))]);
+        let env = finish(super::parse_event(&group(msg.clone()), &s).unwrap(), &forwards, &s, &prefix).unwrap();
+        assert!(env.attachments.is_empty());
+        let mut mixed = msg.as_array().unwrap().clone();
+        mixed.push(json!({"type": "record", "data": {"file": "own.amr"}}));
+        let env = finish(super::parse_event(&group(json!(mixed)), &s).unwrap(), &forwards, &s, &prefix).unwrap();
+        assert_eq!(env.attachments.len(), 1);
+        assert_eq!(env.attachments[0].file_id.as_deref(), Some("own.amr"));
+        assert!(matches!(env.attachments[0].kind, AttachmentKind::Voice));
     }
 
     #[test]
