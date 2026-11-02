@@ -30,6 +30,15 @@
 //! | music / share | `[音乐:title]` / `[链接:title url]` |
 //! | anything else | `[type]`, logged once per type |
 //!
+//! Notices use the same inbound gates and transcript as messages:
+//!
+//! | notice | text |
+//! |---|---|
+//! | group_recall / friend_recall | `[撤回了一条消息]`, with cached first 40 characters when available |
+//! | notify/poke at self | `[戳了戳你]`, addressed; once per sender/chat per 10 minutes |
+//! | group_increase / group_decrease | `[入群]` / `[退群]`, or `[被移出群]` for kick |
+//! | group_card / other notices | ignored |
+//!
 //! CQ codes are never interpreted, in or out.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -76,6 +85,7 @@ struct Request {
 #[derive(Default)]
 struct Shared {
     self_id: AtomicI64,
+    pokes: Mutex<HashMap<(String, i64), tokio::time::Instant>>,
     own_messages: Mutex<VecDeque<String>>,
     recent: Mutex<VecDeque<(String, Quoted)>>,
     /// Unknown segment types already logged.
@@ -327,14 +337,17 @@ async fn session(
 struct Pending {
     env: Envelope,
     message: Vec<Value>,
+    recalled_id: Option<String>,
 }
 
 /// Merged-forward nodes by forward id; `None` when fetching failed.
 type Forwards = HashMap<String, Option<Vec<Value>>>;
 
 fn parse_event(v: &Value, shared: &Shared) -> Option<Pending> {
-    if v.get("post_type")?.as_str()? != "message" {
-        return None;
+    match v.get("post_type")?.as_str()? {
+        "message" => {}
+        "notice" => return parse_notice(v, shared),
+        _ => return None,
     }
     let self_id = shared.self_id.load(Ordering::Relaxed);
     let user_id = v.get("user_id")?.as_i64()?;
@@ -351,7 +364,7 @@ fn parse_event(v: &Value, shared: &Shared) -> Option<Pending> {
     let name = sender_name(v.get("sender").unwrap_or(&Value::Null)).unwrap_or_default();
     Some(Pending {
         env: Envelope {
-            arrived: Some(tokio::time::Instant::now()),
+            notice: false, arrived: Some(tokio::time::Instant::now()),
             platform: "qq",
             chat_id,
             message_id: v.get("message_id").filter(|id| !id.is_null()).map(id_string),
@@ -364,6 +377,45 @@ fn parse_event(v: &Value, shared: &Shared) -> Option<Pending> {
             attachments: attachments(&message),
         },
         message,
+        recalled_id: None,
+    })
+}
+
+/// Notice bodies are finished in the ordered enrichment task, after preceding messages enter the LRU.
+fn parse_notice(v: &Value, shared: &Shared) -> Option<Pending> {
+    let self_id = shared.self_id.load(Ordering::Relaxed);
+    let member = v.get("user_id")?.as_i64()?;
+    if member == self_id { return None; }
+    let kind = v.get("notice_type")?.as_str()?;
+    let is_group = v.get("group_id").and_then(Value::as_i64).is_some_and(|id| id != 0);
+    let chat_id = if is_group { format!("group:{}", v["group_id"].as_i64()?) } else { format!("private:{member}") };
+    let (sender, text, mentions_me) = match kind {
+        "group_recall" | "friend_recall" => (
+            v.get("operator_id").and_then(Value::as_i64).unwrap_or(member), "[撤回了一条消息]", false),
+        "notify" if v["sub_type"] == "poke" && v["target_id"].as_i64() == Some(self_id) => {
+            let now = tokio::time::Instant::now();
+            let mut pokes = shared.pokes.lock().unwrap_or_else(|e| e.into_inner());
+            pokes.retain(|_, t| now.duration_since(*t) < Duration::from_secs(600));
+            if pokes.contains_key(&(chat_id.clone(), member)) { return None; }
+            pokes.insert((chat_id.clone(), member), now);
+            (member, "[戳了戳你]", true)
+        }
+        "group_increase" => (member, "[入群]", false),
+        "group_decrease" => (member, if v["sub_type"] == "kick" { "[被移出群]" } else { "[退群]" }, false),
+        "group_card" | "group_upload" | "group_admin" | "group_ban" | "friend_add" | "notify" => return None,
+        _ => return None,
+    };
+    Some(Pending {
+        env: Envelope {
+            notice: true, platform: "qq", chat_id, message_id: None,
+            // No name: people.observe would rename the person to their id.
+            sender_id: sender.to_string(), sender_name: String::new(), sender_is_bot: false,
+            is_group, mentions_me, text: text.into(), attachments: Vec::new(),
+            arrived: Some(tokio::time::Instant::now()),
+        },
+        message: Vec::new(),
+        recalled_id: matches!(kind, "group_recall" | "friend_recall")
+            .then(|| v.get("message_id").filter(|id| !id.is_null()).map(id_string)).flatten(),
     })
 }
 
@@ -401,7 +453,17 @@ fn attachments(message: &[Value]) -> Vec<Attachment> {
 }
 
 /// Render the text; `None` when nothing readable is left.
-fn finish(p: Pending, forwards: &Forwards, shared: &Shared, reply: &str) -> Option<Envelope> {
+fn finish(mut p: Pending, forwards: &Forwards, shared: &Shared, reply: &str) -> Option<Envelope> {
+    if p.env.notice {
+        if let Some(id) = p.recalled_id {
+            let mut recent = shared.recent.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(i) = recent.iter().position(|(key, _)| key == &id) {
+                let (_, quoted) = recent.remove(i)?;
+                p.env.text = format!("[撤回了一条消息: {}]", cut(&quoted.text.replace("\r\n", " ").replace(['\r', '\n'], " "), 40));
+            }
+        }
+        return Some(p.env);
+    }
     let r = Render { self_id: shared.self_id.load(Ordering::Relaxed).to_string(), shared, forwards };
     let mut mentions_me = false;
     let body = r.segments(&p.message, 0, Some(&mut mentions_me));
@@ -678,6 +740,88 @@ fn cut(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+
+    fn notice(kind: &str) -> Value {
+        json!({"post_type":"notice", "notice_type":kind, "user_id":12, "group_id":34,
+            "operator_id":56, "message_id":7})
+    }
+
+    #[test]
+    fn recalls_render_operator_and_consume_cache_in_order() {
+        for kind in ["group_recall", "friend_recall"] {
+            let s = shared(99);
+            let mut v = notice(kind);
+            if kind == "friend_recall" { v.as_object_mut().unwrap().remove("group_id"); }
+            let env = parse_event(&v, &s).unwrap();
+            assert_eq!(env.text, "[撤回了一条消息]");
+            assert_eq!(env.sender_id, "56");
+            assert!(!env.mentions_me && env.notice && env.message_id.is_none());
+            assert_eq!(env.is_group, kind == "group_recall");
+            // Parsing can precede enrichment of the message being recalled.
+            let pending = super::parse_event(&v, &s).unwrap();
+            s.cache("7".into(), Quoted { name:"member".into(), text:"字".repeat(41) });
+            let env = finish(pending, &Forwards::new(), &s, "").unwrap();
+            assert_eq!(env.text, format!("[撤回了一条消息: {}…]", "字".repeat(40)));
+            assert!(s.cached("7").is_none());
+            v["user_id"] = json!(99);
+            assert!(parse_event(&v, &s).is_none());
+        }
+        let mut v = notice("friend_recall");
+        v.as_object_mut().unwrap().remove("operator_id");
+        v.as_object_mut().unwrap().remove("group_id");
+        let env = parse_event(&v, &shared(99)).unwrap();
+        assert_eq!(env.sender_id, "12");
+        assert_eq!(env.chat_id, "private:12");
+    }
+
+    #[test]
+    fn membership_notices_and_ignored_types() {
+        for (kind, subtype, expected) in [("group_increase", "approve", "[入群]"),
+            ("group_decrease", "leave", "[退群]"), ("group_decrease", "kick", "[被移出群]")] {
+            let mut v = notice(kind);
+            v["sub_type"] = json!(subtype);
+            let s = shared(99);
+            let env = parse_event(&v, &s).unwrap();
+            assert_eq!(env.text, expected);
+            assert_eq!(env.sender_id, "12");
+            assert!(env.sender_name.is_empty());
+            assert_eq!(env.chat_id, "group:34");
+            assert!(env.notice && env.is_group && !env.mentions_me);
+            v["user_id"] = json!(99);
+            assert!(parse_event(&v, &s).is_none());
+        }
+        for kind in ["group_card", "group_upload", "group_admin", "group_ban", "friend_add", "notify", "unknown"] {
+            assert!(parse_event(&notice(kind), &shared(99)).is_none());
+        }
+        assert!(!parse_event(&group(json!([text("hello")])), &shared(99)).unwrap().notice);
+    }
+
+    #[test]
+    fn poke_target_and_sender_chat_rate_limit() {
+        let s = shared(99);
+        let mut v = notice("notify");
+        v["sub_type"] = json!("poke");
+        v["target_id"] = json!(98);
+        assert!(parse_event(&v, &s).is_none());
+        v["target_id"] = json!(99);
+        let env = parse_event(&v, &s).unwrap();
+        assert_eq!(env.text, "[戳了戳你]");
+        assert_eq!(env.sender_id, "12");
+        assert!(env.notice && env.mentions_me);
+        assert!(parse_event(&v, &s).is_none());
+        s.pokes.lock().unwrap().insert(("group:34".into(), 12), tokio::time::Instant::now() - Duration::from_secs(600));
+        assert!(parse_event(&v, &s).is_some());
+        v["user_id"] = json!(13);
+        assert!(parse_event(&v, &s).is_some());
+        v["group_id"] = json!(35);
+        assert!(parse_event(&v, &s).is_some());
+        v.as_object_mut().unwrap().remove("group_id");
+        assert_eq!(parse_event(&v, &s).unwrap().chat_id, "private:13");
+        assert!(parse_event(&v, &s).is_none());
+        v["user_id"] = json!(99);
+        assert!(parse_event(&v, &s).is_none());
+    }
+
     fn shared(me: i64) -> Shared {
         let s = Shared::default();
         s.self_id.store(me, Ordering::Relaxed);
@@ -689,7 +833,7 @@ mod tests {
     }
 
     fn parse_with(v: &Value, s: &Shared, forwards: &Forwards) -> Option<Envelope> {
-        finish(super::parse_event(v, s)?, forwards, s, if reply_segment(v["message"].as_array()?).is_some() { "[回复]" } else { "" })
+        finish(super::parse_event(v, s)?, forwards, s, if v["message"].as_array().is_some_and(|m| reply_segment(m).is_some()) { "[回复]" } else { "" })
     }
 
     fn group(message: Value) -> Value {

@@ -31,7 +31,7 @@ mod tests {
 
     fn env(platform: &'static str, sender_id: &str, name: &str) -> Envelope {
         Envelope {
-            attachments: Vec::new(),
+            notice: false, attachments: Vec::new(),
             arrived: None,
             platform,
             chat_id: sender_id.into(),
