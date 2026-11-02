@@ -49,6 +49,9 @@ Telegram 的收发消息走环境变量 `TELEGRAM_PROXY` 指定的代理（例�
 `/stop` 停下当前任务 · `/freeze` / `/unfreeze` 冻结主动行为和工具 · `/digest` 现在发待决事项 ·
 `/approve 编号` / `/reject 编号 理由` · `/reflect` 现在整理记忆
 
+核心代码提案：`/evolve 提案ID` 开始检查，`/evolve-status 提案ID` 查看状态；通过构建、
+测试、eval 和审查后仍需主人批准，才提交并重启。候选格式和操作说明见 [进化闸门](docs/EVOLUTION.md)。
+
 ## 你会经常改的文件
 
 - `config/models.yaml`：QCL 表，平时只需要调 `q` 这一列

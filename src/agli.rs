@@ -40,6 +40,8 @@ use crate::store::{AuditRecord, MessageRecord, Outcome, ReviewCategory, ReviewSt
 use crate::work::board::{Board, TaskKind, TaskStatus, ThreadRef};
 use crate::work::research::{self, Job};
 
+mod evolution;
+
 pub enum Event {
     Inbound(Envelope),
     Tick,
@@ -487,6 +489,8 @@ pub struct Agli {
     appraisals: ConversationAppraisals,
     board: Arc<Mutex<Board>>,
     jobs: BTreeMap<String, RunningJob>,
+    evolution_job: Option<evolution::Running>,
+    evolution_restart: Option<crate::evolution::restart::Restart>,
     /// Group lines he has not yet "read" into his session, per chat key.
     unseen: HashMap<String, Vec<String>>,
     /// Recent speakers per group chat key, for the audience and recall.
@@ -524,6 +528,8 @@ impl Agli {
             appraisals: ConversationAppraisals::default(),
             board: Arc::new(Mutex::new(board)),
             jobs: BTreeMap::new(),
+            evolution_job: None,
+            evolution_restart: None,
             unseen: HashMap::new(),
             speakers: HashMap::new(),
             deliveries: Vec::new(),
@@ -1264,7 +1270,8 @@ impl Agli {
         Ok(match cmd {
             "/help" => "/status 状态  /board 看板  /task 描述 新研究任务  /code 描述 新编码任务  /run 任务编号 立即开始\n\
                         /stop 停下当前任务  /freeze 冻结主动行为与工具  /unfreeze 解冻\n\
-                        /digest 现在发待决事项  /approve 编号  /reject 编号 理由  /reflect 现在整理记忆"
+                        /digest 现在发待决事项  /approve 编号  /reject 编号 理由  /reflect 现在整理记忆\n\
+                        /evolve 提案ID 检查核心代码提案  /evolve-status 提案ID 查看进度"
                 .into(),
             "/status" => {
                 let (spent, limit) = self.models.spent_today();
@@ -1289,19 +1296,28 @@ impl Agli {
                 format!("记下了：{}", t.id)
             }
             "/run" if !arg.is_empty() => self.start_job_with_owner_slot(arg, ctx.owner_private())?,
-            "/stop" => match self.stop_jobs().await {
-                ids if !ids.is_empty() => {
-                    for id in &ids { self.board().set_status(id, TaskStatus::Waiting, "主人让我停下")?; }
-                    if self.cfg.runtime.hands.max_jobs == 1 || self.flow.task_id.as_ref().is_some_and(|id| ids.contains(id)) {
-                        self.exit_flow();
+            "/evolve" => self.start_evolution(arg, ctx)?,
+            "/evolve-status" => {
+                anyhow::ensure!(ctx.owner_private(), "只有主人私聊能查看进化提案");
+                self.evolution_gate().status(arg)?
+            }
+            "/stop" => {
+                let evolution = self.stop_evolution().await?;
+                match self.stop_jobs().await {
+                    ids if !ids.is_empty() => {
+                        for id in &ids { self.board().set_status(id, TaskStatus::Waiting, "主人让我停下")?; }
+                        if self.cfg.runtime.hands.max_jobs == 1 || self.flow.task_id.as_ref().is_some_and(|id| ids.contains(id)) {
+                            self.exit_flow();
+                        }
+                        self.catch_up_focus().await?;
+                        format!("停了：{}{}", ids.join("、"), if evolution { "；进化任务也已停止。" } else { "" })
                     }
-                    self.catch_up_focus().await?;
-                    format!("停了：{}", ids.join("、"))
+                    _ => if evolution { "已停下进化检查或提交；记录已保留，未自动重试。".into() } else { "现在没在做任务。".into() },
                 }
-                _ => "现在没在做任务。".into(),
-            },
+            }
             "/freeze" => {
                 self.store.kv_set("frozen", json!(true))?;
+                self.stop_evolution().await?;
                 let ids = self.stop_jobs().await;
                 if !ids.is_empty() {
                     for id in &ids { self.board().set_status(id, TaskStatus::Waiting, "冻结")?; }
@@ -1319,7 +1335,10 @@ impl Agli {
             "/digest" => judge::digest(self.store.as_ref())?.unwrap_or_else(|| "没有待你决定的事。".into()),
             "/approve" | "/reject" => {
                 let (id, reason) = arg.split_once(char::is_whitespace).map(|(i, r)| (i, r.trim())).unwrap_or((arg, ""));
-                self.settle_review(id.trim_start_matches('#').parse()?, cmd == "/approve", reason, ctx)?
+                let id = id.trim_start_matches('#').parse()?;
+                if cmd == "/approve" && self.store.reviews()?.iter().any(|r| r.id == id && r.payload.get("evolution").is_some()) {
+                    self.approve_evolution(id, reason, ctx)?
+                } else { self.settle_review(id, cmd == "/approve", reason, ctx)? }
             }
             "/reflect" => {
                 let n = self.extract_all(chrono::Duration::days(2)).await?;
@@ -1338,6 +1357,10 @@ impl Agli {
             .ok_or_else(|| anyhow::anyhow!("没有 #{id}"))?;
         if item.status != ReviewStatus::Open {
             return Ok(format!("#{id} 已经处理过了。"));
+        }
+        if item.payload.get("evolution").is_some() {
+            anyhow::ensure!(ctx.owner_private() && !approve, "进化审批必须走主人专用入口");
+            self.evolution_gate().reject(&item)?;
         }
         if let Some(sender) = item.payload.get("agent_candidate").and_then(Value::as_str) {
             bot_flags::settle(self.store.as_ref(), sender, approve)?;
@@ -2579,6 +2602,28 @@ mod tests {
             restarted.on_messages(vec![env]).await.unwrap();
         }
         assert_eq!(restarted.store.reviews().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn evolution_commands_require_owner_private_context_and_obey_freeze() {
+        let mut test = TestAgli::new("evolution-acl").await;
+        let a = &mut test.agli;
+        let mut stranger = a.focus_ctx("telegram", "42", "42").unwrap();
+        stranger.partner.as_mut().unwrap().is_owner = false;
+        assert!(a.run_command("/evolve", "candidate", &stranger).await.is_err());
+        let mut owner = a.focus_ctx("telegram", "42", "42").unwrap();
+        owner.is_group = true;
+        assert!(a.run_command("/evolve", "candidate", &owner).await.is_err());
+        owner.is_group = false;
+        a.run_command("/freeze", "", &owner).await.unwrap();
+        assert!(a.run_command("/evolve", "candidate", &owner).await.is_err());
+        a.run_command("/unfreeze", "", &owner).await.unwrap();
+        assert!(a.run_command("/evolve", "../candidate", &owner).await.is_err());
+        assert!(a.evolution_job.is_none());
+        a.run_command("/evolve", "candidate", &owner).await.unwrap();
+        assert!(a.evolution_job.is_some());
+        a.run_command("/freeze", "", &owner).await.unwrap();
+        assert!(a.evolution_job.is_none());
     }
 
     #[tokio::test]

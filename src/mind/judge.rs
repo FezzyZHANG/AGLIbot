@@ -91,7 +91,8 @@ pub async fn review_with_limit(models: &Models, category: ReviewCategory, subjec
         checklist(category)
     );
     // If no reviewer is available or it fails, the item goes to the owner instead of through.
-    match models.ask_json_with_limit::<Raw>("verify", &ProcessingPolicy::Any, system, &user, limit).await {
+    let scenario = if category == ReviewCategory::Evolve { "evolve" } else { "verify" };
+    match models.ask_json_with_limit::<Raw>(scenario, &ProcessingPolicy::Any, system, &user, limit).await {
         Ok(raw) => Ok(Judgement { verdict: Verdict::parse(&raw.verdict), reasons: raw.reasons, fixes: raw.fixes, urgent: raw.urgent }),
         Err(e) => {
             tracing::warn!("review unavailable, forwarding to owner: {e:#}");

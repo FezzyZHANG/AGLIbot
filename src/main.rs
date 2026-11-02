@@ -2,6 +2,7 @@ mod agli;
 mod channels;
 mod config;
 mod config_watch;
+mod evolution;
 mod hands;
 mod mind;
 mod ns;
@@ -48,6 +49,12 @@ async fn recv_work(events: &mut mpsc::Receiver<Event>, queued: &mut WorkQueue, a
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("evolution-restart") {
+        let mut args = std::env::args().skip(2);
+        let parent = args.next().ok_or_else(|| anyhow::anyhow!("missing parent PID"))?.parse()?;
+        let request = args.next().ok_or_else(|| anyhow::anyhow!("missing restart request"))?;
+        return evolution::restart::helper(parent, request.into());
+    }
     dotenvy::dotenv().ok();
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("import-jsonl")) {
         return store::import::run(std::env::args_os().skip(2));
@@ -122,15 +129,28 @@ async fn main() -> Result<()> {
     let mut agli = Agli::new(cfg.clone(), store, models, outlets, events_tx)?;
     let mut config_poll = tokio::time::interval(Duration::from_secs(2));
     config_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    agli.acknowledge_evolution_start()?;
     info!("AGLI is up");
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            _ = config_poll.tick() => agli.reload_config(&mut config_watcher),
+            _ = config_poll.tick() => {
+                agli.reload_config(&mut config_watcher);
+                agli.poll_evolution().await;
+            },
             work = recv_work(&mut events, &mut queued, &cfg.acl, &cfg.runtime.session) => match work {
                 Some(work) => agli.handle(work).await,
                 None => break,
             },
+        }
+        if let Some(restart) = agli.take_evolution_restart() {
+            match restart.launch().await {
+                Ok(()) => break,
+                Err(e) => {
+                    let _ = restart.receipt("failed", Some(&format!("{e:#}")));
+                    warn!("evolution restart failed; old bot remains running: {e:#}");
+                }
+            }
         }
     }
     info!("bye");
