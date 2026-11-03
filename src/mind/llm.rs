@@ -185,11 +185,11 @@ pub fn parse_anthropic(v: &Value) -> Result<(String, Value, Usage)> {
 }
 
 pub fn parse_openai(v: &Value) -> Result<(String, Usage)> {
-    let text = v
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("response has no choices[0].message.content"))?
-        .to_string();
+    let text = strip_thought_tags(
+        v.pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("response has no choices[0].message.content"))?,
+    );
     let total = u64_at(v, "/usage/prompt_tokens");
     // OpenAI reports prompt_tokens_details.cached_tokens; DeepSeek reports prompt_cache_hit_tokens.
     let cached = u64_at(v, "/usage/prompt_tokens_details/cached_tokens").max(u64_at(v, "/usage/prompt_cache_hit_tokens"));
@@ -200,6 +200,34 @@ pub fn parse_openai(v: &Value) -> Result<(String, Usage)> {
         output: u64_at(v, "/usage/completion_tokens"),
     };
     Ok((text, usage))
+}
+
+/// Some OpenAI-compatible relays (the Gemini one) inline thinking as `<thought>…</thought>`
+/// in the content, sometimes empty; it is never part of the reply.
+fn strip_thought_tags(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    loop {
+        let open = ["<thought>", "<think>"].iter().filter_map(|t| rest.find(t).map(|i| (i, *t))).min();
+        let Some((start, tag)) = open else { break };
+        let close = format!("</{}", &tag[1..]);
+        let Some(end) = rest[start..].find(&close) else { break };
+        out.push_str(&rest[..start]);
+        rest = &rest[start + end + close.len()..];
+    }
+    out.push_str(rest);
+    if out.len() == text.len() { out } else { out.trim_start().to_string() }
+}
+
+/// Roles and lengths of a chat request, without its content, for diagnosing rejected requests.
+fn request_shape(body: &Value) -> String {
+    let messages = body["messages"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let parts: Vec<String> = messages.iter().map(|m| {
+        let role = m["role"].as_str().unwrap_or("?").chars().next().unwrap_or('?');
+        format!("{role}{}", m["content"].as_str().map_or(0, |c| c.chars().count()))
+    }).collect();
+    let shown = parts.iter().rev().take(40).rev().cloned().collect::<Vec<_>>().join(",");
+    format!("request messages={} [{}{shown}]", parts.len(), if parts.len() > 40 { "…," } else { "" })
 }
 
 pub struct LlmClient {
@@ -272,14 +300,15 @@ impl LlmClient {
             }
             ProviderKind::OpenaiCompat => {
                 let base = provider_base_url(provider).ok_or_else(|| anyhow!("provider {} needs base_url", m.provider))?;
+                let request = openai_body(m, p);
                 let mut req = self
                     .http
                     .post(format!("{}/chat/completions", base.trim_end_matches('/')))
-                    .json(&openai_body(m, p));
+                    .json(&request);
                 if let Some(key) = &key {
                     req = req.bearer_auth(key);
                 }
-                let body = send_text(req).await?;
+                let body = send_text(req).await.map_err(|e| anyhow!("{e:#} ({})", request_shape(&request)))?;
                 let (text, usage) = if m.stream {
                     parse_openai_stream(&body)?
                 } else {
@@ -427,6 +456,25 @@ mod tests {
         let (text, usage) = parse_openai_stream(body).unwrap();
         assert_eq!(text, "你好！");
         assert_eq!(usage, Usage { uncached_input: 100, cached_input: 400, output: 30, cache_write: 0 });
+    }
+
+    #[test]
+    fn inline_thought_tags_never_reach_the_reply() {
+        let reply = |content: &str| parse_openai(&json!({"choices": [{"message": {"content": content}}]})).unwrap().0;
+        assert_eq!(reply("<thought>
+</thought>撤回也没用。"), "撤回也没用。");
+        assert_eq!(reply("<think>想想</think>
+
+好。"), "好。");
+        assert_eq!(reply("a<thought>x</thought>b<thought>y</thought>c"), "abc");
+        assert_eq!(reply("  缩进保留"), "  缩进保留");
+        assert_eq!(reply("提到 <thought> 但没闭合"), "提到 <thought> 但没闭合");
+    }
+
+    #[test]
+    fn request_shape_lists_roles_and_lengths_only() {
+        let body = json!({"messages": [{"role": "system", "content": "秘密"}, {"role": "user", "content": ""}]});
+        assert_eq!(request_shape(&body), "request messages=2 [s2,u0]");
     }
 
     #[test]

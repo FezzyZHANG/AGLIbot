@@ -13,6 +13,8 @@ pub fn requested(text: &str) -> Option<String> {
     let text = text.split_whitespace().filter(|w| !w.starts_with('@')).collect::<Vec<_>>().join(" ");
     let rest = text.strip_prefix("/技能")?.trim_start();
     let name = rest.strip_prefix(':').or_else(|| rest.strip_prefix('：'))?.trim();
+    // People copy the `<名>` placeholder literally.
+    let name = name.strip_prefix('<').and_then(|n| n.strip_suffix('>')).unwrap_or(name).trim();
     (!name.is_empty()).then(|| name.to_string())
 }
 
@@ -36,6 +38,7 @@ mod tests {
         assert_eq!(requested("/技能:战技").as_deref(), Some("战技"));
         assert_eq!(requested("  /技能： 终结技 ").as_deref(), Some("终结技"));
         assert_eq!(requested("@zhuang_bot /技能:连携 @zhuang_bot").as_deref(), Some("连携"));
+        assert_eq!(requested("/技能:<连携技>").as_deref(), Some("连携技"));
         assert_eq!(requested("/技能:"), None);
         assert_eq!(requested("/技能战技"), None);
         assert_eq!(requested("看 /技能:战技"), None);
