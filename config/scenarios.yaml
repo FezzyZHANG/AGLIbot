@@ -13,4 +13,4 @@ research_plan: { q_min: 8, priority: quality }
 verify:        { q_min: 8, priority: quality, review: true, budget_exempt: true }
 synthesize:    { q_min: 8, priority: quality }
 act:           { q_min: 8, priority: quality, review: true, budget_exempt: true }
-evolve:        { q_min: 9, priority: quality, review: true, budget_exempt: true }
+evolve:        { model: opus, q_min: 8.8, priority: quality, review: true, budget_exempt: true }
