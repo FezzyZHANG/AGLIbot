@@ -1,18 +1,17 @@
 # 部署
 
-在线的 bot 不从开发 checkout 运行。这里说明三个目录分别管什么，以及“当前跑的是哪个版本”记在哪里。
+在线的 bot 不从开发 checkout 运行。这里说明两个目录分别管什么，以及“当前跑的是哪个版本”记在哪里。
 
-## 三个目录
+## 两个目录
 
 | 目录 | 作用 | 例子 |
 |---|---|---|
 | 源码仓库（`AGLI_SOURCE`） | git、Moldloft、开发；进化闸门在这里建 worktree 和提交 | `C:\dev\AGLIbot` |
-| 部署 worktree | 手动部署时检出要构建的提交，不在里面改东西 | `C:\dev\AGLIbot-deploy` |
 | 运行时根（`AGLI_ROOT`） | 在线 bot 的 `config/`、`mind/`、`data/`、`work/`、`.env` | `C:\dev\AGLIbot-runtime\<名字>` |
 
 运行时根里有两个本机文件，都不进版本库：
 
-- `runtime.json`：`{source, deploy_worktree}`，供脚本使用。
+- `runtime.json`：`{source}`，供脚本使用。
 - `.env`：从源码仓库的 `.env` 复制而来，`MONGO_DATABASE` 指向这个运行时自己的库。bot 先读 `AGLI_ROOT/.env`，再读工作目录下的 `.env`；先读到的值优先。
 
 没有设置 `AGLI_SOURCE` 时，源码仓库就等于 `AGLI_ROOT`，也就是旧的单目录用法，测试和本地开发不受影响。
@@ -28,7 +27,8 @@
 有两条路线会写它，启动只认它：
 
 - **手动部署**：运行 `ops/deploy.ps1 -Runtime <根> [-Commit main] [-Force]`。
-  - 脚本在部署 worktree 中检出目标提交，用 `cargo build --locked --release` 构建到 `<根>/data/releases/<commit>/`。
+  - 脚本在临时 worktree（`%TEMP%\aglibot-deploy`，用完即删）中检出目标提交，用 `cargo build --locked --release` 构建。target 目录是源码仓库的 `target/deploy/`，各次部署共用，只重编改动过的部分。
+  - 只把 `aglibot.exe` 复制到 `<根>/data/releases/<commit>/aglibot.exe`。
   - 列出这个提交的 `config/` 与运行时 `config/` 的差异，只提示，不同步。
   - 写入指针（`origin: manual`），然后重启。
 - **进化**：闸门把 release 构建到 `<根>/data/evolution/releases/<id>/`。新进程通过校验并写入 `running` 回执后，写入指针（`origin: evolution:<id>`）。

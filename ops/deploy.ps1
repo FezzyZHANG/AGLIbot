@@ -18,7 +18,6 @@ function Native {
 $rt = (Resolve-Path -LiteralPath $Runtime).Path
 $cfg = Get-Content -Raw -LiteralPath (Join-Path $rt 'runtime.json') | ConvertFrom-Json
 $src = $cfg.source
-$wt = $cfg.deploy_worktree
 
 $target = Native git -C $src rev-parse --verify "$Commit^{commit}"
 if ($LASTEXITCODE -ne 0) { throw "unknown commit $Commit" }
@@ -33,21 +32,34 @@ if (Test-Path -LiteralPath $pointer) {
     }
 }
 
-if (Native git -C $wt status --porcelain) { throw "deploy worktree $wt has local changes" }
-Native git -C $wt checkout -q --detach $target
-if ($LASTEXITCODE -ne 0) { throw "checkout failed in $wt" }
-$targetDir = Join-Path $rt "data\releases\$target"
-Push-Location $wt
+# A throwaway worktree for the build. Its path stays fixed, and the target dir is shared across
+# deploys (in the source repo's ignored target\, outside the runtime root), so only changed
+# crates rebuild; the release itself is just the copied exe.
+$wt = Join-Path $env:TEMP 'aglibot-deploy'
+function Remove-Worktree {
+    if (Test-Path -LiteralPath $wt) { Native git -C $src worktree remove --force $wt | Out-Null }
+    if (Test-Path -LiteralPath $wt) { Remove-Item -Recurse -Force -LiteralPath $wt }
+    Native git -C $src worktree prune | Out-Null
+}
+Remove-Worktree
+Native git -C $src worktree add -q --detach $wt $target
+if ($LASTEXITCODE -ne 0) { throw "worktree add failed for $target" }
 try {
-    Native cargo build --locked --release --bin aglibot --target-dir $targetDir | Select-Object -Last 3
-    if ($LASTEXITCODE -ne 0) { throw 'build failed' }
-} finally { Pop-Location }
-$exe = Join-Path $targetDir 'release\aglibot.exe'
+    Push-Location $wt
+    try {
+        Native cargo build --locked --release --bin aglibot --target-dir (Join-Path $src 'target\deploy') | Select-Object -Last 3
+        if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+    } finally { Pop-Location }
+    $releaseDir = Join-Path $rt "data\releases\$target"
+    New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+    $exe = Join-Path $releaseDir 'aglibot.exe'
+    Copy-Item -Force -LiteralPath (Join-Path $src 'target\deploy\release\aglibot.exe') -Destination $exe
 
-# Runtime config is deliberately its own copy; show where it differs from this commit's defaults.
-"config differences (commit vs runtime):"
-Native git -c core.autocrlf=false --no-pager diff --no-index --stat --ignore-cr-at-eol -- (Join-Path $wt 'config') (Join-Path $rt 'config')
-if ($LASTEXITCODE -eq 0) { "  none" }
+    # Runtime config is deliberately its own copy; show where it differs from this commit's defaults.
+    "config differences (commit vs runtime):"
+    Native git -c core.autocrlf=false --no-pager diff --no-index --stat --ignore-cr-at-eol -- (Join-Path $wt 'config') (Join-Path $rt 'config')
+    if ($LASTEXITCODE -eq 0) { "  none" }
+} finally { Remove-Worktree }
 
 $release = [ordered]@{ commit = $target; exe = $exe; exe_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLower()
     origin = 'manual'; at = (Get-Date).ToUniversalTime().ToString('o') }
