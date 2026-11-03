@@ -28,7 +28,7 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $out = Join-Path $rt "data\logs\bot-$stamp.out.log"
 $err = Join-Path $rt "data\logs\bot-$stamp.err.log"
 # WMI starts the bot outside the caller's process tree, so it survives the shell (and Claude Code) that ran this.
-$line = "cmd.exe /d /s /c `"set `"AGLI_ROOT=$rt`"&& set `"AGLI_SOURCE=$($cfg.source)`"&& `"$($release.exe)`" 1>`"$out`" 2>`"$err`"`""
+$line = "cmd.exe /d /s /c `"set `"AGLI_ROOT=$rt`"&& set `"AGLI_SOURCE=$($cfg.source)`"&& set NO_COLOR=1&& `"$($release.exe)`" 1>`"$out`" 2>`"$err`"`""
 $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $line; CurrentDirectory = $rt }
 if ($r.ReturnValue -ne 0) { throw "Win32_Process.Create failed: $($r.ReturnValue)" }
 
