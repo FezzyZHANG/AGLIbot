@@ -166,6 +166,9 @@ pub struct SocialCfg {
     pub groups: Vec<String>,
     #[serde(default)]
     pub ignored_groups: Vec<String>,
+    /// Names that address him in a group like an @ does; matched as substrings, ASCII case-insensitive.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     #[serde(default)]
     pub read_only_reflect: ReadOnlyReflectCfg,
     /// Whether people other than the owner may chat with him in private.
@@ -198,6 +201,16 @@ impl Default for ReadOnlyReflectCfg {
 impl SocialCfg {
     pub fn read_only_group(&self, id: &str) -> bool {
         !self.groups.iter().any(|g| g == id) && !self.ignored_groups.iter().any(|g| g == id)
+    }
+
+    /// The alias a group message calls him by, ignoring the `[回复 名字: 引文]` quote QQ prepends.
+    pub fn called_by(&self, text: &str) -> Option<&str> {
+        let text = match text.strip_prefix("[回复") {
+            Some(rest) => rest.split_once(']').map_or("", |(_, after)| after),
+            None => text,
+        };
+        let text = text.to_lowercase();
+        self.aliases.iter().map(String::as_str).find(|a| !a.trim().is_empty() && text.contains(&a.to_lowercase()))
     }
 
     pub fn reflects_normally(&self, ns: &crate::ns::Namespace) -> bool {

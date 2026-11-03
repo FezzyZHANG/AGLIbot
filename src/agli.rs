@@ -552,6 +552,8 @@ pub struct Agli {
     evolution_restart: Option<crate::evolution::restart::Restart>,
     /// Group lines he has not yet "read" into his session, per chat key.
     unseen: HashMap<String, Vec<String>>,
+    /// Task titles whose markers were dropped (not an owner chat), told to him on the chat's next turn.
+    dropped_tasks: HashMap<String, Vec<String>>,
     /// Recent speakers per group chat key, for the audience and recall.
     speakers: HashMap<String, Vec<String>>,
     deliveries: Vec<research::Outcome>,
@@ -590,6 +592,7 @@ impl Agli {
             evolution_job: None,
             evolution_restart: None,
             unseen: HashMap::new(),
+            dropped_tasks: HashMap::new(),
             speakers: HashMap::new(),
             deliveries: Vec::new(),
             ignored_logged: HashSet::new(),
@@ -906,7 +909,11 @@ impl Agli {
 
         self.unseen.entry(ctx.key.clone()).or_default().push(line);
         let busy = self.flow.is_focused() || asleep;
-        let addressed = env.mentions_me && (!asleep || who.is_owner);
+        let called = if env.mentions_me { None } else { self.cfg.social.called_by(&env.text) };
+        if let Some(alias) = called {
+            info!("called by name `{alias}` in {}", ctx.key);
+        }
+        let addressed = (env.mentions_me || called.is_some()) && (!asleep || who.is_owner);
         let decision = if env.notice {
             if addressed { FloorDecision::Speak } else { FloorDecision::Silent("notice") }
         } else {
@@ -1158,7 +1165,10 @@ impl Agli {
     async fn converse_with_claim(&mut self, ctx: &ChatCtx, body: String, current: usize, unsolicited: bool, claim: Option<&str>) -> Result<()> {
         let now = Utc::now();
         let busy = if ctx.flow_ns.is_some() && ctx.flow_ns == self.flow.focus { None } else { self.flow.title.clone() };
-        let text = user_turn(&tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref()), &body);
+        let notes: Vec<String> = self.dropped_tasks.remove(&ctx.key).unwrap_or_default().iter()
+            .map(|t| format!("系统：你之前回复里的任务“{t}”没有建立（只有主人私聊里的任务才算），现在没有人在做它，也不会有结果。"))
+            .collect();
+        let text = user_turn(&tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref(), &notes), &body);
         // Recall runs on every turn (cheap at this volume) so the policy is known before routing.
         let tasks = ctx.task_cards(&self.board());
         let embedded = match self.models.embed(&ProcessingPolicy::default_for(&ctx.scope), &body).await {
@@ -1202,7 +1212,9 @@ impl Agli {
                 info!("owner asked for a task: {} ({})", t.title, t.id);
                 self.wake_decide = true;
             } else {
-                warn!("ignored a task marker outside an owner chat");
+                warn!("ignored a task marker outside an owner chat in {}: {title}", ctx.key);
+                // His transcript still holds the marker; tell him next turn so he does not act as if it runs.
+                self.dropped_tasks.entry(ctx.key.clone()).or_default().push(title.clone());
             }
         }
         if let Some(req) = &intent.relay {
@@ -1906,7 +1918,7 @@ impl Agli {
         let text = format!(
             "{}\n\n上次和主人说话：{since_owner}\n驱力：社交 {:.2}，好奇 {:.2}，成就感需求 {:.2}，疲惫 {:.2}\n\
              今天花费 ${spent:.3} / ${limit:.2}\n正在做：{}\n\n## 看板\n{}",
-            tail(now.with_timezone(&Local), &s.snapshot(), None),
+            tail(now.with_timezone(&Local), &s.snapshot(), None, &[]),
             s.drives.social,
             s.drives.curiosity,
             s.drives.competence,
@@ -4119,6 +4131,31 @@ mod tests {
         let second = a.prepare_messages(group_messages(&["three", "four"], false)).await;
         assert!(!second.speak && second.consider);
         assert_eq!(a.unseen["telegram:-7"].len(), 4);
+    }
+
+    #[tokio::test]
+    async fn calling_him_by_alias_addresses_him_like_a_mention() {
+        let mut test = TestAgli::new("alias").await;
+        let a = &mut test.agli;
+        Arc::make_mut(&mut a.cfg).social.aliases = vec!["小庄".into(), "Zhuang".into()];
+        assert!(a.prepare_messages(group_messages(&["小庄你怎么不说话了"], false)).await.speak);
+        assert!(a.prepare_messages(group_messages(&["hey zhuang"], false)).await.speak);
+        let quoted = a.prepare_messages(group_messages(&["[回复 某人: 小庄说的]我不同意"], false)).await;
+        assert!(!quoted.speak, "a quote of someone else's line does not call him");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_group_task_marker_is_told_to_him_on_the_next_turn() {
+        let mut test = TestAgli::new("dropped-task").await;
+        let a = &mut test.agli;
+        a.test_chat = Some(TestChat::new(&["好，我去看看。<任务>测一下基准</任务>", "[沉默]"], &[Outcome::Sent]));
+        a.on_messages(group_messages(&["去测一下"], true)).await.unwrap();
+        assert!(a.board().tasks().is_empty());
+        a.on_messages(group_messages(&["测完没"], true)).await.unwrap();
+        let turns = &a.test_chat.as_ref().unwrap().turns;
+        assert!(!turns[0].1.contains("没有建立"), "{}", turns[0].1);
+        assert!(turns[1].1.contains("任务“测一下基准”没有建立"), "{}", turns[1].1);
+        assert!(a.dropped_tasks.is_empty());
     }
 
     #[tokio::test]
