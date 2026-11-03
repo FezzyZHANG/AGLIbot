@@ -1,0 +1,289 @@
+{
+  "saved_date": "2026-11-02",
+  "timezone": "Asia/Singapore",
+  "method": "GitHub connector fetch; UTF-8/LF local snapshot",
+  "scope": "selected transcripts and scene compilations; no skill installation",
+  "files": [
+    {
+      "url": "https://github.com/AngChow/endfield-story-corpus/blob/main/%E4%BB%BB%E5%8A%A1/0036_e6m1_%E6%83%8A%E9%B8%BF%E4%B8%80%E7%9E%A5.md",
+      "path": "corpus/任务/0036_e6m1_惊鸿一瞥.md",
+      "kind": "community_game_transcript",
+      "blob_sha": "7a2531cc07b2fc46c5c27d5fb2a1f935a9deda7b",
+      "source_characters": 15005
+    },
+    {
+      "url": "https://github.com/AngChow/endfield-story-corpus/blob/main/%E4%BB%BB%E5%8A%A1/0038_e6m3_%E7%A9%86%E5%A6%82%E6%B8%85%E9%A3%8E.md",
+      "path": "corpus/任务/0038_e6m3_穆如清风.md",
+      "kind": "community_game_transcript",
+      "blob_sha": "bd80bee396e094b278d637f697f9526aed062e42",
+      "source_characters": 17854
+    },
+    {
+      "url": "https://github.com/AngChow/endfield-story-corpus/blob/main/%E4%BB%BB%E5%8A%A1/0057_e9m4_%E5%BD%93%E6%97%B6%E6%90%BA%E6%89%8B%E5%A4%84.md",
+      "path": "corpus/任务/0057_e9m4_当时携手处.md",
+      "kind": "community_game_transcript",
+      "blob_sha": "32b44c6800cdf7f6cdccca7e12e72d0d44fac787",
+      "source_characters": 12665
+    },
+    {
+      "url": "https://github.com/AngChow/endfield-story-corpus/blob/main/%E4%BB%BB%E5%8A%A1/0058_e10m1_%E5%A2%99%E5%B4%A9%E5%9B%A0%E9%9A%99.md",
+      "path": "corpus/任务/0058_e10m1_墙崩因隙.md",
+      "kind": "community_game_transcript",
+      "blob_sha": "f8ab13ab31f56beb2dfb2245315a3c18e0c9c12e",
+      "source_characters": 9837
+    },
+    {
+      "url": "https://github.com/AngChow/endfield-story-corpus/blob/main/%E4%BB%BB%E5%8A%A1/0059_e10m2_%E5%A4%A7%E5%99%A8%E6%99%9A%E6%88%90.md",
+      "path": "corpus/任务/0059_e10m2_大器晚成.md",
+      "kind": "community_game_transcript",
+      "blob_sha": "c62c85520aa2b2d54d71b4098bf10cac241bb2c3",
+      "source_characters": 8998
+    },
+    {
+      "url": "https://github.com/AngChow/endfield-story-corpus/blob/main/%E4%BB%BB%E5%8A%A1/0061_e10m4_%E5%BF%97%E5%90%8C%E9%81%93%E5%90%88.md",
+      "path": "corpus/任务/0061_e10m4_志同道合.md",
+      "kind": "community_game_transcript",
+      "blob_sha": "b20f375119fc413d6519820dece64c8a94a4ea77",
+      "source_characters": 15666
+    },
+    {
+      "url": "https://github.com/AngChow/endfield-story-corpus/blob/main/干员/0001_zhuang-fangyi_庄方宜.md",
+      "path": "corpus/干员/0001_zhuang-fangyi_庄方宜.md",
+      "kind": "community_game_transcript",
+      "source_characters": 14640
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/mi-fu-challenge.md",
+      "path": "secondary/references/raw/mi-fu-challenge.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "b9367b6ccd1029d2cba0ac18e1a84ca2548f2a72",
+      "source_characters": 679
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/northern-return.md",
+      "path": "secondary/references/raw/northern-return.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "4dff998dba498e8e3febc41fb5cdce611609a46e",
+      "source_characters": 2276
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/operator-profile.md",
+      "path": "secondary/references/raw/operator-profile.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "58d16e55e6cd51132de39ea7f06fdf412bd1d156",
+      "source_characters": 4526
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-01-lab-archive-interlude.md",
+      "path": "secondary/references/raw/scene-01-lab-archive-interlude.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "c0cf88e9b9e131342227243379b7fb33446f7b37",
+      "source_characters": 3549
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-02-pear-blossom-avenue.md",
+      "path": "secondary/references/raw/scene-02-pear-blossom-avenue.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "955be830a0177c4a463f82a1105b0c6b5794a93d",
+      "source_characters": 1253
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-03-street-performance-detour.md",
+      "path": "secondary/references/raw/scene-03-street-performance-detour.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "87313d045ea9058509e0be3632c8ac32e5bb8d65",
+      "source_characters": 4899
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-04-boundary-stone-rift.md",
+      "path": "secondary/references/raw/scene-04-boundary-stone-rift.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "2c06a789e0bc7ccbc93f745c2682d064e5d2b0f3",
+      "source_characters": 2183
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-05-hub-instrument-collab.md",
+      "path": "secondary/references/raw/scene-05-hub-instrument-collab.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "e06a0913dace66529b73f48520ada1d631f8b1a0",
+      "source_characters": 2311
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-06-letter-and-elevator.md",
+      "path": "secondary/references/raw/scene-06-letter-and-elevator.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "faecaeb9a7676e24aa30b90114ba68c027a66b2f",
+      "source_characters": 3931
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-07-scroll-archive-young-zhuang.md",
+      "path": "secondary/references/raw/scene-07-scroll-archive-young-zhuang.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "4059da3a49ea8ac21faa07d199fd49e5e5de9256",
+      "source_characters": 1938
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-08-scroll-silt-birth-meeting.md",
+      "path": "secondary/references/raw/scene-08-scroll-silt-birth-meeting.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "d8863f8e0ab08a8621472db6cf048edbf0da604a",
+      "source_characters": 1674
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-09-scroll-disaster-self-and-rift-end.md",
+      "path": "secondary/references/raw/scene-09-scroll-disaster-self-and-rift-end.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "333040c9adef1221237cf7bf386879875670e900",
+      "source_characters": 1712
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-10-surface-return-bamboo-wine.md",
+      "path": "secondary/references/raw/scene-10-surface-return-bamboo-wine.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "5351eba4c7d364aac65dcd3b27e213424d7fda1f",
+      "source_characters": 2591
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-11-northern-expedition-part-01.md",
+      "path": "secondary/references/raw/scene-11-northern-expedition-part-01.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "bbf18e04bc675213ee2fa10c09f3de618f962603",
+      "source_characters": 2133
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-11-northern-expedition-part-02.md",
+      "path": "secondary/references/raw/scene-11-northern-expedition-part-02.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "799590e87f5eecc68fe4756663fba92933b2b3e4",
+      "source_characters": 2001
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-12-outpost-and-homecoming.md",
+      "path": "secondary/references/raw/scene-12-outpost-and-homecoming.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "a1fad7d364e0cf1e8fabac77d76ca10760a33f95",
+      "source_characters": 1501
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-13-research-site-memorial-part-01.md",
+      "path": "secondary/references/raw/scene-13-research-site-memorial-part-01.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "be36d13555a16512c8c7c446d7107f717651dcda",
+      "source_characters": 1399
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-13-research-site-memorial-part-02.md",
+      "path": "secondary/references/raw/scene-13-research-site-memorial-part-02.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "624143d0736583d0d1d7a7d171b3ea1b2d431e93",
+      "source_characters": 4370
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-13-research-site-memorial-part-03.md",
+      "path": "secondary/references/raw/scene-13-research-site-memorial-part-03.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "0c99195767496445afef61e9d8d9c782979f200c",
+      "source_characters": 3538
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-14-after-victory-part-01.md",
+      "path": "secondary/references/raw/scene-14-after-victory-part-01.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "36478bc9af56e88a6430c8e0de004badb4b1fa59",
+      "source_characters": 2534
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/references/raw/scene-15-mi-fu-baker.md",
+      "path": "secondary/references/raw/scene-15-mi-fu-baker.md",
+      "kind": "community_scene_compilation_unverified",
+      "blob_sha": "bfed6763932c3147338d6396c52f881ea410cca8",
+      "source_characters": 1069
+    },
+    {
+      "url": "https://github.com/AngChow/endfield-story-corpus/blob/main/README.md",
+      "path": "corpus/README.md",
+      "kind": "source_documentation",
+      "source_characters": 2189
+    },
+    {
+      "url": "https://github.com/AngChow/endfield-story-corpus/blob/main/LICENSE",
+      "path": "corpus/LICENSE",
+      "kind": "source_documentation",
+      "source_characters": 455
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/README.md",
+      "path": "secondary/README.md",
+      "kind": "source_documentation",
+      "source_characters": 6707
+    },
+    {
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill/blob/main/LICENSE",
+      "path": "secondary/LICENSE",
+      "kind": "source_documentation",
+      "source_characters": 1065
+    }
+  ],
+  "links": [
+    {
+      "title": "官方角色入口",
+      "url": "https://endfield.hypergryph.com/operator",
+      "status": "官方网页；链接留存"
+    },
+    {
+      "title": "庄方宜档案与语音（华法琳）",
+      "url": "https://warfarin.wiki/cn/operators/zhuang-fangyi",
+      "status": "社区资料页；本地 corpus 为上游历史快照，不是此网页当前版本的完整镜像"
+    },
+    {
+      "title": "庄方宜档案与语音（BWIKI）",
+      "url": "https://wiki.biligame.com/zmd/庄方宜",
+      "status": "社区资料页；链接留存"
+    },
+    {
+      "title": "穆如清风",
+      "url": "https://warfarin.wiki/cn/missions/e6m3",
+      "status": "corpus 已保存任务文本"
+    },
+    {
+      "title": "大器晚成（扩展段）",
+      "url": "https://endfield.games/zh-Hans/quests/wuling-city/e10m2d5/",
+      "status": "链接留存；本地 corpus 保存 e10m2 主任务"
+    },
+    {
+      "title": "志同道合",
+      "url": "https://warfarin.wiki/cn/missions/e10m4",
+      "status": "corpus 已保存任务文本"
+    },
+    {
+      "title": "志同道合（另一 Wiki 扩展段）",
+      "url": "https://www.endfield.games/zh-Hans/quests/cross-region/e10m4d5/",
+      "status": "链接留存"
+    },
+    {
+      "title": "中文干员语音合集",
+      "url": "https://www.bilibili.com/video/BV1FcdqBCEea/",
+      "status": "仅链接；未下载音视频、未听验或转录"
+    },
+    {
+      "title": "满信赖语音",
+      "url": "https://www.bilibili.com/video/BV1m79rB8E2s/",
+      "status": "仅链接；未下载音视频、未听验或转录"
+    },
+    {
+      "title": "干员叙事：总有春风归故里",
+      "url": "https://www.bilibili.com/video/BV13ydbB3EGK/",
+      "status": "仅链接；未下载音视频、未听验或转录"
+    },
+    {
+      "title": "剧情文本库",
+      "url": "https://github.com/AngChow/endfield-story-corpus",
+      "status": "仅保存本次相关选篇与 README/LICENSE，并非全库"
+    },
+    {
+      "title": "庄方宜角色资料仓库",
+      "url": "https://github.com/MengPaul07/zhuang-fangyi-skill",
+      "status": "保存 references/raw 与 README/LICENSE；未安装或启用 skill"
+    }
+  ]
+}
