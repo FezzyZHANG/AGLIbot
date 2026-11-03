@@ -163,6 +163,7 @@ AGLIbot/
 
 - **namespace 只是组织边界，不等于访问权限。** 同一个项目里可以同时有公开资料和私聊内容。跨 namespace 使用信息必须显式选择，并且满足 scope。
 - **检索规则**：只有当前听众全部在 scope 允许范围内的记忆，才能进入上下文。这条由 `privacy.rs` 在代码层强制执行。
+- **群记忆可以进成员的私聊，反过来不行**（#78）：`group:<id>` 的记忆允许出现在与该群成员的私聊里。成员 = 在群里说过话的人，或 QQ 私聊时经 NapCat 查到在群里的人；只增不减，后入群的人也能听到入群前的事，退群不收回。`persons:[ids]` 的记忆仍然不进任何群。
 - `processing_policy` 默认由 scope 推导（例如 `self` → `local_only`），只在个别 namespace 上手动覆盖，以减少你的配置工作。
 - namespace 同时是心流分桶的键，也是 L2 缓存前缀的单位（见第 4 节）。
 - 命名提示：MongoDB 自己把 `db.collection` 称作 namespace，所以字段名统一用 `ns`，避免看日志时混淆。

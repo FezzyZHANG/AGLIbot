@@ -270,6 +270,17 @@ impl QqHandle {
         tokio::time::timeout(FORWARD_TIMEOUT, self.call("get_msg", json!({ "message_id": id }))).await.map_err(|_| anyhow!("get_msg timed out"))?
     }
 
+    /// Groups the bot account is in.
+    pub async fn group_ids(&self) -> Result<Vec<i64>> {
+        let data = self.call("get_group_list", json!({})).await?;
+        Ok(data.as_array().into_iter().flatten().filter_map(|g| g.get("group_id")).filter_map(|id| id_string(id).parse().ok()).collect())
+    }
+
+    /// NapCat fails the call for a non-member; any failure counts as not (yet) known.
+    pub async fn in_group(&self, group_id: i64, user_id: i64) -> bool {
+        self.call("get_group_member_info", json!({ "group_id": group_id, "user_id": user_id })).await.is_ok()
+    }
+
     /// The nodes of a merged forward.
     async fn forward_nodes(&self, id: &str) -> Result<Vec<Value>> {
         let data = tokio::time::timeout(FORWARD_TIMEOUT, self.call("get_forward_msg", json!({ "message_id": id })))

@@ -75,6 +75,8 @@ impl<'de> Deserialize<'de> for Namespace {
 pub struct Audience {
     pub members: BTreeSet<String>,
     pub group: Option<String>,
+    /// Private chats only: groups every member has been in, whose memories they may hear.
+    pub member_of: BTreeSet<String>,
 }
 
 impl Audience {
@@ -83,11 +85,16 @@ impl Audience {
     }
 
     pub fn private(person_id: &str) -> Self {
-        Audience { members: BTreeSet::from([person_id.to_string()]), group: None }
+        Audience { members: BTreeSet::from([person_id.to_string()]), ..Self::default() }
+    }
+
+    /// A private chat whose one member was in these groups (membership is never revoked).
+    pub fn private_member_of(person_id: &str, groups: impl IntoIterator<Item = String>) -> Self {
+        Audience { member_of: groups.into_iter().collect(), ..Self::private(person_id) }
     }
 
     pub fn group(group_id: &str, members: impl IntoIterator<Item = String>) -> Self {
-        Audience { members: members.into_iter().collect(), group: Some(group_id.to_string()) }
+        Audience { members: members.into_iter().collect(), group: Some(group_id.to_string()), ..Self::default() }
     }
 
     pub fn is_solo(&self) -> bool {
@@ -119,7 +126,11 @@ impl Scope {
             Scope::SelfOnly => false,
             // We never know a group's full membership, so person-scoped memories stay out of groups.
             Scope::Persons { ids } => aud.group.is_none() && aud.members.iter().all(|m| ids.contains(m)),
-            Scope::Group { id } => aud.group.as_deref() == Some(id.as_str()),
+            // Group talk may reach its members in private, never the other way round.
+            Scope::Group { id } => match &aud.group {
+                Some(g) => g == id,
+                None => aud.member_of.contains(id),
+            },
             Scope::Public => true,
         }
     }
@@ -201,6 +212,10 @@ mod tests {
         assert!(g.permits(&Audience::group("g1", ["alice".to_string()])));
         assert!(!g.permits(&Audience::group("g2", ["alice".to_string()])));
         assert!(!g.permits(&Audience::private("alice")));
+        assert!(g.permits(&Audience::private_member_of("alice", ["g1".to_string()])));
+        assert!(!g.permits(&Audience::private_member_of("alice", ["g2".to_string()])));
+        // Membership elsewhere never lets one group's talk into another group.
+        assert!(!g.permits(&Audience { member_of: ["g1".to_string()].into(), ..Audience::group("g2", ["alice".to_string()]) }));
         assert!(!Scope::SelfOnly.permits(&Audience::private("owner")));
         assert!(Scope::Public.permits(&Audience::group("g2", [])));
     }

@@ -240,6 +240,7 @@ mod tests {
             last_update_day: None,
             facts: vec![Fact { text: "在考虑换工作".into(), ns: "person/owner".parse().unwrap(), scope: private, ts: Utc::now() }],
             last_seen: Utc::now(),
+            groups: vec!["qq:1".into()],
         };
         let partners = [&owner];
 
@@ -253,12 +254,25 @@ mod tests {
         assert_eq!(r.withheld, 2);
 
         let owner_ns: Namespace = "person/owner".parse().unwrap();
-        let dm = Audience::private("owner");
-        let q = Query { audience: &dm, ns: &owner_ns, partners: &partners, max_episodes: 10, max_facts: 10, include_lessons: false, half_life_days: 30.0 };
+        let outsider = Audience::private("owner");
+        let q = Query { audience: &outsider, ns: &owner_ns, partners: &partners, max_episodes: 10, max_facts: 10, include_lessons: false, half_life_days: 30.0 };
         let text = render(&recall(&store, &q).unwrap());
         assert!(text.contains("辞职") && text.contains("换工作"));
-        // The group episode involved the owner but is scoped to the group: not in the DM either.
+        // Without membership the group episode stays out of the DM, even though he took part.
         assert!(!text.contains("Rust"));
+
+        // A member may hear the group's talk in private.
+        let member = Audience::private_member_of("owner", owner.groups.clone());
+        let q = Query { audience: &member, ..q };
+        let text = render(&recall(&store, &q).unwrap());
+        assert!(text.contains("辞职") && text.contains("Rust"), "{text}");
+
+        // Someone who was never in the group does not, even when talking about a member.
+        let stranger_ns: Namespace = "person/qq:6".parse().unwrap();
+        let stranger = Audience::private_member_of("qq:6", ["qq:2".to_string()]);
+        let q = Query { audience: &stranger, ns: &stranger_ns, ..q };
+        let r = recall(&store, &q).unwrap();
+        assert!(r.is_empty(), "{}", render(&r));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

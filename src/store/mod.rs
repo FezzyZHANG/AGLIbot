@@ -203,6 +203,9 @@ pub struct Person {
     #[serde(default)]
     pub facts: Vec<Fact>,
     pub last_seen: DateTime<Utc>,
+    /// Groups (`platform:group_id`) they were seen in; append-only, see `Scope::permits`.
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 /// A generalised, de-identified lesson from reflection. Always created with scope `self`.

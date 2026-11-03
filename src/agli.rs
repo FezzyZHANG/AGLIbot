@@ -436,6 +436,8 @@ struct OvernightChat {
 const OVERNIGHT_CHATS: &str = "overnight_chats";
 /// Prefixed to the owner's group lines; `speaker_label` strips these brackets from nicknames.
 const OWNER_MARK: &str = "【主人】";
+/// Bounds the first-DM NapCat lookup, which runs on the message loop.
+const MEMBERSHIP_LOOKUP: Duration = Duration::from_secs(10);
 
 impl ChatCtx {
     fn owner_private(&self) -> bool {
@@ -558,6 +560,8 @@ pub struct Agli {
     speakers: HashMap<String, Vec<String>>,
     deliveries: Vec<research::Outcome>,
     ignored_logged: HashSet<String>,
+    /// People whose QQ group membership was looked up this run.
+    membership_checked: HashSet<String>,
     wake_decide: bool,
     #[cfg(test)]
     test_chat: Option<tests::TestChat>,
@@ -568,6 +572,7 @@ impl Agli {
         let l1 = build_l1(&cfg.mind_dir())?;
         let mut people = People::load(store.as_ref())?;
         people.ensure(store.as_ref(), &cfg.acl.owner.person_id, "主人", Tier::Owner)?;
+        people.backfill_groups(store.as_ref())?;
         let mut flow = Flow::load(&cfg.data_dir());
         if flow.is_focused() {
             let now = Utc::now();
@@ -596,6 +601,7 @@ impl Agli {
             speakers: HashMap::new(),
             deliveries: Vec::new(),
             ignored_logged: HashSet::new(),
+            membership_checked: HashSet::new(),
             wake_decide: recovered > 0,
             #[cfg(test)]
             test_chat: None,
@@ -687,6 +693,36 @@ impl Agli {
         Ok(identify(&acl, env))
     }
 
+    /// On someone's first QQ private message this run, ask NapCat which of the bot's groups they
+    /// are in, so members who never spoke there may still hear about the group in private.
+    async fn check_qq_groups(&mut self, env: &Envelope, who: &Who) -> Result<()> {
+        if env.platform != "qq" || env.is_group || who.is_agent || !self.membership_checked.insert(who.person_id.clone()) {
+            return Ok(());
+        }
+        let (Some(qq), Ok(user)) = (self.outlets.qq.clone(), env.sender_id.parse::<i64>()) else { return Ok(()) };
+        let known = self.people.get(&who.person_id).map(|p| p.groups.clone()).unwrap_or_default();
+        let mut found = Vec::new();
+        let lookup = async {
+            for g in qq.group_ids().await? {
+                let key = format!("qq:{g}");
+                if !known.contains(&key) && !self.cfg.social.ignored_groups.contains(&key) && qq.in_group(g, user).await {
+                    found.push(key);
+                }
+            }
+            anyhow::Ok(())
+        };
+        match tokio::time::timeout(MEMBERSHIP_LOOKUP, lookup).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("qq group membership lookup failed: {e:#}"),
+            Err(_) => warn!("qq group membership lookup timed out; keeping {} found so far", found.len()),
+        }
+        for g in found {
+            info!("{} is a member of {g}", who.person_id);
+            self.people.add_group(self.store.as_ref(), &who.person_id, &g)?;
+        }
+        Ok(())
+    }
+
     fn focus_ctx(&self, platform: &'static str, chat_id: &str, sender_id: &str) -> Option<ChatCtx> {
         let env = Envelope { notice: false, attachments: Vec::new(), platform, chat_id: chat_id.into(), sender_id: sender_id.into(),
             sender_name: String::new(), sender_is_bot: false, is_group: false, mentions_me: false,
@@ -695,7 +731,7 @@ impl Agli {
         if !who.is_owner { return None }
         Some(ChatCtx { key: format!("{platform}:{chat_id}"), platform, chat_id: chat_id.into(), message_id: None,
             ns: Namespace::Person(who.person_id.clone()), scope: Scope::Persons { ids: vec![who.person_id.clone()] },
-            audience: Audience::private(&who.person_id), flow_ns: None, is_group: false, partner: Some(who) })
+            audience: self.people.private_audience(&who.person_id), flow_ns: None, is_group: false, partner: Some(who) })
     }
 
     async fn busy_triage(&self, messages: &[Envelope]) -> Result<BusyReply> {
@@ -810,6 +846,7 @@ impl Agli {
             info!("message from qq user {} — set OWNER_QQ_ID if that is you", env.sender_id);
         }
         self.people.observe(self.store.as_ref(), &env, &who, now)?;
+        self.check_qq_groups(&env, &who).await?;
         let observed_at = env.arrived.and_then(|t| chrono::Duration::from_std(t.elapsed()).ok()).map_or(now, |age| now - age);
         if !env.notice && let Err(e) = bot_flags::observe(self.store.as_ref(), &env, &who, observed_at) {
             warn!("QQ agent heuristic failed: {e:#}");
@@ -844,7 +881,7 @@ impl Agli {
                 ns: Namespace::Person(who.person_id.clone()),
                 scope: Scope::Persons { ids: vec![who.person_id.clone()] },
                 flow_ns: flow_ns.cloned(),
-                audience: Audience::private(&who.person_id),
+                audience: self.people.private_audience(&who.person_id),
                 is_group: false,
                 partner: Some(who.clone()),
             },
@@ -970,7 +1007,7 @@ impl Agli {
             key: format!("{platform}:{}", chat.chat_id), platform, chat_id: chat.chat_id.clone(), message_id: None,
             ns: Namespace::Person(who.person_id.clone()), scope: Scope::Persons { ids: vec![who.person_id.clone()] },
             flow_ns: None,
-            audience: Audience::private(&who.person_id), is_group: false, partner: Some(who),
+            audience: self.people.private_audience(&who.person_id), is_group: false, partner: Some(who),
         };
         let messages = self.store.messages_after(&ctx.ns, DateTime::UNIX_EPOCH)?;
         let in_chat = |m: &MessageRecord| m.platform == platform && m.chat_id == chat.chat_id;
@@ -1712,7 +1749,7 @@ impl Agli {
             ns: Namespace::Person(owner.clone()),
             scope: Scope::Persons { ids: vec![owner.clone()] },
             flow_ns: None,
-            audience: Audience::private(&owner),
+            audience: self.people.private_audience(&owner),
             is_group: false,
             partner: Some(Who { person_id: owner, is_owner: true, is_agent: false }),
         })

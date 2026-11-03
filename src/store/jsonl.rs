@@ -394,6 +394,7 @@ mod tests {
             last_update_day: None,
             facts: vec![],
             last_seen: Utc::now(),
+            groups: vec![],
         };
         store.save_person(&p).unwrap();
         p.name = "B".into();

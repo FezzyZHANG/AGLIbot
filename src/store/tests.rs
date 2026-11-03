@@ -169,6 +169,7 @@ pub(super) fn contract(store: &dyn Store) {
         last_update_day: None,
         facts: vec![Fact { text: "fact".into(), ns: Namespace::SelfNs, scope: Scope::SelfOnly, ts }],
         last_seen: ts,
+        groups: vec!["qq:9".into()],
     };
     store.save_person(&person).unwrap();
     let mut other = person.clone();
