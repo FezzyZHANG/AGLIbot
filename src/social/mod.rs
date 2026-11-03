@@ -6,3 +6,4 @@ pub mod lexicon;
 pub mod people;
 pub mod cards;
 pub mod privacy;
+pub mod skill_lines;

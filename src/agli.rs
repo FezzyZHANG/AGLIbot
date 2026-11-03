@@ -36,6 +36,7 @@ use crate::social::bot_flags;
 use crate::social::identity::{Who, identify};
 use crate::social::people::People;
 use crate::social::privacy::{self, Query};
+use crate::social::skill_lines;
 use crate::store::{AuditRecord, MessageRecord, Outcome, ReviewCategory, ReviewStatus, Store, Tier};
 use crate::work::board::{Board, TaskKind, TaskStatus, ThreadRef};
 use crate::work::research::{self, Job};
@@ -907,6 +908,32 @@ impl Agli {
         // Read-only batches stop before flow, floor, unseen lines or any reply/command path.
         if group_key.as_ref().is_some_and(|g| self.cfg.social.read_only_group(g)) {
             return Ok(());
+        }
+
+        // A skill request gets its canned voice line, for anyone, before owner commands or the model.
+        // In groups only when he is @'d (or the request replies to him).
+        if (env.mentions_me || !env.is_group) && (who.is_owner || !self.state.energy.asleep)
+            && let Some(name) = skill_lines::requested(&env.text) {
+            if !self.floor.allow_reply(&self.cfg.social, &ctx.key, &who.person_id, who.is_agent, now) {
+                info!("reply cap reached for {} in {}", who.person_id, ctx.key);
+                return Ok(());
+            }
+            let reply = skill_lines::reply(&name, now.timestamp_subsec_nanos() as usize);
+            if ctx.is_group {
+                self.floor.spoke(&ctx.key, false, now);
+            }
+            self.send_plain(&ctx, &reply).await?;
+            return self.store.append_message(&MessageRecord {
+                ts: Utc::now(),
+                platform: ctx.platform.into(),
+                chat_id: ctx.chat_id.clone(),
+                sender: "me".into(),
+                sender_name: String::new(),
+                outgoing: true,
+                text: reply,
+                ns: ctx.ns.clone(),
+                scope: ctx.scope.clone(),
+            });
         }
 
         if who.is_owner && !env.is_group {
@@ -4207,6 +4234,22 @@ mod tests {
         assert!(!quoted.speak, "a quote of someone else's line does not call him");
         let elsewhere = a.prepare_messages(group_messages(&["阿庄在吗"], false)).await;
         assert!(!elsewhere.speak, "an alias scoped to another group does not address him here");
+    }
+
+    #[tokio::test]
+    async fn skill_requests_send_the_voice_line_only_when_he_is_mentioned_in_groups() {
+        let mut test = TestAgli::new("skill-lines").await;
+        let a = &mut test.agli;
+        a.test_chat = Some(TestChat::new(&[], &[Outcome::Sent]));
+        let unmentioned = a.prepare_messages(group_messages(&["/技能:战技"], false)).await;
+        assert!(!unmentioned.speak);
+        assert!(a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().is_empty());
+        let mentioned = a.prepare_messages(group_messages(&["/技能:终结技"], true)).await;
+        assert!(!mentioned.speak, "the canned line replaces a model turn");
+        let sent = a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(["惊霆无声，流电掣雨。", "雷雨并作，化育万物。", "青霄碧落，乌云尽扫。"].contains(&sent[0].as_str()));
+        assert!(a.test_chat.as_ref().unwrap().turns.is_empty());
     }
 
     #[tokio::test]
