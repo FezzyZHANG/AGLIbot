@@ -27,6 +27,7 @@ const GROUPS: &str = "groups.json";
 const RELATIONS: &str = "relations.json";
 const REVIEWS: &str = "reviews.json";
 const KV: &str = "kv.json";
+const LEXICON: &str = "lexicon.json";
 
 pub struct JsonlStore {
     cache: super::cache::Cache,
@@ -305,6 +306,22 @@ impl Store for JsonlStore {
         self.update_doc(KV, |doc: &mut BTreeMap<String, Value>| {
             doc.insert(key.to_string(), value);
         })
+    }
+
+    fn lexicon(&self) -> Result<Vec<Value>> {
+        let _g = self.guard();
+        self.read_doc(LEXICON)
+    }
+
+    fn insert_lexicon(&self, docs: &[Value]) -> Result<()> {
+        let _g = self.guard();
+        let mut all: Vec<Value> = self.read_doc(LEXICON)?;
+        let mut keys: std::collections::BTreeSet<_> = all.iter().map(super::lexicon_key).collect();
+        for doc in docs {
+            anyhow::ensure!(keys.insert(super::lexicon_key(doc)), "duplicate lexicon entry {:?}", super::lexicon_key(doc));
+        }
+        all.extend(docs.iter().cloned());
+        self.write_doc(LEXICON, &all)
     }
 }
 

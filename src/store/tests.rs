@@ -267,9 +267,22 @@ pub(super) fn contract(store: &dyn Store) {
             outcome: Outcome::Denied,
         })
         .unwrap();
+
+    assert!(store.lexicon().unwrap().is_empty());
+    store.insert_lexicon(&[
+        json!({"term": "小庄", "kind": "alias", "scope": null, "enabled": true}),
+        json!({"term": "肉编器", "kind": "slang", "meaning": "手写汇编的人", "scope": "qq:1"}),
+    ]).unwrap();
+    assert!(store.insert_lexicon(&[json!({"term": "小庄", "kind": "slang", "meaning": "x"})]).is_err(), "missing scope equals null");
+    store.insert_lexicon(&[json!({"term": "小庄", "kind": "alias", "scope": "qq:1"})]).unwrap();
 }
 
 pub(super) fn persisted(store: &dyn Store) {
+    let lexicon = store.lexicon().unwrap();
+    let keys: std::collections::BTreeSet<_> = lexicon.iter().map(lexicon_key).collect();
+    assert_eq!(keys, [("小庄".into(), None), ("小庄".into(), Some("qq:1".into())), ("肉编器".into(), Some("qq:1".into()))].into());
+    assert!(lexicon.iter().any(|d| d["meaning"] == "手写汇编的人" && d["kind"] == "slang"));
+    assert!(lexicon.iter().all(|d| d.get("_id").is_none()));
     assert!(store.load_embeddings("embed-a").unwrap().is_empty());
     assert_eq!(store.load_embeddings("embed-b").unwrap(), BTreeMap::from([("episode/a.$".into(), vec![0.25, 0.75])]));
     let audit = store.audits().unwrap();

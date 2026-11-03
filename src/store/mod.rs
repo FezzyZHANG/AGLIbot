@@ -327,4 +327,15 @@ pub trait Store: Send + Sync {
     /// Small key/value facts: extraction watermarks, owner's last chat, freeze flag.
     fn kv_get(&self, key: &str) -> Result<Option<Value>>;
     fn kv_set(&self, key: &str, value: Value) -> Result<()>;
+
+    /// The owner-managed lexicon (#80) as raw documents; `social::lexicon` validates them.
+    fn lexicon(&self) -> Result<Vec<Value>>;
+    /// Insert lexicon documents; a duplicate (term, scope), null and missing scope alike, is an error.
+    fn insert_lexicon(&self, docs: &[Value]) -> Result<()>;
+}
+
+/// The (term, scope) key that must be unique in the lexicon; missing scope is global.
+fn lexicon_key(doc: &Value) -> (String, Option<String>) {
+    let s = |k: &str| doc.get(k).and_then(Value::as_str).map(String::from);
+    (s("term").unwrap_or_default(), s("scope"))
 }

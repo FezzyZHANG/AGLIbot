@@ -556,6 +556,8 @@ pub struct Agli {
     unseen: HashMap<String, Vec<String>>,
     /// Task titles whose markers were dropped (not an owner chat), told to him on the chat's next turn.
     dropped_tasks: HashMap<String, Vec<String>>,
+    /// Owner-managed aliases and group slang (#80), re-read from the store on a short TTL.
+    lexicon: crate::social::lexicon::Lexicon,
     /// Recent speakers per group chat key, for the audience and recall.
     speakers: HashMap<String, Vec<String>>,
     deliveries: Vec<research::Outcome>,
@@ -573,6 +575,9 @@ impl Agli {
         let mut people = People::load(store.as_ref())?;
         people.ensure(store.as_ref(), &cfg.acl.owner.person_id, "主人", Tier::Owner)?;
         people.backfill_groups(store.as_ref())?;
+        if let Err(e) = crate::social::lexicon::Lexicon::seed(store.as_ref(), &cfg.social.aliases) {
+            warn!("lexicon seed failed: {e:#}");
+        }
         let mut flow = Flow::load(&cfg.data_dir());
         if flow.is_focused() {
             let now = Utc::now();
@@ -598,6 +603,7 @@ impl Agli {
             evolution_restart: None,
             unseen: HashMap::new(),
             dropped_tasks: HashMap::new(),
+            lexicon: Default::default(),
             speakers: HashMap::new(),
             deliveries: Vec::new(),
             ignored_logged: HashSet::new(),
@@ -946,8 +952,14 @@ impl Agli {
 
         self.unseen.entry(ctx.key.clone()).or_default().push(line);
         let busy = self.flow.is_focused() || asleep;
-        let called = if env.mentions_me { None } else { self.cfg.social.called_by(&env.text) };
-        if let Some(alias) = called {
+        let called = match (&group_key, env.mentions_me) {
+            (Some(g), false) => {
+                self.lexicon.refresh(self.store.as_ref(), now);
+                self.lexicon.called_by(g, &env.text).map(String::from)
+            }
+            _ => None,
+        };
+        if let Some(alias) = &called {
             info!("called by name `{alias}` in {}", ctx.key);
         }
         let addressed = (env.mentions_me || called.is_some()) && (!asleep || who.is_owner);
@@ -1056,11 +1068,12 @@ impl Agli {
         if lines.is_empty() {
             return Ok(());
         }
+        let joined = lines.join("\n");
+        let slang = self.slang_note(ctx, &joined, Utc::now()).map(|n| format!("{n}\n\n")).unwrap_or_default();
         let user = format!(
-            "（这不是聊天回复，是你在想要不要在群里插话。）群里最近的消息：\n{}\n\n\
+            "（这不是聊天回复，是你在想要不要在群里插话。）群里最近的消息：\n{joined}\n\n{slang}\
              大多数时候你只是看看。只有话题你真的有东西可说、气氛合适、不会打扰别人时才说。\
-             只输出一个 JSON 对象：{{\"speak\": true 或 false, \"reason\": \"一句话\"}}",
-            lines.join("\n")
+             只输出一个 JSON 对象：{{\"speak\": true 或 false, \"reason\": \"一句话\"}}"
         );
         let chime: Chime = self.models.ask_json("triage", &ProcessingPolicy::Any, self.speaker.l1(), &user).await?;
         info!("floor in {}: speak={} ({})", ctx.key, chime.speak, chime.reason);
@@ -1068,6 +1081,13 @@ impl Agli {
             self.converse_group(ctx, true).await?;
         }
         Ok(())
+    }
+
+    /// The lexicon's slang line for a group chat's text; private chats get none.
+    fn slang_note(&mut self, ctx: &ChatCtx, text: &str, now: DateTime<Utc>) -> Option<String> {
+        let Namespace::Group(group) = &ctx.ns else { return None };
+        self.lexicon.refresh(self.store.as_ref(), now);
+        self.lexicon.slang_note(group, text)
     }
 
     async fn converse_group(&mut self, ctx: &ChatCtx, unsolicited: bool) -> Result<()> {
@@ -1202,9 +1222,11 @@ impl Agli {
     async fn converse_with_claim(&mut self, ctx: &ChatCtx, body: String, current: usize, unsolicited: bool, claim: Option<&str>) -> Result<()> {
         let now = Utc::now();
         let busy = if ctx.flow_ns.is_some() && ctx.flow_ns == self.flow.focus { None } else { self.flow.title.clone() };
-        let notes: Vec<String> = self.dropped_tasks.remove(&ctx.key).unwrap_or_default().iter()
+        let mut notes: Vec<String> = self.dropped_tasks.remove(&ctx.key).unwrap_or_default().iter()
             .map(|t| format!("系统：你之前回复里的任务“{t}”没有建立（只有主人私聊里的任务才算），现在没有人在做它，也不会有结果。"))
             .collect();
+        // Slang goes in the tail, never L1/L2, so the cached prefix is unchanged.
+        notes.extend(self.slang_note(ctx, &body, now));
         let text = user_turn(&tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref(), &notes), &body);
         // Recall runs on every turn (cheap at this volume) so the policy is known before routing.
         let tasks = ctx.task_cards(&self.board());
@@ -4174,11 +4196,54 @@ mod tests {
     async fn calling_him_by_alias_addresses_him_like_a_mention() {
         let mut test = TestAgli::new("alias").await;
         let a = &mut test.agli;
-        Arc::make_mut(&mut a.cfg).social.aliases = vec!["小庄".into(), "Zhuang".into()];
+        a.store.insert_lexicon(&[
+            json!({"term": "小庄", "kind": "alias"}),
+            json!({"term": "Zhuang", "kind": "alias", "scope": "telegram:-7"}),
+            json!({"term": "阿庄", "kind": "alias", "scope": "telegram:-9"}),
+        ]).unwrap();
         assert!(a.prepare_messages(group_messages(&["小庄你怎么不说话了"], false)).await.speak);
         assert!(a.prepare_messages(group_messages(&["hey zhuang"], false)).await.speak);
         let quoted = a.prepare_messages(group_messages(&["[回复 某人: 小庄说的]我不同意"], false)).await;
         assert!(!quoted.speak, "a quote of someone else's line does not call him");
+        let elsewhere = a.prepare_messages(group_messages(&["阿庄在吗"], false)).await;
+        assert!(!elsewhere.speak, "an alias scoped to another group does not address him here");
+    }
+
+    #[tokio::test]
+    async fn slang_reaches_the_turn_tail_and_floor_prompt_only_in_its_group() {
+        let mut test = TestAgli::new("slang").await;
+        let a = &mut test.agli;
+        Arc::make_mut(&mut a.cfg).social.groups.push("telegram:-9".into());
+        let here = a.group_ctx("telegram:-7").unwrap();
+        let frame_before = a.frame(&here, 1, "").unwrap().0;
+        a.store.insert_lexicon(&[
+            json!({"term": "肉编器", "kind": "slang", "meaning": "手写汇编的人", "scope": "telegram:-7"}),
+            json!({"term": "姐夫", "kind": "slang", "meaning": "群里大佬的戏称"}),
+        ]).unwrap();
+        a.lexicon.refresh(a.store.as_ref(), Utc::now());
+        assert_eq!(a.frame(&here, 1, "").unwrap().0, frame_before, "slang never changes L2");
+        a.test_chat = Some(TestChat::new(&["[沉默]", "[沉默]", "[沉默]", "[沉默]"], &[]));
+        a.on_messages(group_messages(&["群里都是肉编器"], true)).await.unwrap();
+        a.on_messages(group_messages(&["今天天气不错"], true)).await.unwrap();
+        let mut other = group_messages(&["肉编器和姐夫"], true);
+        other[0].chat_id = "-9".into();
+        a.on_messages(other).await.unwrap();
+        a.on_messages(vec![private_message("100", "肉编器和姐夫是啥")]).await.unwrap();
+        let turns = &a.test_chat.as_ref().unwrap().turns;
+        let tail = |i: usize| turns[i].1.split("</当前状态>").next().unwrap().to_string();
+        assert!(tail(0).contains("群里的说法：肉编器＝手写汇编的人"), "{}", turns[0].1);
+        assert!(!tail(1).contains("群里的说法"), "{}", turns[1].1);
+        assert!(!turns[0].2.contains("手写汇编"), "{}", turns[0].2);
+        assert!(tail(2).contains("姐夫＝群里大佬的戏称") && !tail(2).contains("肉编器＝"), "{}", turns[2].1);
+        assert!(!turns[3].1.contains("群里的说法") && !turns[3].2.contains("手写汇编"), "private chats get no slang");
+
+        a.models = Arc::new(Models::stub(a.store.clone(), vec![r#"{"speak":false,"reason":"看看"}"#.into()]));
+        a.unseen.insert("telegram:-7".into(), vec!["member-0(100)：姐夫又在当肉编器".into()]);
+        let ctx = a.group_ctx("telegram:-7").unwrap();
+        a.consider_group(&ctx).await.unwrap();
+        let prompts = a.models.stub_prompts();
+        let floor = &prompts.iter().find(|p| p.0 == "triage").unwrap().2;
+        assert!(floor.contains("群里的说法：肉编器＝手写汇编的人；姐夫＝群里大佬的戏称"), "{floor}");
     }
 
     #[tokio::test]

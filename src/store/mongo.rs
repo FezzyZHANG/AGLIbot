@@ -19,7 +19,7 @@ use super::{AuditRecord, Episode, EpisodeEmbedding, Group, Lesson, MessageRecord
 use crate::ns::Namespace;
 
 const COLLECTIONS: &[&str] =
-    &["messages", "model_calls", "episodes", "persons", "lessons", "audit", "reviews", "kv", "relations", "groups"];
+    &["messages", "model_calls", "episodes", "persons", "lessons", "audit", "reviews", "kv", "relations", "groups", "lexicon"];
 
 pub struct MongoStore {
     cache: super::cache::Cache,
@@ -70,6 +70,11 @@ fn indexes() -> Vec<(&'static str, IndexModel)> {
         ("episodes", IndexModel::builder().keys(doc! { "ns": 1, "ts": 1 }).build()),
         ("model_calls", IndexModel::builder().keys(doc! { "scenario": 1, "model": 1, "ts": 1 }).build()),
         ("model_calls", IndexModel::builder().keys(doc! { "ts": 1 }).build()),
+        // Plain BSON fields, not a JSON record, so the owner edits entries in Compass.
+        ("lexicon", IndexModel::builder()
+            .keys(doc! { "term": 1, "scope": 1 })
+            .options(IndexOptions::builder().unique(true).build())
+            .build()),
     ];
     for collection in ["messages", "model_calls", "episodes", "lessons", "audit", "reviews"] {
         indexes.push((
@@ -367,6 +372,24 @@ impl Store for MongoStore {
 
     fn kv_set(&self, key: &str, value: Value) -> Result<()> {
         self.save("kv", key, &value, false)
+    }
+
+    fn lexicon(&self) -> Result<Vec<Value>> {
+        blocking(|| {
+            self.collection("lexicon").find(doc! {}).run()?.map(|doc| {
+                let mut doc = doc?;
+                doc.remove("_id");
+                Ok(bson::Bson::Document(doc).into_relaxed_extjson())
+            }).collect()
+        })
+    }
+
+    fn insert_lexicon(&self, docs: &[Value]) -> Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+        let docs = docs.iter().map(bson::to_document).collect::<std::result::Result<Vec<_>, _>>()?;
+        blocking(|| Ok(self.collection("lexicon").insert_many(docs).run().map(|_| ())?))
     }
 }
 
