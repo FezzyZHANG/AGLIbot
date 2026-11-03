@@ -54,8 +54,10 @@ impl Fixture {
         std::fs::write(root.join("src/main.rs"), UPDATED).unwrap();
         let patch = git(&root, &["diff", "--binary", "--no-ext-diff", "--no-textconv", "--", "src/main.rs"], &[]).await.unwrap();
         git(&root, &["checkout", "--", "src/main.rs"], &[]).await.unwrap();
-        let store = Arc::new(crate::store::jsonl::JsonlStore::open(&root.join("data")).unwrap());
-        let gate = Gate { root: root.clone(), dir: root.join("data/evolution"), store };
+        // Production layout: the runtime root is a separate, non-git directory (ignored here).
+        let runtime = root.join("data/runtime");
+        let store = Arc::new(crate::store::jsonl::JsonlStore::open(&runtime.join("data")).unwrap());
+        let gate = Gate { source: root.clone(), root: runtime.clone(), dir: runtime.join("data/evolution"), store };
         let request = Request {
             source: Source { drydock: "default".into(), ticket: Some(26), proposal: None },
             summary: "fixture code change".into(),
@@ -120,12 +122,12 @@ impl Drop for Fixture {
         if let Some(server) = self.server.take() {
             server.join().unwrap();
         }
-        assert!(self.gate.root.parent() == Some(std::env::temp_dir().as_path()));
+        assert!(self.gate.source.parent() == Some(std::env::temp_dir().as_path()));
         if std::thread::panicking() {
-            eprintln!("preserved failing fixture: {}", self.gate.root.display());
+            eprintln!("preserved failing fixture: {}", self.gate.source.display());
             return;
         }
-        let _ = std::fs::remove_dir_all(&self.gate.root);
+        let _ = std::fs::remove_dir_all(&self.gate.source);
     }
 }
 
@@ -212,10 +214,17 @@ async fn full_pipeline_requires_owner_then_commits_exact_tree_and_prepares_resta
     let r = f.gate.load("happy").unwrap();
     assert_eq!(r.state, State::RestartRequested);
     assert_eq!(restart.executable_sha256, hash(&std::fs::read(&restart.executable).unwrap()));
-    assert_eq!(oid(&f.gate.root, &["rev-parse", "HEAD"]).await.unwrap(), f.request.base_commit);
-    assert_eq!(std::fs::read_to_string(f.gate.root.join("src/main.rs")).unwrap(), ORIGINAL);
-    assert_eq!(oid(&f.gate.root, &["rev-parse", &format!("{}^{{tree}}", restart.commit)]).await.unwrap(), r.tree);
-    assert_eq!(oid(&f.gate.root, &["rev-parse", "refs/heads/codex/evolution-happy"]).await.unwrap(), restart.commit);
+    assert_eq!(oid(&f.gate.source, &["rev-parse", "HEAD"]).await.unwrap(), f.request.base_commit);
+    assert_eq!(std::fs::read_to_string(f.gate.source.join("src/main.rs")).unwrap(), ORIGINAL);
+    assert_eq!(oid(&f.gate.source, &["rev-parse", &format!("{}^{{tree}}", restart.commit)]).await.unwrap(), r.tree);
+    assert_eq!(oid(&f.gate.source, &["rev-parse", "refs/heads/codex/evolution-happy"]).await.unwrap(), restart.commit);
+    // Commits land in the source repo; the release and the restart belong to the runtime root.
+    assert!(restart.executable.starts_with(f.gate.root.canonicalize().unwrap()));
+    assert_eq!(restart.root, f.gate.root.canonicalize().unwrap());
+    crate::evolution::restart::record_release(f.gate.dir.parent().unwrap(), &restart.commit, &restart.executable, "evolution:happy").unwrap();
+    let release: Value = serde_json::from_slice(&std::fs::read(f.gate.root.join("data/release.json")).unwrap()).unwrap();
+    assert_eq!((release["commit"].as_str(), release["origin"].as_str()), (Some(restart.commit.as_str()), Some("evolution:happy")));
+    assert_eq!(release["exe_sha256"], restart.executable_sha256);
     assert!(f.gate.finish("happy").await.is_err()); // no duplicate commit/restart
     assert!(f.gate.prepare("happy", "owner", &f.models("pass")).await.is_err());
 
@@ -251,9 +260,9 @@ async fn full_pipeline_requires_owner_then_commits_exact_tree_and_prepares_resta
     parent.wait().unwrap();
     assert!(!f.gate.root.join("started-marker").exists());
     // Timeout terminates both the checking process and its delayed descendant.
-    assert!(run(&f.gate.root, restart.executable.to_str().unwrap(), &["fork"], &[], 1).await.is_err());
+    assert!(run(&f.gate.source, restart.executable.to_str().unwrap(), &["fork"], &[], 1).await.is_err());
     tokio::time::sleep(Duration::from_millis(1300)).await;
-    assert!(!f.gate.root.join("late-marker").exists());
+    assert!(!f.gate.source.join("late-marker").exists());
 }
 
 #[tokio::test]

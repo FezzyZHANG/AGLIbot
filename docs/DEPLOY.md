@@ -1,0 +1,50 @@
+# 部署
+
+在线的 bot 不从开发 checkout 运行。这里说明三个目录分别管什么，以及“当前跑的是哪个版本”记在哪里。
+
+## 三个目录
+
+| 目录 | 作用 | 例子 |
+|---|---|---|
+| 源码仓库（`AGLI_SOURCE`） | git、Moldloft、开发；进化闸门在这里建 worktree 和提交 | `C:\dev\AGLIbot` |
+| 部署 worktree | 手动部署时检出要构建的提交，不在里面改东西 | `C:\dev\AGLIbot-deploy` |
+| 运行时根（`AGLI_ROOT`） | 在线 bot 的 `config/`、`mind/`、`data/`、`work/`、`.env` | `C:\dev\AGLIbot-runtime\<名字>` |
+
+运行时根里有两个本机文件，都不进版本库：
+
+- `runtime.json`：`{source, deploy_worktree}`，供脚本使用。
+- `.env`：从源码仓库的 `.env` 复制而来，`MONGO_DATABASE` 指向这个运行时自己的库。bot 先读 `AGLI_ROOT/.env`，再读工作目录下的 `.env`；先读到的值优先。
+
+没有设置 `AGLI_SOURCE` 时，源码仓库就等于 `AGLI_ROOT`，也就是旧的单目录用法，测试和本地开发不受影响。
+
+## release 指针
+
+`<运行时根>/data/release.json` 是“应该运行哪个版本”的唯一记录：
+
+```json
+{ "commit": "…", "exe": "…\\aglibot.exe", "exe_sha256": "…", "origin": "manual | evolution:<id>", "at": "…" }
+```
+
+有两条路线会写它，启动只认它：
+
+- **手动部署**：运行 `ops/deploy.ps1 -Runtime <根> [-Commit main] [-Force]`。
+  - 脚本在部署 worktree 中检出目标提交，用 `cargo build --locked --release` 构建到 `<根>/data/releases/<commit>/`。
+  - 列出这个提交的 `config/` 与运行时 `config/` 的差异，只提示，不同步。
+  - 写入指针（`origin: manual`），然后重启。
+- **进化**：闸门把 release 构建到 `<根>/data/evolution/releases/<id>/`。新进程通过校验并写入 `running` 回执后，写入指针（`origin: evolution:<id>`）。
+
+**防止回滚**：如果目标提交不包含当前指针记录的提交，`deploy.ps1` 会拒绝执行。典型情况是进化跑在未合并的 `codex/evolution-<id>` 分支上。先把它合并进要部署的分支，或者确认要撤掉它后加 `-Force`。
+
+`ops/start-bot.ps1 -Runtime <根> [-Restart]`：
+- 先校验指针里 exe 的 sha256，有别的 aglibot 在运行时拒绝启动。
+- 通过 WMI 启动 bot，使它不挂在调用者的进程树下。
+- 把 pid 写入 `<根>/data/logs/current.json`，日志写在 `<根>/data/logs/bot-<时间>.{out,err}.log`。
+- 加 `-Restart` 时，只停止 `current.json` 记录的那个进程。
+
+bot 启动时会在日志里写一行 `release <commit> (<origin>)`。如果正在运行的 exe 与指针不一致，同一行会带上 WARNING。
+
+## config 的两份
+
+源码仓库的 `config/` 是默认值和评审对象。运行时的 `config/` 是在线实际生效的一份，可以有人设相关的差异，比如别名、固定模型。改了仓库里的 config 并不会影响在线 bot；要上线，就在运行时那份里改。每次部署打印的差异列表就是用来发现两份是否漂移的。
+
+L4 的文件系统权限隔离（DESIGN 第 6 节）尚未实现：运行时根目前只是另一个目录，还没有 ACL 限制。

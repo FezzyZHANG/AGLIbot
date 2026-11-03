@@ -74,6 +74,30 @@ impl Restart {
     }
 }
 
+/// `data/release.json`: the one record of what the bot should run. Manual deploys
+/// (`ops/deploy.ps1`) and evolution both write it; `ops/start-bot.ps1` starts only what it names.
+pub const RELEASE_FILE: &str = "release.json";
+
+pub fn record_release(data_dir: &std::path::Path, commit: &str, exe: &std::path::Path, origin: &str) -> Result<()> {
+    let exe = exe.canonicalize()?;
+    let release = json!({
+        "commit": commit, "exe": exe, "exe_sha256": format!("{:x}", Sha256::digest(std::fs::read(&exe)?)),
+        "origin": origin, "at": chrono::Utc::now(),
+    });
+    std::fs::write(data_dir.join(RELEASE_FILE), serde_json::to_vec_pretty(&release)?)?;
+    Ok(())
+}
+
+/// Logged at startup; a mismatch is reported, not enforced (the start script enforces it).
+pub fn describe_release(data_dir: &std::path::Path) -> String {
+    let Ok(bytes) = std::fs::read(data_dir.join(RELEASE_FILE)) else { return "no release pointer".into() };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return "unreadable release pointer".into() };
+    let exe = std::env::current_exe().and_then(std::fs::read).map(|b| format!("{:x}", Sha256::digest(b)));
+    let matches = exe.is_ok_and(|sha| v["exe_sha256"].as_str() == Some(sha.as_str()));
+    format!("release {} ({}){}", v["commit"].as_str().unwrap_or("?"), v["origin"].as_str().unwrap_or("?"),
+        if matches { "" } else { "; WARNING: running executable differs from the release pointer" })
+}
+
 /// Called before loading configuration or opening a database in the helper process.
 pub fn helper(parent: u32, request: PathBuf) -> Result<()> {
     let restart: Restart = serde_json::from_slice(&std::fs::read(request)?)?;
@@ -141,4 +165,25 @@ fn handoff(parent: u32, restart: &Restart) -> Result<()> {
     cmd.spawn().context("starting approved executable")?;
     // The new bot acknowledges Running after initialization, just before entering its main loop.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_pointer_names_commit_and_flags_another_executable() {
+        let dir = std::env::temp_dir().join(format!("aglibot-test-release-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(describe_release(&dir), "no release pointer");
+        let exe = std::env::current_exe().unwrap();
+        record_release(&dir, "abc123", &exe, "manual").unwrap();
+        assert_eq!(describe_release(&dir), "release abc123 (manual)");
+        let other = dir.join("other.exe");
+        std::fs::write(&other, b"not the running binary").unwrap();
+        record_release(&dir, "def456", &other, "evolution:x").unwrap();
+        assert!(describe_release(&dir).starts_with("release def456 (evolution:x); WARNING"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

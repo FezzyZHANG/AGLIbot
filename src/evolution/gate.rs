@@ -93,6 +93,9 @@ pub struct Record {
 
 #[derive(Clone)]
 pub struct Gate {
+    /// The git checkout with `.moldloft/`: candidates are based, committed and built from here.
+    source: PathBuf,
+    /// The runtime root (`AGLI_ROOT`): evolution data lives here and the new bot starts here.
     root: PathBuf,
     dir: PathBuf,
     store: Arc<dyn Store>,
@@ -195,7 +198,8 @@ fn validate(request: &Request, patch: &[u8]) -> Result<()> {
 impl Gate {
     pub fn new(cfg: &Config, store: Arc<dyn Store>) -> Self {
         let root = cfg.root.canonicalize().unwrap_or_else(|_| cfg.root.clone());
-        Self { dir: root.join(&cfg.runtime.data_dir).join("evolution"), root, store }
+        let source = cfg.source.canonicalize().unwrap_or_else(|_| cfg.source.clone());
+        Self { dir: root.join(&cfg.runtime.data_dir).join("evolution"), source, root, store }
     }
     fn worktree(&self, id: &str) -> PathBuf {
         self.dir.join("runs").join(id)
@@ -241,7 +245,7 @@ impl Gate {
     }
 
     async fn source(&self, source: &Source) -> Result<Value> {
-        let manifest: Value = serde_json::from_slice(&std::fs::read(self.root.join(".moldloft/project.json"))?)?;
+        let manifest: Value = serde_json::from_slice(&std::fs::read(self.source.join(".moldloft/project.json"))?)?;
         let port = manifest["port"].as_u64().filter(|p| (1..=65535).contains(p)).context("Moldloft port")?;
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -306,9 +310,9 @@ impl Gate {
         anyhow::ensure!(!worktree.exists(), "worktree path already exists");
         std::fs::create_dir_all(worktree.parent().context("worktree parent")?)?;
         let path = worktree.to_str().context("worktree path must be UTF-8")?;
-        let base = oid(&self.root, &["rev-parse", &format!("{}^{{commit}}", r.request.base_commit)]).await?;
+        let base = oid(&self.source, &["rev-parse", &format!("{}^{{commit}}", r.request.base_commit)]).await?;
         anyhow::ensure!(base == r.request.base_commit, "base is not a commit");
-        git(&self.root, &["worktree", "add", "--detach", path, &base], &[]).await?;
+        git(&self.source, &["worktree", "add", "--detach", path, &base], &[]).await?;
         // Inspect a proposed index first: a lying manifest must not write L4 files even inside
         // this worktree. No candidate code executes during Git's patch parsing.
         git(&worktree, &["apply", "--cached", "-"], patch).await?;
@@ -535,7 +539,8 @@ impl Gate {
         );
         r.state = State::Running;
         self.save(&r)?;
-        restart.receipt("running", None)
+        restart.receipt("running", None)?;
+        crate::evolution::restart::record_release(self.dir.parent().context("evolution dir has no data dir")?, &restart.commit, &restart.executable, &format!("evolution:{id}"))
     }
 
     async fn commit(&self, r: &mut Record) -> Result<String> {

@@ -2549,7 +2549,7 @@ mod tests {
         async fn new(name: &str) -> Self {
             let dir = std::env::temp_dir().join(format!("aglibot-test-batch-{name}-{}", std::process::id()));
             let mut cfg = Config {
-                root: dir.clone(), acl: acl(),
+                root: dir.clone(), source: dir.clone(), acl: acl(),
                 models: serde_yaml::from_str(include_str!("../config/models.yaml")).unwrap(),
                 scenarios: serde_yaml::from_str(include_str!("../config/scenarios.yaml")).unwrap(),
                 channels: serde_yaml::from_str(include_str!("../config/channels.yaml")).unwrap(),

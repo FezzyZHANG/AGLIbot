@@ -441,7 +441,10 @@ impl MongoCfg {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Runtime root (`AGLI_ROOT`): config, mind, data and work.
     pub root: PathBuf,
+    /// The source checkout (`AGLI_SOURCE`, default `root`), used by the evolution gate.
+    pub source: PathBuf,
     pub models: ModelsCfg,
     pub scenarios: ScenariosCfg,
     pub acl: AclCfg,
@@ -455,6 +458,7 @@ impl Config {
         let dir = root.join("config");
         let mut cfg = Config {
             root: root.to_path_buf(),
+            source: std::env::var_os("AGLI_SOURCE").map_or_else(|| root.to_path_buf(), PathBuf::from),
             models: read_yaml(&dir.join("models.yaml"))?,
             scenarios: read_yaml(&dir.join("scenarios.yaml"))?,
             acl: read_yaml(&dir.join("acl.yaml"))?,

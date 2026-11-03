@@ -55,6 +55,10 @@ async fn main() -> Result<()> {
         let request = args.next().ok_or_else(|| anyhow::anyhow!("missing restart request"))?;
         return evolution::restart::helper(parent, request.into());
     }
+    // The runtime root's .env first, so the bot need not run from a source checkout.
+    if let Some(root) = std::env::var_os("AGLI_ROOT") {
+        dotenvy::from_path(PathBuf::from(root).join(".env")).ok();
+    }
     dotenvy::dotenv().ok();
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("import-jsonl")) {
         return store::import::run(std::env::args_os().skip(2));
@@ -130,6 +134,7 @@ async fn main() -> Result<()> {
     let mut config_poll = tokio::time::interval(Duration::from_secs(2));
     config_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     agli.acknowledge_evolution_start()?;
+    info!("{}", evolution::restart::describe_release(&cfg.data_dir()));
     info!("AGLI is up");
     loop {
         tokio::select! {

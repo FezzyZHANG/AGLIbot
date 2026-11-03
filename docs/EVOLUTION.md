@@ -102,6 +102,7 @@ cargo test --locked --offline <eval-name> -- --exact --nocapture
 新进程继续使用原来的 `AGLI_ROOT`、配置和数据目录；加载存储、模型与通道后，在进入
 主循环前写 `running` 回执（不代表所有外部服务均已连通）。新版本的源代码分支保存在进化分支中；主 checkout
 不会自动 merge。后续开发应使用该分支/commit 为基线，避免丢失已启用的修改。
+新进程确认运行后会更新运行时根的 `data/release.json`；手动部署（`ops/deploy.ps1`）在目标提交不包含这个进化提交时会拒绝，避免悄悄回滚。闸门的 git 操作和 Moldloft 读取在源码仓库（`AGLI_SOURCE`）进行，运行数据和 release 在运行时根。见[部署](DEPLOY.md)。
 
 ## 证据和中断
 
