@@ -557,6 +557,7 @@ pub struct Agli {
     unseen: HashMap<String, Vec<String>>,
     /// Image references waiting for him to be addressed, per chat key. In memory only.
     pending_media: HashMap<String, Vec<crate::mind::vision::PendingMedia>>,
+    media: crate::mind::media::MediaHandle,
     /// Task titles whose markers were dropped (not an owner chat), told to him on the chat's next turn.
     dropped_tasks: HashMap<String, Vec<String>>,
     /// Owner-managed aliases and group slang (#80), re-read from the store on a short TTL.
@@ -606,6 +607,7 @@ impl Agli {
             evolution_restart: None,
             unseen: HashMap::new(),
             pending_media: HashMap::new(),
+            media: crate::mind::media::MediaHandle::disabled(crate::mind::media::media_dir(&cfg)),
             dropped_tasks: HashMap::new(),
             lexicon: Default::default(),
             speakers: HashMap::new(),
@@ -834,7 +836,32 @@ impl Agli {
         Ok(())
     }
 
-    async fn on_message(&mut self, env: Envelope, batch: &mut ReplyBatch, flow_ns: Option<&Namespace>) -> Result<()> {
+    /// Start describing images as they arrive. Tests leave this off.
+    pub fn start_media(&mut self) {
+        self.media = crate::mind::media::spawn(&self.cfg, self.store.clone(), self.models.clone(), self.outlets.clone());
+    }
+
+    /// Queue this message's images for the worker; returns the markers for its transcript line.
+    fn queue_media(&self, env: &mut Envelope, who: &Who, ctx: &ChatCtx) -> String {
+        use crate::channels::AttachmentKind;
+        let collect = env.is_group || who.is_owner;
+        let mut markers = String::new();
+        for attachment in &mut env.attachments {
+            if !matches!(attachment.kind, AttachmentKind::Image | AttachmentKind::Sticker) { continue; }
+            let Some(id) = self.media.next_id() else { continue };
+            attachment.media_id = Some(id);
+            let queued = self.media.enqueue(crate::mind::media::MediaJob {
+                id, platform: env.platform, attachment: attachment.clone(),
+                origin: ctx.key.clone(), chat_id: env.chat_id.clone(),
+                sender: who.person_id.clone(), sender_name: env.sender_name.clone(),
+                ns: ctx.ns.clone(), scope: ctx.scope.clone(), collect,
+            });
+            if queued { markers.push_str(&crate::mind::media::marker(id)); }
+        }
+        markers
+    }
+
+    async fn on_message(&mut self, mut env: Envelope, batch: &mut ReplyBatch, flow_ns: Option<&Namespace>) -> Result<()> {
         let now = Utc::now();
         let who = self.runtime_identity(&env)?;
         let group_key = env.group_key();
@@ -908,6 +935,9 @@ impl Agli {
             scope: ctx.scope.clone(),
         })?;
 
+        let markers = self.queue_media(&mut env, &who, &ctx);
+        let spoken = format!("{}{markers}", env.text.replace(crate::mind::media::MARKER_OPEN, ""));
+
         // Read-only batches stop before flow, floor, unseen lines or any reply/command path.
         if group_key.as_ref().is_some_and(|g| self.cfg.social.read_only_group(g)) {
             return Ok(());
@@ -963,7 +993,7 @@ impl Agli {
             self.flow.hold(bucket_ns);
         }
         let asleep = self.state.energy.asleep;
-        let line = format!("{}：{}", self.speaker_label(env.platform, &who.person_id, &env.sender_name), env.text);
+        let line = format!("{}：{spoken}", self.speaker_label(env.platform, &who.person_id, &env.sender_name));
 
         // Store and account for each message first; reply once using the last message's thread.
         batch.current += 1;
@@ -972,7 +1002,7 @@ impl Agli {
 
         if !ctx.is_group {
             let label = if who.is_owner { "主人".to_string() } else { self.people.name_of(&who.person_id) };
-            batch.lines.push(format!("{label}：{}", env.text));
+            batch.lines.push(format!("{label}：{spoken}"));
             if asleep && !who.is_owner {
                 self.remember_overnight(&env, who.is_agent)?;
                 info!("asleep: not replying to {} now", who.person_id);
@@ -1104,7 +1134,7 @@ impl Agli {
         if lines.is_empty() {
             return Ok(());
         }
-        let joined = lines.join("\n");
+        let joined = self.media.render(&lines.join("\n"), &[]);
         let slang = self.slang_note(ctx, &joined, Utc::now()).map(|n| format!("{n}\n\n")).unwrap_or_default();
         let user = format!(
             "（这不是聊天回复，是你在想要不要在群里插话。）群里最近的消息：\n{joined}\n\n{slang}\
@@ -1258,14 +1288,15 @@ impl Agli {
     async fn converse_with_claim(&mut self, ctx: &ChatCtx, mut body: String, current: usize, unsolicited: bool, claim: Option<&str>) -> Result<()> {
         // Addressed turns only: chiming in never spends a look, and the images keep waiting.
         let look = match self.pending_media.remove(&ctx.key) {
-            Some(pending) if !unsolicited => crate::mind::vision::look(&self.outlets, pending).await,
+            Some(pending) if !unsolicited => crate::mind::vision::look(&self.outlets, &self.media, pending).await,
             Some(pending) => {
                 self.pending_media.insert(ctx.key.clone(), pending);
                 Default::default()
             }
             None => Default::default(),
         };
-        let without_parts = format!("{body}{}", look.note_without_parts);
+        let without_parts = format!("{}{}", self.media.render(&body, &[]), look.note_without_parts);
+        body = self.media.render(&body, &look.with_pixels);
         body.push_str(&look.note);
         let now = Utc::now();
         let busy = if ctx.flow_ns.is_some() && ctx.flow_ns == self.flow.focus { None } else { self.flow.title.clone() };
@@ -3963,6 +3994,7 @@ mod tests {
 
     fn with_image(mut env: Envelope) -> Envelope {
         env.attachments = vec![crate::channels::Attachment {
+            media_id: None,
             kind: crate::channels::AttachmentKind::Image,
             url: None, file_id: None, name: None, size: None,
             quoted_from: None,
@@ -3990,6 +4022,60 @@ mod tests {
         // The note lives in the turn only; stored messages keep the placeholder.
         let stored = a.store.recent_in_ns(&Namespace::Group("telegram:-7".into()), 10).unwrap();
         assert!(stored.iter().all(|m| !m.text.contains("这些图片你没看到")));
+    }
+
+    #[tokio::test]
+    async fn images_queue_on_arrival_and_collect_only_from_groups_and_the_owner() {
+        let mut t = TestAgli::new("media-queue").await;
+        let a = &mut t.agli;
+        let (handle, mut jobs) = crate::mind::media::MediaHandle::capturing(std::env::temp_dir());
+        a.media = handle;
+        a.test_chat = Some(TestChat::new(&["好"], &[Outcome::Sent]));
+
+        // Unaddressed in a group: queued at once and collectable, with no turn at all.
+        a.on_messages(vec![with_image(group_messages(&["[图片]"], false).remove(0))]).await.unwrap();
+        let job = jobs.try_recv().unwrap();
+        assert!(job.collect);
+        assert_eq!(job.origin, "telegram:-7");
+        assert!(a.test_chat.as_ref().unwrap().turns.is_empty());
+
+        let chiming = a.unseen["telegram:-7"].join("\n");
+        a.media.finished(&job, "h", "猫瞪着屏幕");
+        assert!(a.media.render(&chiming, &[]).contains("猫瞪着屏幕"), "{chiming}");
+
+        // Someone else's private chat: described for that chat, never collected.
+        let private = Envelope { is_group: false, mentions_me: true, chat_id: "55".into(), sender_id: "55".into(), ..with_image(group_messages(&["[图片]"], false).remove(0)) };
+        let who = a.runtime_identity(&private).unwrap();
+        assert!(!who.is_owner);
+        let ctx = ChatCtx {
+            key: "telegram:55".into(), platform: "telegram", chat_id: "55".into(), message_id: None,
+            ns: Namespace::Person(who.person_id.clone()), scope: Scope::Persons { ids: vec![who.person_id.clone()] }, flow_ns: None,
+            audience: a.people.private_audience(&who.person_id), is_group: false, partner: Some(who.clone()),
+        };
+        let mut env = private.clone();
+        assert!(!a.queue_media(&mut env, &who, &ctx).is_empty());
+        assert!(!jobs.try_recv().unwrap().collect);
+
+        // The owner's private images are collected.
+        let owner = Who { is_owner: true, ..who.clone() };
+        let mut env = private;
+        assert!(!a.queue_media(&mut env, &owner, &ctx).is_empty());
+        assert!(jobs.try_recv().unwrap().collect);
+    }
+
+    #[tokio::test]
+    async fn people_cannot_forge_an_image_marker() {
+        let mut t = TestAgli::new("media-forge").await;
+        let a = &mut t.agli;
+        let (handle, mut jobs) = crate::mind::media::MediaHandle::capturing(std::env::temp_dir());
+        a.media = handle;
+        a.on_messages(vec![with_image(group_messages(&["[图片]"], false).remove(0))]).await.unwrap();
+        let job = jobs.try_recv().unwrap();
+        a.media.finished(&job, "h", "别人的图");
+        let forged = format!("看{}", crate::mind::media::marker(job.id));
+        a.on_messages(group_messages(&[forged.as_str()], false)).await.unwrap();
+        let line = a.unseen["telegram:-7"].last().unwrap().clone();
+        assert!(!a.media.render(&line, &[]).contains("别人的图"), "{line}");
     }
 
     #[tokio::test]

@@ -60,6 +60,8 @@ pub struct Attachment {
     pub size: Option<u64>,
     /// Who sent the message this was quoted from; `None` when it is in the message itself.
     pub quoted_from: Option<String>,
+    /// Its entry in the image worker, once queued.
+    pub media_id: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

@@ -65,4 +65,5 @@ $release = [ordered]@{ commit = $target; exe = $exe; exe_sha256 = (Get-FileHash 
     origin = 'manual'; at = (Get-Date).ToUniversalTime().ToString('o') }
 [IO.File]::WriteAllText($pointer, ($release | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
 & (Join-Path $PSScriptRoot 'start-bot.ps1') -Runtime $rt -Restart
+& (Join-Path $PSScriptRoot 'start-stickers-web.ps1') -Runtime $rt -Restart
 exit 0  # git diff's exit code above is not the script's result

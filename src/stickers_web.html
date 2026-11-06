@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小庄的表情包</title>
+<style>
+:root { --bg:#f6f6f4; --card:#fff; --text:#222; --muted:#71716c; --line:#dfdfda; --accent:#2f6fde; --warn:#b3261e; }
+@media (prefers-color-scheme: dark) { :root { --bg:#191918; --card:#242422; --text:#ececea; --muted:#9c9c96; --line:#3a3a37; --accent:#7aa7f5; --warn:#f2877f; } }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,"Microsoft YaHei",sans-serif; }
+header { position:sticky; top:0; z-index:2; background:var(--bg); border-bottom:1px solid var(--line); padding:10px 16px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+h1 { font-size:16px; margin:0 8px 0 0; }
+input, select, textarea, button { font:inherit; color:inherit; background:var(--card); border:1px solid var(--line); border-radius:6px; padding:4px 8px; }
+button { cursor:pointer; }
+button:hover { border-color:var(--accent); }
+button.danger { color:var(--warn); }
+.tabs button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+.bar { padding:8px 16px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; color:var(--muted); }
+#hits { padding:0 16px 8px; }
+main { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:12px; padding:8px 16px 40px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; display:flex; flex-direction:column; }
+.card.picked { outline:2px solid var(--accent); }
+.thumb { height:170px; display:flex; align-items:center; justify-content:center; background:var(--bg); cursor:pointer; }
+.thumb img { max-width:100%; max-height:170px; object-fit:contain; }
+.body { padding:8px 10px; display:flex; flex-direction:column; gap:4px; flex:1; }
+.meta { color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+.chip { display:inline-block; background:var(--bg); border-radius:4px; padding:0 5px; margin:0 3px 3px 0; font-size:12px; }
+.actions { display:flex; gap:6px; flex-wrap:wrap; padding:0 10px 10px; }
+dialog { border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--text); width:min(560px,calc(100vw - 32px)); }
+dialog img { display:block; max-width:100%; max-height:260px; margin:0 auto 10px; }
+dialog label { display:block; margin-top:8px; color:var(--muted); font-size:12px; }
+dialog textarea, dialog input, dialog select { width:100%; }
+.empty { grid-column:1/-1; text-align:center; color:var(--muted); padding:60px 16px; }
+#error { color:var(--warn); padding:0 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>表情包</h1>
+  <span class="tabs" id="tabs"></span>
+  <input id="q" type="search" placeholder="筛选描述、文字、标签">
+  <select id="scope"><option value="">全部范围</option><option value="any">到处可用</option><option value="origin">仅来源群</option></select>
+  <select id="origin"><option value="">全部来源</option></select>
+  <select id="sort"><option value="">最新收录</option><option value="sent">发送最多</option></select>
+</header>
+<div class="bar">
+  <input id="probe" type="search" placeholder="试一句聊天内容，看会检索到什么" size="30">
+  <button id="probeGo">检索测试</button>
+  <span id="count"></span>
+  <span id="bulk" hidden>
+    已选 <b id="picked">0</b> 张
+    <button data-bulk="active">启用</button>
+    <button data-bulk="disabled">停用</button>
+    <button data-bulk="delete" class="danger">删除</button>
+    <button id="clear">取消选择</button>
+  </span>
+</div>
+<div id="error"></div>
+<div id="hits"></div>
+<main id="grid"></main>
+<dialog id="dialog">
+  <form method="dialog" id="form">
+    <img id="big" alt="">
+    <div class="meta" id="info"></div>
+    <label>描述<textarea id="description" rows="3"></textarea></label>
+    <label>什么场合发<input id="use_when"></label>
+    <label>什么场合不发<input id="avoid"></label>
+    <label>标签（空格分隔）<input id="tags"></label>
+    <label>范围<select id="editScope"><option value="any">到处可用</option><option value="origin">仅来源群</option></select></label>
+    <p>
+      <button value="save" id="save">保存</button>
+      <button value="cancel" id="cancel">关闭</button>
+    </p>
+  </form>
+</dialog>
+<script>
+const $ = id => document.getElementById(id);
+const STATUS = {active: '使用中', rejected: '被过滤', disabled: '已停用'};
+let tab = 'active', items = [], picked = new Set(), editing = null;
+
+function el(tag, props = {}, ...kids) {
+  const node = Object.assign(document.createElement(tag), props);
+  node.append(...kids);
+  return node;
+}
+function showError(text) { $('error').textContent = text || ''; }
+async function send(url, method, body) {
+  const options = {method, headers: {'x-stickers-ui': '1'}};
+  if (body !== undefined) { options.headers['content-type'] = 'application/json'; options.body = JSON.stringify(body); }
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    let message = '操作失败（' + response.status + '）';
+    try { message = (await response.json()).error || message; } catch (e) {}
+    throw new Error(message);
+  }
+  return response.status === 204 ? null : response.json();
+}
+
+async function load() {
+  const params = new URLSearchParams({status: tab, q: $('q').value, scope: $('scope').value, origin: $('origin').value, sort: $('sort').value});
+  try {
+    const data = await (await fetch('/api/stickers?' + params)).json();
+    items = data.items;
+    tabs(data.counts);
+    origins(data.origins);
+    $('count').textContent = data.total > items.length ? `显示 ${items.length} / ${data.total} 张` : `${data.total} 张`;
+    draw();
+    showError('');
+  } catch (e) { showError('读取失败：' + e.message); }
+}
+function tabs(counts) {
+  $('tabs').replaceChildren(...Object.keys(STATUS).map(key => {
+    const button = el('button', {textContent: `${STATUS[key]} ${counts[key] || 0}`, className: key === tab ? 'on' : ''});
+    button.onclick = () => { tab = key; picked.clear(); load(); };
+    return button;
+  }));
+}
+function origins(all) {
+  const current = $('origin').value;
+  $('origin').replaceChildren(el('option', {value: '', textContent: '全部来源'}),
+    ...Object.entries(all).map(([key, n]) => el('option', {value: key, textContent: `${key}（${n}）`})));
+  $('origin').value = current;
+}
+function card(item, score) {
+  const box = el('div', {className: 'card' + (picked.has(item.hash) ? ' picked' : '')});
+  const thumb = el('div', {className: 'thumb', title: '点击选择'});
+  if (item.has_file === false) thumb.append(el('span', {className: 'meta', textContent: '文件已清理'}));
+  else thumb.append(el('img', {src: '/media/' + item.hash, loading: 'lazy', alt: item.description}));
+  thumb.onclick = () => {
+    picked.has(item.hash) ? picked.delete(item.hash) : picked.add(item.hash);
+    box.classList.toggle('picked');
+    $('picked').textContent = picked.size;
+    $('bulk').hidden = picked.size === 0;
+  };
+  const body = el('div', {className: 'body'}, el('div', {textContent: item.description || '（没有描述）'}));
+  if (score !== undefined) body.append(el('div', {className: 'meta', textContent: '相似度 ' + score.toFixed(3)}));
+  if (item.use_when) body.append(el('div', {className: 'meta', textContent: '适合：' + item.use_when}));
+  if (item.avoid) body.append(el('div', {className: 'meta', textContent: '不适合：' + item.avoid}));
+  body.append(el('div', {}, ...item.tags.map(tag => el('span', {className: 'chip', textContent: tag}))));
+  const scope = item.scope === 'origin' ? '仅来源群' : '到处可用';
+  body.append(el('div', {className: 'meta', textContent: `${scope}${item.scope_reason ? '：' + item.scope_reason : ''}`}));
+  body.append(el('div', {className: 'meta', textContent: `${item.origin} · 见过 ${item.sightings} 次 · 发过 ${item.sent_count} 次`}));
+  const actions = el('div', {className: 'actions'});
+  const edit = el('button', {textContent: '编辑'});
+  edit.onclick = () => open(item);
+  actions.append(edit);
+  const next = item.status === 'active' ? ['disabled', '停用'] : ['active', item.status === 'rejected' ? '收录' : '启用'];
+  const toggle = el('button', {textContent: next[1]});
+  toggle.onclick = () => act(() => send('/api/stickers/' + item.hash, 'PATCH', {status: next[0]}));
+  actions.append(toggle);
+  const remove = el('button', {textContent: '删除', className: 'danger'});
+  remove.onclick = () => { if (confirm('删除这张？文件也会删除，再次出现时会重新收录。')) act(() => send('/api/stickers/' + item.hash, 'DELETE')); };
+  actions.append(remove);
+  box.append(thumb, body, actions);
+  return box;
+}
+function draw() {
+  $('grid').replaceChildren(...(items.length ? items.map(item => card(item)) : [el('div', {className: 'empty', textContent: '这里还没有图。'})]));
+  $('picked').textContent = picked.size;
+  $('bulk').hidden = picked.size === 0;
+}
+async function act(run) {
+  try { await run(); showError(''); await load(); } catch (e) { showError(e.message); }
+}
+function open(item) {
+  editing = item;
+  $('big').src = item.has_file === false ? '' : '/media/' + item.hash;
+  $('info').textContent = item.text ? '图里的文字：' + item.text : '';
+  $('description').value = item.description;
+  $('use_when').value = item.use_when;
+  $('avoid').value = item.avoid;
+  $('tags').value = item.tags.join(' ');
+  $('editScope').value = item.scope;
+  $('dialog').showModal();
+}
+$('dialog').addEventListener('close', () => {
+  if ($('dialog').returnValue !== 'save' || !editing) return;
+  const hash = editing.hash;
+  act(() => send('/api/stickers/' + hash, 'PATCH', {
+    description: $('description').value, use_when: $('use_when').value, avoid: $('avoid').value,
+    tags: $('tags').value.split(/\s+/), scope: $('editScope').value,
+  }));
+});
+for (const button of document.querySelectorAll('[data-bulk]')) {
+  button.onclick = () => {
+    const action = button.dataset.bulk;
+    if (action === 'delete' && !confirm(`删除这 ${picked.size} 张？文件也会删除。`)) return;
+    act(async () => { await send('/api/bulk', 'POST', {hashes: [...picked], action}); picked.clear(); });
+  };
+}
+$('clear').onclick = () => { picked.clear(); draw(); };
+let timer;
+$('q').oninput = () => { clearTimeout(timer); timer = setTimeout(load, 250); };
+for (const id of ['scope', 'origin', 'sort']) $(id).onchange = load;
+async function probe() {
+  const text = $('probe').value.trim();
+  if (!text) { $('hits').replaceChildren(); return; }
+  try {
+    const data = await send('/api/search', 'POST', {text});
+    const note = data.waiting ? `（还有 ${data.waiting} 张在等向量）` : '';
+    const grid = el('main', {style: 'padding:8px 0'}, ...data.hits.map(hit => card(hit.record, hit.score)));
+    $('hits').replaceChildren(el('div', {className: 'meta', textContent: `最接近的 ${data.hits.length} 张${note}`}), grid);
+    showError('');
+  } catch (e) { $('hits').replaceChildren(); showError(e.message); }
+}
+$('probeGo').onclick = probe;
+$('probe').onkeydown = event => { if (event.key === 'Enter') probe(); };
+load();
+</script>
+</body>
+</html>

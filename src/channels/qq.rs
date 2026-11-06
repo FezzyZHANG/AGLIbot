@@ -559,6 +559,7 @@ fn attachments(message: &[Value]) -> Vec<Attachment> {
             name: field("name").or_else(|| (seg["type"] == "file").then(|| field("file")).flatten()),
             size: field("file_size").and_then(|s| s.parse().ok()),
             quoted_from: None,
+            media_id: None,
         })
     }).collect()
 }

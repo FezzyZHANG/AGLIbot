@@ -28,7 +28,13 @@ providers:
     api_key_env: GEMINI_RELAY_API_KEY
   local:
     kind: openai_compat
-    base_url: http://localhost:11434/v1   # 例如 Ollama；没跑本地模型也无妨，只是 local_only 的信息将无模型可用
+    base_url: http://127.0.0.1:11434/v1   # 例如 Ollama；没跑本地模型也无妨，只是 local_only 的信息将无模型可用
+
+# 表情包检索的向量；和语义召回的 embedding 分开，打开它不改变记忆召回。
+sticker_embedding:
+  provider: local
+  model: bge-m3
+  local: true
 
 models:
   # Claude 中转：只启用报价表中的非 high 5.5 型号；沿用 1 USD = 6.65 CNY 的路由估值。

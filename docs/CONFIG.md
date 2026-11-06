@@ -38,6 +38,7 @@
 | `models[].fallbacks` | 可空字符串 | 无 | Anthropic 服务端拒答回退参数；不是 AGLI 自己的升级链；当前仅部分模型填写 |
 | `models[].stream` | bool | false | 兼容接口使用 SSE；内部收齐正文后发送，不向渠道转发推理增量 |
 | `models[].enable_thinking` | 可空 bool | 无（不发该参数） | 兼容接口 thinking 参数；场景 effort 为 low 时实际发 false；当前仅部分模型填写 |
+| `sticker_embedding` | 可空对象 | 无（不建表情包向量） | 字段同 `embedding`，只用到 provider、model、local；和语义召回分开，当前为本地 `bge-m3`，基址用 `127.0.0.1`（`localhost` 在这台机器上每次多 2 秒） |
 | `embedding` | 可空对象 | 无（关闭语义召回） | **可选块，当前未配置**；独立于聊天模型列表 |
 | `embedding.provider` | 字符串 | 块内必填 | 引用 providers，调用时要求 openai_compat |
 | `embedding.model` | 字符串 | 块内必填 | embedding 模型名，调用基址下的 `/embeddings` |
@@ -65,7 +66,7 @@ embedding:
 
 ## scenarios.yaml（全部需重启）
 
-顶层是场景名称 → 对象，以下每个字段对每个场景都适用。当前场景为 `triage`、`chat`、`extract`、`consolidate`、`research_plan`、`verify`、`synthesize`、`act`、`evolve`。前七个由加载器强制要求，后两个虽未在加载阶段强制检查，相关审查流程仍会使用。新增名称本身不会创造新流程。
+顶层是场景名称 → 对象，以下每个字段对每个场景都适用。当前场景为 `caption`（后台描述图片，缺少时图片只存不描述）、`triage`、`chat`、`extract`、`consolidate`、`research_plan`、`verify`、`synthesize`、`act`、`evolve`。前七个由加载器强制要求，后两个虽未在加载阶段强制检查，相关审查流程仍会使用。新增名称本身不会创造新流程。
 
 | 键路径 | 类型 | 缺键默认 | 用途 |
 |---|---|---|---|

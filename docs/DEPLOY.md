@@ -46,6 +46,12 @@
 
 bot 启动时会在日志里写一行 `release <commit> (<origin>)`。如果正在运行的 exe 与指针不一致，同一行会带上 WARNING。
 
+## 表情包页面
+
+`ops/start-stickers-web.ps1 -Runtime <根> [-Port 8790] [-Restart]` 用指针里的 exe 启动 `aglibot stickers-web`，只监听 `127.0.0.1`，没有登录。pid 记在 `<根>/data/logs/stickers-web.json`。它是单独的进程，bot 重启或部署时页面照常可用；`deploy.ps1` 重启 bot 后会一起重启它。
+
+向量依赖本机的 Ollama：要在运行，并已 `ollama pull bge-m3`，否则向量排队等待，聊天不受影响。
+
 ## config 的两份
 
 源码仓库的 `config/` 是默认值和评审对象。运行时的 `config/` 是在线实际生效的一份，可以有人设相关的差异，比如别名、固定模型。改了仓库里的 config 并不会影响在线 bot；要上线，就在运行时那份里改。每次部署打印的差异列表就是用来发现两份是否漂移的。

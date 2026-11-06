@@ -23,7 +23,8 @@ if ($Restart -and (Test-Path -LiteralPath $current)) {
         }
     }
 }
-if (Get-Process aglibot -ErrorAction SilentlyContinue) { throw 'AGLI is already running; stop the intended instance explicitly before another start.' }
+# The sticker page runs from the same exe, so tell the two apart by command line.
+if (Get-CimInstance Win32_Process -Filter "Name='aglibot.exe'" | Where-Object { $_.CommandLine -notlike '*stickers-web*' }) { throw 'AGLI is already running; stop the intended instance explicitly before another start.' }
 
 $release = Get-Content -Raw -LiteralPath (Join-Path $rt 'data\release.json') | ConvertFrom-Json
 $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $release.exe).Hash.ToLower()

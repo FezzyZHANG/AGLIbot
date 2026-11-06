@@ -149,6 +149,7 @@ fn media(msg: &Value) -> Option<(&'static str, Option<Attachment>)> {
         name: None,
         size: file.get("file_size").and_then(Value::as_u64),
         quoted_from: None,
+        media_id: None,
     });
     if let Some(sizes) = msg.get("photo").and_then(Value::as_array) {
         // Sizes run smallest to largest; one photo, not several images.

@@ -299,8 +299,11 @@ impl LlmClient {
     /// For keyless (local) providers: is the server actually up? Checked once at startup.
     pub async fn reachable(&self, m: &ModelEntry) -> bool {
         let Some(base) = self.providers.get(&m.provider).and_then(provider_base_url) else { return false };
-        let probe = self.http.get(format!("{base}/models")).timeout(Duration::from_secs(2)).send().await;
-        probe.is_ok_and(|r| r.status().is_success())
+        let Ok(probe) = self.http.get(format!("{base}/models")).timeout(Duration::from_secs(2)).send().await else { return false };
+        let Ok(listing) = probe.error_for_status() else { return false };
+        // A running server is not enough: Ollama may be up for embeddings without this model pulled.
+        let Ok(listing) = listing.json::<Value>().await else { return false };
+        listing["data"].as_array().is_some_and(|models| models.iter().any(|entry| entry["id"].as_str() == Some(m.model.as_str())))
     }
 
     pub async fn complete(&self, m: &ModelEntry, p: &Prompt<'_>) -> Result<Reply> {

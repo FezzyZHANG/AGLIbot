@@ -279,6 +279,67 @@ pub struct ReviewItem {
     pub pushed: bool,
 }
 
+/// What became of an image, one record per file content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaStatus {
+    /// A sticker he may use.
+    Active,
+    /// The filter turned it down; the owner can still keep it.
+    Rejected,
+    /// Described for its own private chat; never shown or collected.
+    Seen,
+    /// The owner stopped it. The record stays, so it is not collected again.
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StickerScope {
+    Any,
+    Origin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaRecord {
+    /// sha256 of the file.
+    pub hash: String,
+    pub ext: String,
+    pub status: MediaStatus,
+    /// The model's judgement, kept apart from `status`, which also depends on where it was seen.
+    pub keep: bool,
+    pub description: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub use_when: String,
+    #[serde(default)]
+    pub avoid: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub scope: StickerScope,
+    #[serde(default)]
+    pub scope_reason: String,
+    /// `platform:chat_id` where it was first collectable.
+    pub origin: String,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub sightings: u64,
+    #[serde(default)]
+    pub sent_count: u64,
+    #[serde(default)]
+    pub last_sent: Option<DateTime<Utc>>,
+}
+
+/// Rebuildable from `MediaRecord`: a changed `text_hash` or model means it is rebuilt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StickerVector {
+    pub hash: String,
+    pub model_id: String,
+    pub text_hash: String,
+    pub vector: Vec<f32>,
+}
+
 pub trait Store: Send + Sync {
     fn append_message(&self, m: &MessageRecord) -> Result<()>;
     /// The last `n` messages in a namespace, oldest first.
@@ -332,6 +393,16 @@ pub trait Store: Send + Sync {
     fn lexicon(&self) -> Result<Vec<Value>>;
     /// Insert lexicon documents; a duplicate (term, scope), null and missing scope alike, is an error.
     fn insert_lexicon(&self, docs: &[Value]) -> Result<()>;
+
+    fn media(&self, hash: &str) -> Result<Option<MediaRecord>>;
+    /// Insert or replace by hash.
+    fn save_media(&self, record: &MediaRecord) -> Result<()>;
+    fn all_media(&self) -> Result<Vec<MediaRecord>>;
+    /// Removes the record and its vectors.
+    fn delete_media(&self, hash: &str) -> Result<()>;
+    /// By hash; only vectors from this embedder.
+    fn sticker_vectors(&self, model_id: &str) -> Result<BTreeMap<String, StickerVector>>;
+    fn save_sticker_vector(&self, vector: &StickerVector) -> Result<()>;
 }
 
 /// The (term, scope) key that must be unique in the lexicon; missing scope is global.

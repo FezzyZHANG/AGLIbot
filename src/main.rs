@@ -8,6 +8,7 @@ mod mind;
 mod ns;
 mod social;
 mod store;
+mod stickers_web;
 mod work;
 
 use std::path::PathBuf;
@@ -63,6 +64,9 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("import-jsonl")) {
         return store::import::run(std::env::args_os().skip(2));
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("stickers-web")) {
+        return stickers_web::run(std::env::args_os().skip(2)).await;
     }
     // start-bot.ps1 sets this so the log shows in the bot's console window and still lands in a file.
     let log_writer = match std::env::var_os("AGLI_LOG_FILE") {
@@ -144,6 +148,7 @@ async fn main() -> Result<()> {
     let mut config_poll = tokio::time::interval(Duration::from_secs(2));
     config_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     agli.acknowledge_evolution_start()?;
+    agli.start_media();
     info!("{}", evolution::restart::describe_release(&cfg.data_dir()));
     info!("AGLI is up");
     loop {

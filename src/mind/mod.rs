@@ -11,6 +11,7 @@ pub mod models;
 pub mod reflect;
 pub mod router;
 pub mod speak;
+pub mod media;
 pub mod vision;
 pub mod state;
 pub mod watchlist;

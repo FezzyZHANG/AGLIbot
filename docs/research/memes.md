@@ -2,6 +2,8 @@
 
 2026-11-02. Research only; development is not authorized. Providers, interfaces, limits and targets are recommendations. External facts use numbered sources, all accessed **2026-11-02**. No live messages, account probes or recognition benchmarks were performed.
 
+Follow-up, 2026-11-06: [sticker-store.md](sticker-store.md) covers an owner-managed sticker catalogue with vector search, and notes what has changed since this baseline.
+
 ## Repository baseline
 
 `src/channels/qq.rs::parse_event` replaces `face` with `[表情]`, `image` with `[图片]`, and `record` with `[语音]`; identifiers and URLs disappear. Unknown segments, including standalone `mface`, are ignored; an otherwise empty message is dropped. `telegram.rs::parse_message` requires `text`, so sticker-only and voice messages are skipped. Both outgoing `send` methods send text only; QQ deliberately does not interpret CQ codes in model output.

@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::{AuditRecord, Episode, EpisodeEmbedding, Group, Lesson, MessageRecord, ModelCallRecord, Person, Relation, ReviewItem, Store};
+use super::{MediaRecord, StickerVector, AuditRecord, Episode, EpisodeEmbedding, Group, Lesson, MessageRecord, ModelCallRecord, Person, Relation, ReviewItem, Store};
 use crate::ns::Namespace;
 
 const MESSAGES: &str = "messages.jsonl";
@@ -28,6 +28,8 @@ const RELATIONS: &str = "relations.json";
 const REVIEWS: &str = "reviews.json";
 const KV: &str = "kv.json";
 const LEXICON: &str = "lexicon.json";
+const MEDIA: &str = "media.json";
+const STICKER_VECTORS: &str = "sticker_vectors.json";
 
 pub struct JsonlStore {
     cache: super::cache::Cache,
@@ -322,6 +324,41 @@ impl Store for JsonlStore {
         }
         all.extend(docs.iter().cloned());
         self.write_doc(LEXICON, &all)
+    }
+
+    fn media(&self, hash: &str) -> Result<Option<MediaRecord>> {
+        let _g = self.guard();
+        let doc: BTreeMap<String, MediaRecord> = self.read_doc(MEDIA)?;
+        Ok(doc.get(hash).cloned())
+    }
+
+    fn save_media(&self, record: &MediaRecord) -> Result<()> {
+        self.update_doc(MEDIA, |doc: &mut BTreeMap<String, MediaRecord>| {
+            doc.insert(record.hash.clone(), record.clone());
+        })
+    }
+
+    fn all_media(&self) -> Result<Vec<MediaRecord>> {
+        let _g = self.guard();
+        let doc: BTreeMap<String, MediaRecord> = self.read_doc(MEDIA)?;
+        Ok(doc.into_values().collect())
+    }
+
+    fn delete_media(&self, hash: &str) -> Result<()> {
+        self.update_doc(MEDIA, |doc: &mut BTreeMap<String, MediaRecord>| { doc.remove(hash); })?;
+        self.update_doc(STICKER_VECTORS, |doc: &mut BTreeMap<String, StickerVector>| { doc.remove(hash); })
+    }
+
+    fn sticker_vectors(&self, model_id: &str) -> Result<BTreeMap<String, StickerVector>> {
+        let _g = self.guard();
+        let doc: BTreeMap<String, StickerVector> = self.read_doc(STICKER_VECTORS)?;
+        Ok(doc.into_iter().filter(|(_, v)| v.model_id == model_id).collect())
+    }
+
+    fn save_sticker_vector(&self, vector: &StickerVector) -> Result<()> {
+        self.update_doc(STICKER_VECTORS, |doc: &mut BTreeMap<String, StickerVector>| {
+            doc.insert(vector.hash.clone(), vector.clone());
+        })
     }
 }
 

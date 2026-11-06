@@ -20,6 +20,7 @@ use crate::store::{ModelCallRecord, Store};
 pub struct Models {
     pub focus_cache: super::flow_metrics::FocusCache,
     embedding: Option<super::embedding::EmbeddingCfg>,
+    sticker_embedding: Option<super::embedding::EmbeddingCfg>,
     embedding_warned: AtomicBool,
     router: Router,
     llm: LlmClient,
@@ -100,6 +101,7 @@ impl Models {
         Ok(Models {
             focus_cache: super::flow_metrics::FocusCache::new(cfg)?,
             embedding, embedding_warned: AtomicBool::new(false),
+            sticker_embedding: cfg.models.sticker_embedding.clone().filter(|e| e.validate().is_ok()),
             router, llm, store, budget: Mutex::new(budget), has_local,
             #[cfg(test)]
             stub: None,
@@ -111,6 +113,7 @@ impl Models {
         Self {
             focus_cache: Default::default(),
             embedding: None, embedding_warned: AtomicBool::new(false),
+            sticker_embedding: None,
             router: Router::new(vec![], Default::default()),
             llm: LlmClient::new(Default::default()).unwrap(), store,
             budget: Mutex::new(Budget::new(1.0, 0.0)), has_local: false,
@@ -140,6 +143,28 @@ impl Models {
         if !self.embedding_warned.swap(true, Ordering::Relaxed) {
             warn!("semantic recall unavailable; retaining ordinary recall: {error:#}");
         }
+    }
+
+    pub fn sticker_embedding_id(&self) -> Option<String> {
+        self.sticker_embedding.as_ref().map(|cfg| cfg.model_id())
+    }
+
+    /// Sticker text is already what a cloud model wrote, so it needs no policy check here.
+    pub async fn embed_sticker(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        let Some(cfg) = &self.sticker_embedding else { return Ok(None) };
+        let (vector, _) = self.embedding_call(cfg, &ProcessingPolicy::Any, text).await?;
+        Ok(Some(vector))
+    }
+
+    /// One call with an image, for the background worker: no retry or escalation.
+    pub async fn describe_image(&self, policy: &ProcessingPolicy, system: &str, frames: Vec<String>) -> Result<String> {
+        #[cfg(test)]
+        if self.stub.is_some() { return self.stub_reply("caption", policy, "image") }
+        let model = self.pick("caption", policy)?;
+        let turns = [Turn::UserParts(super::media::caption_parts(frames))];
+        let effort = self.effort("caption");
+        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref() };
+        Ok(self.call_once("caption", &model, &prompt, "caption", None).await?.text)
     }
 
     /// Check policy before passing any input to the client (including the test client).

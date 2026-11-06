@@ -64,6 +64,9 @@ pub struct ModelEntry {
 pub struct ModelsCfg {
     #[serde(default)]
     pub embedding: Option<crate::mind::embedding::EmbeddingCfg>,
+    /// Vectors for sticker search, separate so turning it on does not change memory recall.
+    #[serde(default)]
+    pub sticker_embedding: Option<crate::mind::embedding::EmbeddingCfg>,
     pub daily_budget_usd: f64,
     pub providers: BTreeMap<String, ProviderCfg>,
     pub models: Vec<ModelEntry>,

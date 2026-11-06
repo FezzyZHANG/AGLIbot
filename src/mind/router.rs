@@ -303,14 +303,14 @@ mod tests {
     }
 
     #[test]
-    fn bailian_alone_covers_repo_scenarios_except_chat() {
+    fn bailian_alone_covers_repo_scenarios_except_vision_ones() {
         let cfg = crate::config::Config::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
         let full = Router::new(cfg.models.models.clone(), cfg.scenarios.clone());
         let models = cfg.models.models.into_iter().filter(|m| m.provider == "bailian").collect();
         let r = Router::new(models, cfg.scenarios);
         // `evolve` is owner-triggered and falls back to owner review, so it may need a non-bailian model.
         assert!(full.select("evolve", &ProcessingPolicy::Any, false).is_ok());
-        for name in r.scenarios.keys().filter(|n| *n != "evolve" && *n != "chat") {
+        for name in r.scenarios.keys().filter(|n| *n != "evolve" && *n != "chat" && *n != "caption") {
             for exhausted in [false, true] {
                 assert_eq!(r.select(name, &ProcessingPolicy::Any, exhausted).unwrap().provider, "bailian");
             }

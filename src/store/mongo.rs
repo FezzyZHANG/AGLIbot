@@ -15,11 +15,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::{AuditRecord, Episode, EpisodeEmbedding, Group, Lesson, MessageRecord, ModelCallRecord, Person, Relation, ReviewItem, Store};
+use super::{MediaRecord, StickerVector, AuditRecord, Episode, EpisodeEmbedding, Group, Lesson, MessageRecord, ModelCallRecord, Person, Relation, ReviewItem, Store};
 use crate::ns::Namespace;
 
 const COLLECTIONS: &[&str] =
-    &["messages", "model_calls", "episodes", "persons", "lessons", "audit", "reviews", "kv", "relations", "groups", "lexicon"];
+    &["messages", "model_calls", "episodes", "persons", "lessons", "audit", "reviews", "kv", "relations", "groups", "media", "sticker_vectors", "lexicon"];
 
 pub struct MongoStore {
     cache: super::cache::Cache,
@@ -391,6 +391,35 @@ impl Store for MongoStore {
         let docs = docs.iter().map(bson::to_document).collect::<std::result::Result<Vec<_>, _>>()?;
         blocking(|| Ok(self.collection("lexicon").insert_many(docs).run().map(|_| ())?))
     }
+
+    fn media(&self, hash: &str) -> Result<Option<MediaRecord>> {
+        blocking(|| self.collection("media").find_one(doc! { "_id": hash }).run()?.map(decode).transpose())
+    }
+
+    fn save_media(&self, record: &MediaRecord) -> Result<()> {
+        self.save("media", &record.hash, record, false)
+    }
+
+    fn all_media(&self) -> Result<Vec<MediaRecord>> {
+        Ok(self.keyed_snapshot::<MediaRecord>("media")?.into_values().collect())
+    }
+
+    fn delete_media(&self, hash: &str) -> Result<()> {
+        blocking(|| {
+            self.collection("media").delete_one(doc! { "_id": hash }).run()?;
+            self.collection("sticker_vectors").delete_one(doc! { "_id": hash }).run()?;
+            Ok(())
+        })
+    }
+
+    fn sticker_vectors(&self, model_id: &str) -> Result<BTreeMap<String, StickerVector>> {
+        Ok(self.keyed_snapshot::<StickerVector>("sticker_vectors")?.into_values()
+            .filter(|v| v.model_id == model_id).map(|v| (v.hash.clone(), v)).collect())
+    }
+
+    fn save_sticker_vector(&self, vector: &StickerVector) -> Result<()> {
+        self.save("sticker_vectors", &vector.hash, vector, false)
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +433,35 @@ mod tests {
         let doc = record(value, fields).unwrap();
         let bytes = bson::to_vec(&doc).unwrap();
         decode(bson::from_slice(&bytes).unwrap()).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires MONGO_URL pointing at a test server; creates and drops a unique test database"]
+    fn media_records_and_vectors_round_trip() {
+        let url = std::env::var("MONGO_URL").expect("MONGO_URL");
+        let store = MongoStore::open(&url, &format!("aglibot_test_{}", ObjectId::new().to_hex())).unwrap();
+        let record = MediaRecord {
+            hash: "h".into(), ext: "png".into(), status: super::super::MediaStatus::Active, keep: true, description: "猫".into(),
+            text: String::new(), use_when: String::new(), avoid: String::new(), tags: vec!["猫".into()],
+            scope: super::super::StickerScope::Origin, scope_reason: String::new(), origin: "qq:group:1".into(),
+            first_seen: time(), last_seen: time(), sightings: 1, sent_count: 0, last_sent: None,
+        };
+        let result = (|| -> Result<()> {
+            assert!(store.media("h")?.is_none());
+            store.save_media(&record)?;
+            store.save_media(&MediaRecord { sightings: 2, ..record.clone() })?;
+            assert_eq!(store.media("h")?.unwrap().sightings, 2);
+            assert_eq!(store.all_media()?.len(), 1);
+            store.save_sticker_vector(&StickerVector { hash: "h".into(), model_id: "m".into(), text_hash: "t".into(), vector: vec![0.5, -1.0] })?;
+            assert_eq!(store.sticker_vectors("m")?["h"].vector, [0.5, -1.0]);
+            assert!(store.sticker_vectors("other")?.is_empty());
+            store.delete_media("h")?;
+            assert!(store.media("h")?.is_none());
+            assert!(store.sticker_vectors("m")?.is_empty());
+            Ok(())
+        })();
+        store.drop_import_test_database().unwrap();
+        result.unwrap();
     }
 
     #[test]
