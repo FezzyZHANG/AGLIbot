@@ -17,6 +17,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
 
 use agli::{Agli, Event, WorkItem, WorkQueue, next_work};
 use channels::Outlets;
@@ -63,10 +64,19 @@ async fn main() -> Result<()> {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("import-jsonl")) {
         return store::import::run(std::env::args_os().skip(2));
     }
+    // start-bot.ps1 sets this so the log shows in the bot's console window and still lands in a file.
+    let log_writer = match std::env::var_os("AGLI_LOG_FILE") {
+        Some(path) => {
+            let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            BoxMakeWriter::new(std::io::stdout.and(Arc::new(file)))
+        }
+        None => BoxMakeWriter::new(std::io::stdout),
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with_writer(log_writer)
         .init();
 
     let root = std::env::var_os("AGLI_ROOT").map(PathBuf::from).unwrap_or(std::env::current_dir()?);

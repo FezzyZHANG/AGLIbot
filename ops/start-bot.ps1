@@ -14,8 +14,13 @@ if ($Restart -and (Test-Path -LiteralPath $current)) {
     $proc = Get-Process -Id $old.pid -ErrorAction SilentlyContinue
     if ($proc -and $proc.Name -eq 'aglibot') {
         if ($proc.Path -ne $old.exe) { throw "pid $($old.pid) runs $($proc.Path), not the recorded $($old.exe); stop it explicitly" }
+        $window = (Get-CimInstance Win32_Process -Filter "ProcessId=$($old.pid)").ParentProcessId
         Stop-Process -Id $old.pid -Confirm:$false
         $proc.WaitForExit(30000) | Out-Null
+        # Its cmd.exe is now paused on the exit message; close that window too.
+        if ($window -and (Get-CimInstance Win32_Process -Filter "Name='cmd.exe' AND ProcessId=$window")) {
+            Stop-Process -Id $window -Confirm:$false -ErrorAction SilentlyContinue
+        }
     }
 }
 if (Get-Process aglibot -ErrorAction SilentlyContinue) { throw 'AGLI is already running; stop the intended instance explicitly before another start.' }
@@ -28,7 +33,9 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $out = Join-Path $rt "data\logs\bot-$stamp.out.log"
 $err = Join-Path $rt "data\logs\bot-$stamp.err.log"
 # WMI starts the bot outside the caller's process tree, so it survives the shell (and Claude Code) that ran this.
-$line = "cmd.exe /d /s /c `"set `"AGLI_ROOT=$rt`"&& set `"AGLI_SOURCE=$($cfg.source)`"&& set NO_COLOR=1&& `"$($release.exe)`" 1>`"$out`" 2>`"$err`"`""
+# The bot prints its log to this window and copies it to AGLI_LOG_FILE. Stderr (panics, startup errors)
+# goes to its file and is shown once the bot exits; the pause keeps the window open to read it.
+$line = "cmd.exe /d /s /c `"set `"AGLI_ROOT=$rt`"&& set `"AGLI_SOURCE=$($cfg.source)`"&& set `"AGLI_LOG_FILE=$out`"&& set NO_COLOR=1&& `"$($release.exe)`" 2>`"$err`" & chcp 65001 >nul & type `"$err`" & echo bot exited, log: `"$out`" & pause`""
 $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $line; CurrentDirectory = $rt }
 if ($r.ReturnValue -ne 0) { throw "Win32_Process.Create failed: $($r.ReturnValue)" }
 

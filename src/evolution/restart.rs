@@ -154,7 +154,8 @@ fn handoff(parent: u32, restart: &Restart) -> Result<()> {
     // Write before spawn: a lost acknowledgement must not cause a second launch.
     restart.receipt("starting", None)?;
     let mut cmd = Command::new(&restart.executable);
-    cmd.current_dir(&restart.root).env("AGLI_ROOT", &restart.root).env("AGLI_EVOLUTION_STARTED", &restart.id).stdin(Stdio::null());
+    // It logs to runtime.log below, not to the file its predecessor's start-bot.ps1 named.
+    cmd.current_dir(&restart.root).env("AGLI_ROOT", &restart.root).env("AGLI_EVOLUTION_STARTED", &restart.id).env_remove("AGLI_LOG_FILE").stdin(Stdio::null());
     let log = std::fs::OpenOptions::new().create(true).append(true).open(restart.receipt.with_file_name("runtime.log"))?;
     cmd.stdout(log.try_clone()?).stderr(log);
     #[cfg(windows)]

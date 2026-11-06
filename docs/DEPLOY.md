@@ -39,7 +39,10 @@
 - 先校验指针里 exe 的 sha256，有别的 aglibot 在运行时拒绝启动。
 - 通过 WMI 启动 bot，使它不挂在调用者的进程树下。
 - 把 pid 写入 `<根>/data/logs/current.json`，日志写在 `<根>/data/logs/bot-<时间>.{out,err}.log`。
-- 加 `-Restart` 时，只停止 `current.json` 记录的那个进程。
+- 弹出的 cmd 窗口实时显示日志：bot 把日志同时写到控制台和 `AGLI_LOG_FILE`（即 `.out.log`）。stderr（panic、启动错误）只写 `.err.log`，bot 退出后才显示在窗口里，窗口停在 `pause` 等待按键。关闭还在运行的窗口会连 bot 一起结束。
+- 加 `-Restart` 时，只停止 `current.json` 记录的那个进程，并关掉它的窗口。
+
+`AGLI_LOG_FILE` 需要 bot 本身支持。用 `start-bot.ps1` 启动不支持它的旧 release 时，日志只出现在窗口里，不会写入 `.out.log`。进化重启的 bot 没有窗口，日志照旧写在 `runtime.log`。
 
 bot 启动时会在日志里写一行 `release <commit> (<origin>)`。如果正在运行的 exe 与指针不一致，同一行会带上 WARNING。
 
