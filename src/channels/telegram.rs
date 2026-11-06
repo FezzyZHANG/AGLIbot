@@ -12,6 +12,7 @@ use crate::config::TelegramCfg;
 const CHUNK_CHARS: usize = 3500;
 
 /// Cloneable: one copy polls (it owns the offset), others only send.
+/// The token is in every request URL, so every reqwest error here drops the URL before it can be logged.
 #[derive(Clone)]
 pub struct Telegram {
     http: reqwest::Client,
@@ -39,7 +40,7 @@ impl Telegram {
 
     /// Learn who the bot is; needed before polling groups.
     pub async fn identify(&mut self) -> Result<()> {
-        let v: Value = self.http.get(format!("{}/getMe", self.base)).send().await?.json().await?;
+        let v: Value = self.http.get(format!("{}/getMe", self.base)).send().await.map_err(reqwest::Error::without_url)?.json().await.map_err(reqwest::Error::without_url)?;
         if v.get("ok").and_then(Value::as_bool) != Some(true) {
             bail!("getMe failed: {v}");
         }
@@ -78,8 +79,9 @@ impl Telegram {
             ])
             .timeout(Duration::from_secs(self.poll_timeout_s + 10))
             .send()
-            .await?;
-        let v: Value = resp.json().await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        let v: Value = resp.json().await.map_err(reqwest::Error::without_url)?;
         if v.get("ok").and_then(Value::as_bool) != Some(true) {
             bail!("getUpdates failed: {v}");
         }
@@ -95,7 +97,7 @@ impl Telegram {
         Ok(out)
     }
 
-    /// Download a file by id. The token is in every URL here, so errors drop the URL.
+    /// Download a file by id.
     pub async fn fetch_file(&self, file_id: &str, max: usize) -> Result<Vec<u8>> {
         let v: Value = self.http.get(format!("{}/getFile", self.base)).query(&[("file_id", file_id)])
             .send().await.map_err(reqwest::Error::without_url)?
@@ -114,9 +116,11 @@ impl Telegram {
                 .post(format!("{}/sendMessage", self.base))
                 .json(&json!({"chat_id": chat_id, "text": chunk}))
                 .send()
-                .await?
+                .await
+                .map_err(reqwest::Error::without_url)?
                 .json()
-                .await?;
+                .await
+                .map_err(reqwest::Error::without_url)?;
             if v.get("ok").and_then(Value::as_bool) != Some(true) {
                 bail!("sendMessage failed: {v}");
             }
@@ -307,6 +311,51 @@ mod tests {
         let requests = server.join().unwrap();
         assert!(requests[0].starts_with("GET http://telegram.invalid/bot-test/getUpdates?"));
         assert_eq!(requests[1], "POST http://telegram.invalid/bot-test/sendMessage HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn request_errors_never_contain_the_token() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        async fn errors(base: String) -> Vec<anyhow::Error> {
+            let mut tg = Telegram {
+                http: reqwest::Client::new(),
+                base,
+                offset: 0,
+                poll_timeout_s: 1,
+                me_id: 0,
+                me_username: String::new(),
+            };
+            vec![
+                tg.identify().await.unwrap_err(),
+                tg.poll().await.unwrap_err(),
+                tg.send("42", "hi").await.unwrap_err(),
+                tg.fetch_file("f", 1024).await.unwrap_err(),
+            ]
+        }
+
+        // Connection refused.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let mut seen = errors(format!("http://{closed}/botSECRET")).await;
+
+        // A proxy or gateway answering with something other than JSON.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let mut socket = socket.unwrap();
+                socket.read(&mut [0; 4096]).unwrap();
+                write!(socket, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad").unwrap();
+            }
+        });
+        seen.extend(errors(format!("http://{open}/botSECRET")).await);
+
+        assert_eq!(seen.len(), 8);
+        for error in seen {
+            let text = format!("{error:#} {error:?}");
+            assert!(!text.contains("SECRET"), "{text}");
+        }
     }
 
     /// Reads bot metadata only; does not send messages or consume pending updates.
