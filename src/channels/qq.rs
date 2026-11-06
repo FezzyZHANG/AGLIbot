@@ -14,7 +14,7 @@
 //! |---|---|
 //! | text | as is |
 //! | at | `@名字 `; @him sets `mentions_me` instead; `all` is `@全体成员 ` |
-//! | reply | `[回复 名字: 前40字…]`, else `[回复]`; replies to him set `mentions_me`; hidden in forwards; quoted images become attachments |
+//! | reply | `[回复 名字: 前40字…]`, else `[回复]`; replies to him set `mentions_me`; hidden in forwards; images in the quoted message, or the nearest earlier one it quotes, become attachments |
 //! | face | `[表情:微笑]` from `raw.faceText`, else `[表情]` |
 //! | mface | `[表情:summary]` (market sticker) |
 //! | image | `[图片]`; stickers (`sub_type` 1) `[动画表情]` |
@@ -73,6 +73,8 @@ const NODE_CHARS: usize = 500;
 /// waits on them.
 const FORWARD_FETCHES: usize = 6;
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(8);
+/// `get_msg` calls per quote chain: the inbound line waits on them too.
+const QUOTE_FETCHES: usize = 3;
 /// Card fields beyond this are cut.
 const CARD_CHARS: usize = 200;
 
@@ -185,8 +187,9 @@ async fn enrich(mut raw: mpsc::Receiver<Pending>, qq: QqHandle, inbound: mpsc::S
             if let Some(id) = &env.message_id {
                 // Cache the body only, so quoting a reply does not nest prefixes.
                 let body = env.text.strip_prefix(reply.as_str()).unwrap_or(&env.text).trim().to_string();
-                // Likewise its own images only, so quoting a quote does not reach further back.
-                let images = env.attachments.iter().filter(|a| is_image(a)).cloned().collect();
+                // Its own images, else the ones it quoted, so a later quote of it finds them.
+                let own: Vec<_> = env.attachments.iter().filter(|a| is_image(a)).cloned().collect();
+                let images = if own.is_empty() { quoted_images.clone() } else { own };
                 qq.shared.cache(id.clone(), Quoted { name: env.sender_name.clone(), text: body, images });
             }
             env.attachments.extend(quoted_images);
@@ -564,6 +567,10 @@ fn is_image(attachment: &Attachment) -> bool {
     matches!(attachment.kind, AttachmentKind::Image | AttachmentKind::Sticker)
 }
 
+fn images_in(segments: &[Value]) -> Vec<Attachment> {
+    attachments(segments).into_iter().filter(is_image).collect()
+}
+
 /// Render the text; `None` when nothing readable is left.
 fn finish(mut p: Pending, forwards: &Forwards, shared: &Shared, reply: &str) -> Option<Envelope> {
     if p.env.notice {
@@ -590,16 +597,62 @@ fn reply_segment(message: &[Value]) -> Option<&Value> {
     message.iter().find(|s| s.get("type").and_then(Value::as_str) == Some("reply"))
 }
 
+fn reply_id(message: &[Value]) -> Option<String> {
+    reply_segment(message)?.pointer("/data/id").filter(|id| !id.is_null()).map(id_string).filter(|id| !id.is_empty())
+}
+
+fn quoted_name(data: &Value, id: &str, shared: &Shared) -> String {
+    let me = shared.self_id.load(Ordering::Relaxed).to_string();
+    if shared.is_mine(id) || data.pointer("/sender/user_id").map(id_string).as_deref() == Some(&me) {
+        "我".into()
+    } else {
+        node_name(data)
+    }
+}
+
+/// Walk back from a quoted message with no images to the nearest earlier one that has some, keeping
+/// who first sent them. `fetched` calls are already spent.
+async fn earlier_images<F, Fut>(segments: &[Value], shared: &Shared, fetch: &mut F, mut fetched: usize) -> Vec<Attachment>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Value>>,
+{
+    let mut next = reply_id(segments);
+    while let Some(id) = next {
+        if let Some(cached) = shared.cached(&id) {
+            let from = Some(cached.name).filter(|name| !name.is_empty());
+            return cached.images.into_iter().map(|a| Attachment { quoted_from: a.quoted_from.or_else(|| from.clone()), ..a }).collect();
+        }
+        if fetched >= QUOTE_FETCHES { break; }
+        fetched += 1;
+        let data = match fetch(id.clone()).await {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("qq: quoted message {id} unreadable: {e:#}");
+                break;
+            }
+        };
+        let segments = node_segments(&data);
+        let images = images_in(&segments);
+        if !images.is_empty() {
+            let from = Some(quoted_name(&data, &id, shared));
+            return images.into_iter().map(|a| Attachment { quoted_from: from.clone(), ..a }).collect();
+        }
+        next = reply_id(&segments);
+    }
+    Vec::new()
+}
+
 /// The quote's text prefix, and the images in the quoted message.
 async fn resolve_reply<F, Fut>(message: &[Value], shared: &Shared, mut fetch: F) -> (String, Vec<Attachment>)
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<Value>>,
 {
-    let Some(seg) = reply_segment(message) else {
+    if reply_segment(message).is_none() {
         return (String::new(), Vec::new());
-    };
-    let Some(id) = seg.pointer("/data/id").filter(|id| !id.is_null()).map(id_string).filter(|id| !id.is_empty()) else {
+    }
+    let Some(id) = reply_id(message) else {
         return ("[回复]".into(), Vec::new());
     };
     let quoted = match shared.cached(&id) {
@@ -608,14 +661,14 @@ where
             Ok(data) if data.get("message").is_some_and(|m| m.is_array() || m.is_string()) => {
                 let forwards = Forwards::new();
                 let r = Render { self_id: shared.self_id.load(Ordering::Relaxed).to_string(), shared, forwards: &forwards };
-                let name = if shared.is_mine(&id) || data.pointer("/sender/user_id").map(id_string).as_deref() == Some(&r.self_id) {
-                    "我".into()
-                } else {
-                    node_name(&data)
-                };
+                let name = quoted_name(&data, &id, shared);
                 let segments = node_segments(&data);
-                let images = attachments(&segments).into_iter().filter(is_image).collect();
-                let message = Quoted { name, text: r.segments(&segments, FORWARD_DEPTH, None).trim().to_string(), images };
+                let text = r.segments(&segments, FORWARD_DEPTH, None).trim().to_string();
+                let mut images = images_in(&segments);
+                if images.is_empty() {
+                    images = earlier_images(&segments, shared, &mut fetch, 1).await;
+                }
+                let message = Quoted { name, text, images };
                 shared.cache(id, message.clone());
                 Some(message)
             }
@@ -629,7 +682,7 @@ where
     match quoted {
         Some(q) => {
             let from = Some(q.name.clone()).filter(|name| !name.is_empty());
-            let images = q.images.iter().map(|a| Attachment { quoted_from: from.clone(), ..a.clone() }).collect();
+            let images = q.images.iter().map(|a| Attachment { quoted_from: a.quoted_from.clone().or_else(|| from.clone()), ..a.clone() }).collect();
             (format!("[回复 {}: {}]", q.name, cut(&q.text.replace("\r\n", " ").replace(['\r', '\n'], " "), 40)), images)
         }
         None => ("[回复]".into(), Vec::new()),
@@ -1054,6 +1107,89 @@ mod tests {
         assert_eq!(env.attachments.len(), 1);
         assert_eq!(env.attachments[0].file_id.as_deref(), Some("own.amr"));
         assert!(matches!(env.attachments[0].kind, AttachmentKind::Voice));
+    }
+
+    fn image(file: &str) -> Value {
+        json!({"type": "image", "data": {"file": file, "url": format!("https://example.test/{file}")}})
+    }
+
+    #[tokio::test]
+    async fn a_quote_of_a_quote_reaches_the_image_through_get_msg() {
+        let s = shared(99);
+        let msg = json!([reply("c"), text("这是啥")]);
+        let mut asked = Vec::new();
+        let (_, images) = resolve_reply(msg.as_array().unwrap(), &s, |id| {
+            asked.push(id.clone());
+            async move {
+                Ok(match id.as_str() {
+                    "c" => node("丙", json!([reply("b"), text("看这个")])),
+                    "b" => node("乙", json!([reply("a"), text("转")])),
+                    _ => node("甲", json!([image("a.jpg")])),
+                })
+            }
+        }).await;
+        assert_eq!(asked, ["c", "b", "a"]);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].file_id.as_deref(), Some("a.jpg"));
+        assert_eq!(images[0].quoted_from.as_deref(), Some("甲"));
+        // Quoting the same message again needs no fetch and keeps the first sender.
+        let (_, images) = resolve_reply(msg.as_array().unwrap(), &s, |_| async { panic!("cache hit must not fetch") }).await;
+        assert_eq!(images[0].quoted_from.as_deref(), Some("甲"));
+    }
+
+    #[tokio::test]
+    async fn a_quote_chain_stops_at_the_nearest_image_and_at_the_fetch_limit() {
+        let s = shared(99);
+        let msg = json!([reply("c")]);
+        let mut asked = Vec::new();
+        let (_, images) = resolve_reply(msg.as_array().unwrap(), &s, |id| {
+            asked.push(id.clone());
+            async move {
+                Ok(match id.as_str() {
+                    "c" => node("丙", json!([reply("b"), text("看")])),
+                    _ => node("乙", json!([reply("a"), image("b.jpg")])),
+                })
+            }
+        }).await;
+        assert_eq!(asked, ["c", "b"]);
+        assert_eq!(images[0].file_id.as_deref(), Some("b.jpg"));
+
+        let s = shared(99);
+        let mut asked = Vec::new();
+        let (_, images) = resolve_reply(msg.as_array().unwrap(), &s, |id| {
+            asked.push(id.clone());
+            let next = format!("{id}x");
+            async move { Ok(node("丙", json!([reply(&next), text("再转")]))) }
+        }).await;
+        assert_eq!(asked.len(), QUOTE_FETCHES);
+        assert!(images.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recent_quote_chains_resolve_from_the_cache_with_the_first_sender() {
+        let (raw_tx, raw_rx) = mpsc::channel(8);
+        let (inbound_tx, mut inbound) = mpsc::channel(8);
+        // Holding the receiver without answering: a fetch would time out and fail the assertions.
+        let (tx, _requests) = mpsc::channel(8);
+        let s = Arc::new(shared(99));
+        tokio::spawn(enrich(raw_rx, QqHandle { tx, shared: s.clone() }, inbound_tx));
+        for (id, name, message) in [
+            (1, "甲", json!([image("a.jpg")])),
+            (2, "乙", json!([reply("1"), text("这是啥")])),
+            (3, "丙", json!([reply("2"), text("我也想问")])),
+            (4, "丁", json!([reply("3"), text("加一")])),
+        ] {
+            let mut event = group(message);
+            event["message_id"] = json!(id);
+            event["sender"]["nickname"] = json!(name);
+            raw_tx.send(super::parse_event(&event, &s).unwrap()).await.unwrap();
+        }
+        let mut last = None;
+        for _ in 0..4 { last = inbound.recv().await; }
+        let last = last.unwrap();
+        assert_eq!(last.attachments.len(), 1);
+        assert_eq!(last.attachments[0].file_id.as_deref(), Some("a.jpg"));
+        assert_eq!(last.attachments[0].quoted_from.as_deref(), Some("甲"));
     }
 
     #[test]

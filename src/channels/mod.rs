@@ -83,11 +83,13 @@ impl std::fmt::Display for TooLarge {
 
 impl std::error::Error for TooLarge {}
 
+/// QQ CDN downloads connect directly: without `no_proxy` reqwest would use HTTP(S)_PROXY or the system proxy.
 static MEDIA_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(3))
+        .no_proxy()
         .build()
         .unwrap_or_default()
 });
