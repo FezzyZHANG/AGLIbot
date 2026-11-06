@@ -14,7 +14,7 @@
 //! |---|---|
 //! | text | as is |
 //! | at | `@名字 `; @him sets `mentions_me` instead; `all` is `@全体成员 ` |
-//! | reply | `[回复 名字: 前40字…]`, else `[回复]`; replies to him set `mentions_me`; hidden in forwards |
+//! | reply | `[回复 名字: 前40字…]`, else `[回复]`; replies to him set `mentions_me`; hidden in forwards; quoted images become attachments |
 //! | face | `[表情:微笑]` from `raw.faceText`, else `[表情]` |
 //! | mface | `[表情:summary]` (market sticker) |
 //! | image | `[图片]`; stickers (`sub_type` 1) `[动画表情]` |
@@ -99,6 +99,7 @@ struct Shared {
 struct Quoted {
     name: String,
     text: String,
+    images: Vec<Attachment>,
 }
 
 impl Shared {
@@ -175,17 +176,20 @@ async fn enrich(mut raw: mpsc::Receiver<Pending>, qq: QqHandle, inbound: mpsc::S
         } else {
             Forwards::new()
         };
-        let reply = resolve_reply(&p.message, &qq.shared, |id| {
+        let (reply, quoted_images) = resolve_reply(&p.message, &qq.shared, |id| {
             let qq = qq.clone();
             async move { qq.get_message(&id).await }
         })
         .await;
-        if let Some(env) = finish(p, &forwards, &qq.shared, &reply) {
+        if let Some(mut env) = finish(p, &forwards, &qq.shared, &reply) {
             if let Some(id) = &env.message_id {
                 // Cache the body only, so quoting a reply does not nest prefixes.
                 let body = env.text.strip_prefix(reply.as_str()).unwrap_or(&env.text).trim().to_string();
-                qq.shared.cache(id.clone(), Quoted { name: env.sender_name.clone(), text: body });
+                // Likewise its own images only, so quoting a quote does not reach further back.
+                let images = env.attachments.iter().filter(|a| is_image(a)).cloned().collect();
+                qq.shared.cache(id.clone(), Quoted { name: env.sender_name.clone(), text: body, images });
             }
+            env.attachments.extend(quoted_images);
             if inbound.send(env).await.is_err() {
                 return;
             }
@@ -262,7 +266,7 @@ impl QqHandle {
     fn cache_sent(&self, data: &Value, text: &str) {
         if let Some(mid) = data.get("message_id") {
             self.shared.remember(id_string(mid));
-            self.shared.cache(id_string(mid), Quoted { name: "我".into(), text: text.to_string() });
+            self.shared.cache(id_string(mid), Quoted { name: "我".into(), text: text.to_string(), images: Vec::new() });
         }
     }
 
@@ -551,8 +555,13 @@ fn attachments(message: &[Value]) -> Vec<Attachment> {
             file_id,
             name: field("name").or_else(|| (seg["type"] == "file").then(|| field("file")).flatten()),
             size: field("file_size").and_then(|s| s.parse().ok()),
+            quoted_from: None,
         })
     }).collect()
+}
+
+fn is_image(attachment: &Attachment) -> bool {
+    matches!(attachment.kind, AttachmentKind::Image | AttachmentKind::Sticker)
 }
 
 /// Render the text; `None` when nothing readable is left.
@@ -581,16 +590,17 @@ fn reply_segment(message: &[Value]) -> Option<&Value> {
     message.iter().find(|s| s.get("type").and_then(Value::as_str) == Some("reply"))
 }
 
-async fn resolve_reply<F, Fut>(message: &[Value], shared: &Shared, mut fetch: F) -> String
+/// The quote's text prefix, and the images in the quoted message.
+async fn resolve_reply<F, Fut>(message: &[Value], shared: &Shared, mut fetch: F) -> (String, Vec<Attachment>)
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<Value>>,
 {
     let Some(seg) = reply_segment(message) else {
-        return String::new();
+        return (String::new(), Vec::new());
     };
     let Some(id) = seg.pointer("/data/id").filter(|id| !id.is_null()).map(id_string).filter(|id| !id.is_empty()) else {
-        return "[回复]".into();
+        return ("[回复]".into(), Vec::new());
     };
     let quoted = match shared.cached(&id) {
         Some(message) => Some(message),
@@ -603,7 +613,9 @@ where
                 } else {
                     node_name(&data)
                 };
-                let message = Quoted { name, text: r.segments(&node_segments(&data), FORWARD_DEPTH, None).trim().to_string() };
+                let segments = node_segments(&data);
+                let images = attachments(&segments).into_iter().filter(is_image).collect();
+                let message = Quoted { name, text: r.segments(&segments, FORWARD_DEPTH, None).trim().to_string(), images };
                 shared.cache(id, message.clone());
                 Some(message)
             }
@@ -615,8 +627,12 @@ where
         },
     };
     match quoted {
-        Some(q) => format!("[回复 {}: {}]", q.name, cut(&q.text.replace("\r\n", " ").replace(['\r', '\n'], " "), 40)),
-        None => "[回复]".into(),
+        Some(q) => {
+            let from = Some(q.name.clone()).filter(|name| !name.is_empty());
+            let images = q.images.iter().map(|a| Attachment { quoted_from: from.clone(), ..a.clone() }).collect();
+            (format!("[回复 {}: {}]", q.name, cut(&q.text.replace("\r\n", " ").replace(['\r', '\n'], " "), 40)), images)
+        }
+        None => ("[回复]".into(), Vec::new()),
     }
 }
 
@@ -862,7 +878,7 @@ mod tests {
             assert_eq!(env.is_group, kind == "group_recall");
             // Parsing can precede enrichment of the message being recalled.
             let pending = super::parse_event(&v, &s).unwrap();
-            s.cache("7".into(), Quoted { name:"member".into(), text:"字".repeat(41) });
+            s.cache("7".into(), Quoted { name:"member".into(), text:"字".repeat(41), images: Vec::new() });
             let env = finish(pending, &Forwards::new(), &s, "").unwrap();
             assert_eq!(env.text, format!("[撤回了一条消息: {}…]", "字".repeat(40)));
             assert!(s.cached("7").is_none());
@@ -1013,7 +1029,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarded_and_quoted_media_do_not_become_attachments() {
+    async fn quoted_images_come_along_but_forwards_and_other_quoted_media_do_not() {
         let s = shared(99);
         let media = json!([{"type": "image", "data": {"file": "nested.jpg", "url": "https://example.test/nested"}}]);
         let msg = json!([
@@ -1021,7 +1037,14 @@ mod tests {
             {"type": "forward", "data": {"content": [node("inline", media.clone())]}},
             {"type": "forward", "data": {"id": "fetched"}}
         ]);
-        let prefix = resolve_reply(msg.as_array().unwrap(), &s, |_| async { Ok(node("quoted", media.clone())) }).await;
+        let fetched = json!([media[0], {"type": "record", "data": {"file": "quoted.amr"}}]);
+        let (prefix, images) = resolve_reply(msg.as_array().unwrap(), &s, |_| async { Ok(node("quoted", fetched.clone())) }).await;
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].file_id.as_deref(), Some("nested.jpg"));
+        assert_eq!(images[0].quoted_from.as_deref(), Some("quoted"));
+        // The cached copy answers the next quote without another fetch.
+        let (_, images) = resolve_reply(msg.as_array().unwrap(), &s, |_| async { panic!("cache hit must not fetch") }).await;
+        assert_eq!(images.len(), 1);
         let forwards = Forwards::from([("fetched".into(), Some(vec![node("fetched", media)]))]);
         let env = finish(super::parse_event(&group(msg.clone()), &s).unwrap(), &forwards, &s, &prefix).unwrap();
         assert!(env.attachments.is_empty());
@@ -1190,9 +1213,9 @@ mod tests {
     async fn reply_uses_cache_and_preserves_own_mention() {
         let s = shared(99);
         s.remember("555".into());
-        s.cache("555".into(), Quoted { name: "我".into(), text: "你好\r\n世界".into() });
+        s.cache("555".into(), Quoted { name: "我".into(), text: "你好\r\n世界".into(), images: Vec::new() });
         let msg = json!([reply("555"), text("对")]);
-        let prefix = resolve_reply(msg.as_array().unwrap(), &s, |_| async { panic!("cache hit must not fetch") }).await;
+        let (prefix, _) = resolve_reply(msg.as_array().unwrap(), &s, |_| async { panic!("cache hit must not fetch") }).await;
         let env = finish(super::parse_event(&group(msg), &s).unwrap(), &Forwards::new(), &s, &prefix).unwrap();
         assert_eq!(env.text, "[回复 我: 你好 世界]对");
         assert!(env.mentions_me);
@@ -1203,7 +1226,7 @@ mod tests {
         let s = shared(99);
         for n in [39, 40, 41] {
             let msg = json!([reply(&n.to_string())]);
-            let prefix = resolve_reply(msg.as_array().unwrap(), &s, |id| async move {
+            let (prefix, _) = resolve_reply(msg.as_array().unwrap(), &s, |id| async move {
                 assert_eq!(id, n.to_string());
                 Ok(node("甲", json!([text(&"字".repeat(n))])))
             })
@@ -1220,7 +1243,7 @@ mod tests {
         let s = shared(99);
         for data in [None, Some(Value::Null), Some(json!({}))] {
             let msg = json!([reply("123"), text("原文")]);
-            let prefix = resolve_reply(msg.as_array().unwrap(), &s, |_| {
+            let (prefix, _) = resolve_reply(msg.as_array().unwrap(), &s, |_| {
                 let data = data.clone();
                 async move { data.ok_or_else(|| anyhow!("boom")) }
             })
@@ -1229,7 +1252,7 @@ mod tests {
             assert_eq!(env.text, "[回复]原文");
         }
         let msg = json!([reply("123")]);
-        let prefix = resolve_reply(msg.as_array().unwrap(), &s, |_| async { Err(anyhow!("missing")) }).await;
+        let (prefix, _) = resolve_reply(msg.as_array().unwrap(), &s, |_| async { Err(anyhow!("missing")) }).await;
         assert_eq!(finish(super::parse_event(&group(msg), &s).unwrap(), &Forwards::new(), &s, &prefix).unwrap().text, "[回复]");
     }
 
@@ -1237,7 +1260,7 @@ mod tests {
     async fn quoted_forwards_show_only_headers() {
         let s = shared(99);
         let msg = json!([reply("123")]);
-        let prefix = resolve_reply(msg.as_array().unwrap(), &s, |_| async {
+        let (prefix, _) = resolve_reply(msg.as_array().unwrap(), &s, |_| async {
             Ok(node(
                 "甲",
                 json!([
@@ -1255,12 +1278,12 @@ mod tests {
     fn recent_messages_evict_least_recently_used_and_replace() {
         let s = shared(99);
         for i in 0..RECENT_MESSAGES {
-            s.cache(i.to_string(), Quoted { name: "我".into(), text: i.to_string() });
+            s.cache(i.to_string(), Quoted { name: "我".into(), text: i.to_string(), images: Vec::new() });
         }
         assert_eq!(s.cached("0").unwrap().text, "0");
-        s.cache("500".into(), Quoted { name: "我".into(), text: "new".into() });
+        s.cache("500".into(), Quoted { name: "我".into(), text: "new".into(), images: Vec::new() });
         assert!(s.cached("1").is_none());
-        s.cache("0".into(), Quoted { name: "我".into(), text: "updated".into() });
+        s.cache("0".into(), Quoted { name: "我".into(), text: "updated".into(), images: Vec::new() });
         assert_eq!(s.cached("0").unwrap().text, "updated");
         assert_eq!(s.recent.lock().unwrap().len(), RECENT_MESSAGES);
     }

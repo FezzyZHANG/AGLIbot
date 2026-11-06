@@ -3965,6 +3965,7 @@ mod tests {
         env.attachments = vec![crate::channels::Attachment {
             kind: crate::channels::AttachmentKind::Image,
             url: None, file_id: None, name: None, size: None,
+            quoted_from: None,
         }];
         env
     }

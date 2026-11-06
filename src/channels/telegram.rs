@@ -148,6 +148,7 @@ fn media(msg: &Value) -> Option<(&'static str, Option<Attachment>)> {
         file_id: Some(file.get("file_id")?.as_str()?.to_string()),
         name: None,
         size: file.get("file_size").and_then(Value::as_u64),
+        quoted_from: None,
     });
     if let Some(sizes) = msg.get("photo").and_then(Value::as_array) {
         // Sizes run smallest to largest; one photo, not several images.
@@ -172,9 +173,13 @@ fn parse_message(msg: &Value, me_id: i64, me_username: &str) -> Option<Envelope>
     let chat = msg.get("chat")?;
     let chat_type = chat.get("type")?.as_str()?;
     let replied_to_me = me_id != 0 && msg.pointer("/reply_to_message/from/id").and_then(Value::as_i64) == Some(me_id);
+    let quoted = msg.get("reply_to_message").and_then(|replied| Some(Attachment {
+        quoted_from: replied.pointer("/from/first_name").and_then(Value::as_str).map(String::from),
+        ..media(replied)?.1?
+    }));
     let mentioned = !me_username.is_empty() && text.contains(&format!("@{me_username}"));
     Some(Envelope {
-        notice: false, attachments: attachment.into_iter().collect(),
+        notice: false, attachments: attachment.into_iter().chain(quoted).collect(),
         arrived: Some(tokio::time::Instant::now()),
         platform: "telegram",
         chat_id: chat.get("id")?.as_i64()?.to_string(),
@@ -262,6 +267,20 @@ mod tests {
         let text = "汉".repeat(7);
         assert_eq!(chunks(&text, 3), ["汉汉汉", "汉汉汉", "汉"]);
         assert!(chunks("", 3).is_empty());
+    }
+
+    #[test]
+    fn a_replied_to_photo_comes_along_with_its_sender() {
+        let msg = json!({
+            "message_id": 2, "text": "这是啥", "from": {"id": 1, "first_name": "乙"}, "chat": {"id": 5, "type": "group"},
+            "reply_to_message": {"message_id": 1, "from": {"id": 3, "first_name": "甲"},
+                "photo": [{"file_id": "small"}, {"file_id": "large"}]},
+        });
+        let env = parse_message(&msg, 9, "bot").unwrap();
+        assert_eq!(env.text, "这是啥");
+        assert_eq!(env.attachments.len(), 1);
+        assert_eq!(env.attachments[0].file_id.as_deref(), Some("large"));
+        assert_eq!(env.attachments[0].quoted_from.as_deref(), Some("甲"));
     }
 
     #[tokio::test]

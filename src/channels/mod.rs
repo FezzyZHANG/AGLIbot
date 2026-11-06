@@ -58,6 +58,8 @@ pub struct Attachment {
     pub file_id: Option<String>,
     pub name: Option<String>,
     pub size: Option<u64>,
+    /// Who sent the message this was quoted from; `None` when it is in the message itself.
+    pub quoted_from: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,7 +133,7 @@ pub struct Envelope {
     /// Someone @-ed him or replied to one of his messages.
     pub mentions_me: bool,
     pub text: String,
-    /// Top-level media references; empty when the channel supplies none.
+    /// Top-level media references plus images in a quoted message; empty when the channel supplies none.
     pub attachments: Vec<Attachment>,
     /// When the channel received it. Messages can wait in the event queue while a reply is
     /// generated; the debounce window measures gaps from arrival, not from dequeueing.

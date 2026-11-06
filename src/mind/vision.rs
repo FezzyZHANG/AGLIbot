@@ -64,12 +64,17 @@ impl Failure {
     }
 }
 
-/// Keep image and sticker references, newest last, dropping the oldest past the limit.
+/// Keep image and sticker references, newest last, dropping the oldest past the limit. Quoting an
+/// image that is still waiting does not add it twice.
 pub fn remember(pending: &mut Vec<PendingMedia>, platform: &'static str, sender: &str, attachments: &[Attachment], now: Instant) {
     pending.retain(|m| now.duration_since(m.at) < PENDING_TTL);
-    pending.extend(attachments.iter()
-        .filter(|a| matches!(a.kind, AttachmentKind::Image | AttachmentKind::Sticker))
-        .map(|a| PendingMedia { platform, sender: sender.into(), attachment: a.clone(), at: now }));
+    for a in attachments.iter().filter(|a| matches!(a.kind, AttachmentKind::Image | AttachmentKind::Sticker)) {
+        let same = |m: &PendingMedia| (a.file_id.is_some() && m.attachment.file_id == a.file_id)
+            || (a.url.is_some() && m.attachment.url == a.url);
+        if pending.iter().any(same) { continue; }
+        let sender = a.quoted_from.as_deref().unwrap_or(sender).into();
+        pending.push(PendingMedia { platform, sender, attachment: a.clone(), at: now });
+    }
     let excess = pending.len().saturating_sub(MAX_PENDING);
     pending.drain(..excess);
 }
@@ -302,8 +307,23 @@ mod tests {
         assert_eq!(normalize(&vec![0; MAX_FILE_BYTES + 1], MAX_FRAMES).err(), Some(Failure::TooBig));
     }
 
+    #[test]
+    fn quoted_images_keep_their_sender_and_are_not_added_twice() {
+        let now = Instant::now();
+        let mut pending = Vec::new();
+        let image = attachment(AttachmentKind::Image, Some("https://example.test/a".into()));
+        remember(&mut pending, "qq", "甲", &[image.clone()], now);
+        let again = Attachment { quoted_from: Some("甲".into()), ..image };
+        remember(&mut pending, "qq", "乙", &[again], now);
+        assert_eq!(pending.len(), 1);
+        let other = Attachment { quoted_from: Some("丙".into()), ..attachment(AttachmentKind::Image, Some("https://example.test/b".into())) };
+        remember(&mut pending, "qq", "乙", &[other], now);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[1].sender, "丙");
+    }
+
     fn attachment(kind: AttachmentKind, url: Option<String>) -> Attachment {
-        Attachment { kind, url, file_id: None, name: None, size: None }
+        Attachment { kind, url, file_id: None, name: None, size: None, quoted_from: None }
     }
 
     #[test]
