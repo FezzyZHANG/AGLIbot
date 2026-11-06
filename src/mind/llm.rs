@@ -17,9 +17,18 @@ const MAX_TOKENS: u32 = 16_000;
 #[derive(Debug, Clone)]
 pub enum Turn {
     User(String),
+    /// Text and images from an addressed turn (`mind/vision.rs`). Stays in the session until it rotates.
+    UserParts(Vec<Part>),
     /// `raw` is the provider-native content (Anthropic content blocks, thinking included).
     /// It is replayed unchanged to Anthropic models; other providers get `text`.
     Assistant { text: String, raw: Option<Value> },
+}
+
+#[derive(Debug, Clone)]
+pub enum Part {
+    Text(String),
+    /// Base64-encoded JPEG.
+    Jpeg(String),
 }
 
 pub struct Prompt<'a> {
@@ -65,6 +74,13 @@ pub fn anthropic_body(m: &ModelEntry, p: &Prompt<'_>) -> Value {
         .iter()
         .map(|t| match t {
             Turn::User(text) => json!({"role": "user", "content": text}),
+            Turn::UserParts(parts) => {
+                let content: Vec<Value> = parts.iter().map(|part| match part {
+                    Part::Text(text) => json!({"type": "text", "text": text}),
+                    Part::Jpeg(data) => json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": data}}),
+                }).collect();
+                json!({"role": "user", "content": content})
+            }
             Turn::Assistant { raw: Some(raw), .. } => json!({"role": "assistant", "content": raw}),
             Turn::Assistant { text, raw: None } => json!({"role": "assistant", "content": text}),
         })
@@ -91,6 +107,13 @@ pub fn openai_body(m: &ModelEntry, p: &Prompt<'_>) -> Value {
     let mut messages = vec![json!({"role": "system", "content": system})];
     messages.extend(p.turns.iter().map(|t| match t {
         Turn::User(text) => json!({"role": "user", "content": text}),
+        Turn::UserParts(parts) => {
+            let content: Vec<Value> = parts.iter().map(|part| match part {
+                Part::Text(text) => json!({"type": "text", "text": text}),
+                Part::Jpeg(data) => json!({"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{data}")}}),
+            }).collect();
+            json!({"role": "user", "content": content})
+        }
         Turn::Assistant { text, .. } => json!({"role": "assistant", "content": text}),
     }));
     let mut body = json!({"model": m.model, "messages": messages, "stream": m.stream});
@@ -224,7 +247,11 @@ fn request_shape(body: &Value) -> String {
     let messages = body["messages"].as_array().map(Vec::as_slice).unwrap_or_default();
     let parts: Vec<String> = messages.iter().map(|m| {
         let role = m["role"].as_str().unwrap_or("?").chars().next().unwrap_or('?');
-        format!("{role}{}", m["content"].as_str().map_or(0, |c| c.chars().count()))
+        // A multimodal message counts parts rather than measuring its base64.
+        match m["content"].as_array() {
+            Some(parts) => format!("{role}[{}]", parts.len()),
+            None => format!("{role}{}", m["content"].as_str().map_or(0, |c| c.chars().count())),
+        }
     }).collect();
     let shown = parts.iter().rev().take(40).rev().cloned().collect::<Vec<_>>().join(",");
     format!("request messages={} [{}{shown}]", parts.len(), if parts.len() > 40 { "…," } else { "" })
@@ -362,7 +389,22 @@ mod tests {
             fallbacks: fallbacks.map(String::from),
             stream: false,
             enable_thinking: None,
+            vision: false,
         }
+    }
+
+    #[test]
+    fn multimodal_turns_use_each_providers_image_shape() {
+        let turns = [Turn::UserParts(vec![Part::Text("看".into()), Part::Jpeg("QUJD".into())])];
+        let prompt = Prompt { l1: "L1", l2: "", turns: &turns, effort: None };
+        let openai = openai_body(&model(None), &prompt);
+        assert_eq!(openai["messages"][1]["content"][0], json!({"type": "text", "text": "看"}));
+        assert_eq!(openai["messages"][1]["content"][1]["image_url"]["url"], "data:image/jpeg;base64,QUJD");
+        let anthropic = anthropic_body(&model(None), &prompt);
+        assert_eq!(anthropic["messages"][0]["content"][1]["source"],
+            json!({"type": "base64", "media_type": "image/jpeg", "data": "QUJD"}));
+        // Diagnostics never carry or measure the base64.
+        assert!(request_shape(&openai).ends_with("u[2]]"), "{}", request_shape(&openai));
     }
 
     /// Turn n's request must be a byte prefix of turn n+1's: same system, same earlier messages.

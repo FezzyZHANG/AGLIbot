@@ -3,6 +3,7 @@
 #   c: $/M tokens —— input / cached（缓存命中）/ output；cache_write 不填则按 input × 1.25 计
 #   l: 首字延迟粗估（秒）
 #   local: true 表示本地模型，可以处理 processing_policy = local_only 的信息
+#   vision: true 表示已实测能收图；vision 场景（当前是 chat）只会路由到这些模型
 # 价格请对照各家官方价格页核实，下面的 DeepSeek 价格尤其可能过时。
 
 daily_budget_usd: 2.0
@@ -88,11 +89,13 @@ models:
   # Argon 全部变体输入/输出/缓存读取：¥1 / ¥5 / ¥0.05；未提供独立缓存写入价。
   # q/l 均为待实测的路由估计；Argon 各别名暂用相同估计，不推断档位效果。
   # low/medium/high 作为供应商独立 model ID 原样发送，不附加 enable_thinking。
-  # 先使用非流式请求；添加到共享候选池不代表 chat 固定选用 Gemini。
+  # 先使用非流式请求。2026-11-06 五个 Gemini 型号都通过了中转收图实测；
+  # chat 要求 vision，目前只有它们可选。其他提供商未实测，实测后再加 vision: true。
   - id: gemini-3.8-flash
     provider: gemini_relay
     model: gemini-3.8-flash
     stream: false
+    vision: true
     q: 8.3
     c: { input: 0.056391, cached: 0.005639, output: 0.281955, cache_write: 0 }
     l: 1.0
@@ -100,6 +103,7 @@ models:
     provider: gemini_relay
     model: gemini-4-argon
     stream: false
+    vision: true
     q: 9.5
     c: { input: 0.150376, cached: 0.007519, output: 0.751880 }
     l: 3.0
@@ -107,6 +111,7 @@ models:
     provider: gemini_relay
     model: gemini-4-argon-low
     stream: false
+    vision: true
     q: 9.5
     c: { input: 0.150376, cached: 0.007519, output: 0.751880 }
     l: 3.0
@@ -114,6 +119,7 @@ models:
     provider: gemini_relay
     model: gemini-4-argon-medium
     stream: false
+    vision: true
     q: 9.5
     c: { input: 0.150376, cached: 0.007519, output: 0.751880 }
     l: 3.0
@@ -121,6 +127,7 @@ models:
     provider: gemini_relay
     model: gemini-4-argon-high
     stream: false
+    vision: true
     q: 9.5
     c: { input: 0.150376, cached: 0.007519, output: 0.751880 }
     l: 3.0

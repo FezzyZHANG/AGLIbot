@@ -27,6 +27,7 @@
 | `models[].provider` | 字符串 | 必填 | 引用 providers 中的名称，未知名称启动失败 |
 | `models[].model` | 字符串 | 必填 | 发送给 API 的模型名称 |
 | `models[].q` | f64 | 必填 | 主人估计的质量分；按场景 q_min 过滤 |
+| `models[].vision` | bool | false | 已实测能收图；`vision: true` 的场景只路由到这些模型 |
 | `models[].c` | 对象 | 必填 | token 价格表 |
 | `models[].c.input` | f64 | 必填 | 未缓存输入价格；路由成本比较使用 input + output |
 | `models[].c.cached` | f64 | 必填 | 缓存命中输入价格，用于计费记录 |
@@ -73,6 +74,7 @@ embedding:
 | `*.review` | bool | false | 记录设计意图；**不自动接入 judge**，实际审查由调用处显式执行 |
 | `*.budget_exempt` | bool | false | 超预算时仍保留原优先项；当前 verify / act / evolve 为 true |
 | `*.effort` | 可空字符串 | 无 | Anthropic 的 output_config.effort；另外 low 会关闭兼容接口模型显式配置的 thinking |
+| `*.vision` | bool | false | 只路由到 `vision: true` 的模型，固定 `model` 时也检查；当前 `chat` 为 true 并固定到 `gemini-4-argon-medium`，[看图](../src/mind/vision.rs)把图片直接放进被叫到的那一轮 |
 
 当前部分场景省略 q_min 以外的可选字段，按上述默认值处理；effort 的字符串不在配置层校验。依据：[Scenario](../src/config.rs)、[router.rs](../src/mind/router.rs)、[llm.rs](../src/mind/llm.rs)、[judge.rs](../src/mind/judge.rs)。
 
@@ -297,6 +299,7 @@ provider_cache:
 | `BAILIAN_BASE_URL_OAI` | 当前 models.yaml 指定的服务商基址覆盖变量名 |
 | `MONGO_URL`、`MONGO_DATABASE` | 默认 Mongo 变量名；import-jsonl 工具也直接读取这两个固定名称 |
 | `AGLI_DSH_BIN` | DSH 可执行文件覆盖；不设时从 PATH 查找平台对应的 dsh 启动程序 |
+| `GEMINI_RELAY_BASE_URL`、`GEMINI_RELAY_API_KEY` | Gemini 中转的基址和密钥；仓库默认的 `chat` 要求 vision，目前只有这些模型可选，缺少时启动失败 |
 | `AGLI_DSH_BAILIAN_API_KEY` | DSH 专用凭据，经注册表授权后映射为子进程变量 `DSH_BAILIAN_API_KEY` |
 | `AGLI_DSH_DEEPSEEK_API_KEY` | DSH 专用凭据，经注册表授权后映射为子进程变量 `DEEPSEEK_API_KEY` |
 

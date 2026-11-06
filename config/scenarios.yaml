@@ -4,9 +4,10 @@
 #   review: 是否走 judge 综合审查
 #   budget_exempt: 当日预算用尽后仍保持原优先项（否则强制改走 cheap）
 #   effort: 只对 Anthropic 模型生效，覆盖模型默认的 effort
+#   vision: 只路由到 models.yaml 里 vision: true 的模型
 
 triage:        { q_min: 4, priority: cheap,   effort: low }
-chat:          { q_min: 6, priority: fast,    effort: low }
+chat:          { model: gemini-4-argon-medium, q_min: 6, priority: fast, effort: low, vision: true }
 extract:       { q_min: 5, priority: cheap }
 consolidate:   { q_min: 6, priority: cheap }
 research_plan: { q_min: 8, priority: quality }

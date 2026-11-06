@@ -2,6 +2,20 @@
 
 2026-11-02. Research only; development is not authorized. All interfaces, limits and selections below are proposals. External facts use numbered sources; every source was accessed **2026-11-02**. No account probes or recognition benchmarks were run.
 
+## Implementation status
+
+2026-11-06: the owner authorized development; the code is `src/mind/vision.rs`, which supersedes this document where they differ. The owner chose **direct image input to the chat model** over the caption-first path recommended below:
+
+- **Model:** `chat` has `vision: true` and is pinned to `gemini-4-argon-medium`; a pin or route must be marked `vision: true` in `config/models.yaml`. The five Gemini relay models passed an image probe and are the only ones marked, so the repo default now needs the relay to start. Other providers are unmarked because they are untested, not because they are known to lack vision.
+- **Formats:** JPEG, PNG, WebP and GIF are all normalized to JPEG. The relay rejects BMP and GIF outright. Animated GIF and WebP send up to four evenly spaced frames, overriding the rejection of animated input proposed below.
+- **Limits:** 10 MiB per file and 50 megapixels, raised from the 5 MiB and 20 megapixels proposed below so ordinary phone photos fit. Longest edge 2048 pixels (1024 for frames), at most 8 images per turn and 4 waiting per chat for 10 minutes.
+- **When:** only on a turn where he is addressed. Chiming in never inspects an image.
+- **Cost:** images stay in the session and replay on later turns, about 1,091 tokens each, so they benefit from prompt caching only where the relay provides it. A session rotates before passing 16 images.
+- **Failure:** if the model rejects a turn with images, the turn is retried once without them and says they were not seen.
+- **Retention:** locators are dropped after fetching, and pixels live only in the in-memory session. Nothing about an image's content is written to the message store, so a later session sees `[图片]` again. This is the conservative default for the open retention decision.
+
+Relay probes on 2026-11-06 used the 512×512 Lena image and synthetic images, one run per case, so they establish cost and format handling but not accuracy. Fixtures and targets below remain unmeasured (#56).
+
 ## Repository baseline
 
 `src/channels/qq.rs::parse_event` reduces images to `[图片]`, discarding segment data. `telegram.rs::parse_message` requires `text`: photo-only and captioned photo messages are skipped, not replaced with placeholders. `src/mind/llm.rs` has `Turn::User(String)` and sends string content. Existing OpenAI-compatible HTTP transport therefore helps, but cannot currently submit images.

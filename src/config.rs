@@ -55,6 +55,9 @@ pub struct ModelEntry {
     pub stream: bool,
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    /// Confirmed to accept image input.
+    #[serde(default)]
+    pub vision: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -90,6 +93,9 @@ pub struct Scenario {
     pub budget_exempt: bool,
     #[serde(default)]
     pub effort: Option<String>,
+    /// Route only to models with `vision: true`.
+    #[serde(default)]
+    pub vision: bool,
 }
 
 pub type ScenariosCfg = BTreeMap<String, Scenario>;

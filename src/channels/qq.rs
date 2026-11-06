@@ -270,6 +270,13 @@ impl QqHandle {
         tokio::time::timeout(FORWARD_TIMEOUT, self.call("get_msg", json!({ "message_id": id }))).await.map_err(|_| anyhow!("get_msg timed out"))?
     }
 
+    /// A fresh download URL for a received image.
+    pub async fn image_url(&self, file: &str) -> Result<String> {
+        let data = self.call("get_image", json!({ "file": file })).await?;
+        data.get("url").and_then(Value::as_str).filter(|url| !url.is_empty()).map(String::from)
+            .ok_or_else(|| anyhow!("get_image returned no url"))
+    }
+
     /// Groups the bot account is in.
     pub async fn group_ids(&self) -> Result<Vec<i64>> {
         let data = self.call("get_group_list", json!({})).await?;

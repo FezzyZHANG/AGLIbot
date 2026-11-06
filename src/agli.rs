@@ -555,6 +555,8 @@ pub struct Agli {
     evolution_restart: Option<crate::evolution::restart::Restart>,
     /// Group lines he has not yet "read" into his session, per chat key.
     unseen: HashMap<String, Vec<String>>,
+    /// Image references waiting for him to be addressed, per chat key. In memory only.
+    pending_media: HashMap<String, Vec<crate::mind::vision::PendingMedia>>,
     /// Task titles whose markers were dropped (not an owner chat), told to him on the chat's next turn.
     dropped_tasks: HashMap<String, Vec<String>>,
     /// Owner-managed aliases and group slang (#80), re-read from the store on a short TTL.
@@ -603,6 +605,7 @@ impl Agli {
             evolution_job: None,
             evolution_restart: None,
             unseen: HashMap::new(),
+            pending_media: HashMap::new(),
             dropped_tasks: HashMap::new(),
             lexicon: Default::default(),
             speakers: HashMap::new(),
@@ -936,6 +939,12 @@ impl Agli {
             });
         }
 
+        if !env.attachments.is_empty() {
+            let sender = self.speaker_label(env.platform, &who.person_id, &env.sender_name);
+            let waiting = self.pending_media.entry(ctx.key.clone()).or_default();
+            crate::mind::vision::remember(waiting, env.platform, &sender, &env.attachments, tokio::time::Instant::now());
+        }
+
         if who.is_owner && !env.is_group {
             self.store.kv_set("owner_last_chat", json!({"platform": env.platform, "chat_id": env.chat_id}))?;
             self.state.talked_with_owner(now);
@@ -1246,7 +1255,18 @@ impl Agli {
         self.converse_with_claim(ctx, body, current, unsolicited, None).await
     }
 
-    async fn converse_with_claim(&mut self, ctx: &ChatCtx, body: String, current: usize, unsolicited: bool, claim: Option<&str>) -> Result<()> {
+    async fn converse_with_claim(&mut self, ctx: &ChatCtx, mut body: String, current: usize, unsolicited: bool, claim: Option<&str>) -> Result<()> {
+        // Addressed turns only: chiming in never spends a look, and the images keep waiting.
+        let look = match self.pending_media.remove(&ctx.key) {
+            Some(pending) if !unsolicited => crate::mind::vision::look(&self.outlets, pending).await,
+            Some(pending) => {
+                self.pending_media.insert(ctx.key.clone(), pending);
+                Default::default()
+            }
+            None => Default::default(),
+        };
+        let without_parts = format!("{body}{}", look.note_without_parts);
+        body.push_str(&look.note);
         let now = Utc::now();
         let busy = if ctx.flow_ns.is_some() && ctx.flow_ns == self.flow.focus { None } else { self.flow.title.clone() };
         let mut notes: Vec<String> = self.dropped_tasks.remove(&ctx.key).unwrap_or_default().iter()
@@ -1254,7 +1274,8 @@ impl Agli {
             .collect();
         // Slang goes in the tail, never L1/L2, so the cached prefix is unchanged.
         notes.extend(self.slang_note(ctx, &body, now));
-        let text = user_turn(&tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref(), &notes), &body);
+        let turn_tail = tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref(), &notes);
+        let text = user_turn(&turn_tail, &body);
         // Recall runs on every turn (cheap at this volume) so the policy is known before routing.
         let tasks = ctx.task_cards(&self.board());
         let embedded = match self.models.embed(&ProcessingPolicy::default_for(&ctx.scope), &body).await {
@@ -1269,6 +1290,7 @@ impl Agli {
         #[cfg(test)]
         let response = if let Some(test) = &mut self.test_chat {
             test.turns.push((ctx.key.clone(), text.clone(), l2.clone()));
+            test.images.push(look.parts.iter().filter(|p| matches!(p, crate::mind::llm::Part::Jpeg(_))).count());
             Some(test.replies.pop_front().expect("unexpected model call"))
         } else {
             None
@@ -1277,7 +1299,18 @@ impl Agli {
         let response: Option<Result<String>> = None;
         let response = match response {
             Some(r) => r,
-            None => self.speaker.say(&self.models, &ctx.key, &policy, now, text, || Ok(l2)).await,
+            None => {
+                let had_images = !look.parts.is_empty();
+                let first = self.speaker.say(&self.models, &ctx.key, &policy, now, text, look.parts, || Ok(l2.clone())).await;
+                match first {
+                    Err(e) if had_images => {
+                        warn!("reply with images failed, retrying without them: {e:#}");
+                        let text = user_turn(&turn_tail, &without_parts);
+                        self.speaker.say(&self.models, &ctx.key, &policy, now, text, Vec::new(), || Ok(l2)).await
+                    }
+                    other => other,
+                }
+            }
         };
         let raw = match response {
             Ok(r) => r,
@@ -2571,6 +2604,7 @@ mod tests {
     pub(super) struct TestChat {
         pub(super) replies: VecDeque<Result<String>>,
         pub(super) turns: Vec<(String, String, String)>,
+        pub(super) images: Vec<usize>,
         pub(super) sends: Mutex<VecDeque<Outcome>>,
         pub(super) rewrites: Mutex<VecDeque<Result<String>>>,
         pub(super) rewrite_prompts: Mutex<Vec<(ProcessingPolicy, String)>>,
@@ -2581,7 +2615,7 @@ mod tests {
     impl TestChat {
         fn new(replies: &[&str], sends: &[Outcome]) -> Self {
             Self {
-                replies: replies.iter().map(|s| Ok((*s).into())).collect(), turns: Vec::new(),
+                replies: replies.iter().map(|s| Ok((*s).into())).collect(), turns: Vec::new(), images: Vec::new(),
                 sends: Mutex::new(sends.iter().copied().collect()),
                 rewrites: Mutex::new(VecDeque::new()), rewrite_prompts: Mutex::new(Vec::new()),
                 sent_texts: Mutex::new(Vec::new()), reply_targets: Mutex::new(Vec::new()),
@@ -2622,6 +2656,8 @@ mod tests {
             m.provider = "test".into();
             m.local = false;
             m.q = 100.0;
+            m.vision = true;
+            cfg.scenarios.get_mut("chat").unwrap().model = None;
             let store = Arc::new(crate::store::jsonl::JsonlStore::open(&cfg.data_dir()).unwrap());
             let models = Arc::new(Models::new(&cfg, store.clone()).await.unwrap());
             let (tx, _) = mpsc::channel(16);
@@ -3923,6 +3959,54 @@ mod tests {
             env.mentions_me = mention_first && i == 0;
             env
         }).collect()
+    }
+
+    fn with_image(mut env: Envelope) -> Envelope {
+        env.attachments = vec![crate::channels::Attachment {
+            kind: crate::channels::AttachmentKind::Image,
+            url: None, file_id: None, name: None, size: None,
+        }];
+        env
+    }
+
+    #[tokio::test]
+    async fn images_wait_until_he_is_addressed_and_unseen_ones_are_stated() {
+        let mut t = TestAgli::new("group-images").await;
+        let a = &mut t.agli;
+        a.test_chat = Some(TestChat::new(&["这图我没看到"], &[Outcome::Sent]));
+        let messages = vec![with_image(group_messages(&["[图片]"], false).remove(0))];
+        a.on_messages(messages).await.unwrap();
+        assert!(a.test_chat.as_ref().unwrap().turns.is_empty());
+        assert_eq!(a.pending_media["telegram:-7"].len(), 1);
+
+        a.on_messages(group_messages(&["你看这图"], true)).await.unwrap();
+        let turns = &a.test_chat.as_ref().unwrap().turns;
+        assert_eq!(turns.len(), 1);
+        // This image has no retrievable reference: he is told rather than left to guess.
+        assert!(turns[0].1.contains("这些图片你没看到") && turns[0].1.contains("下载失败"), "{}", turns[0].1);
+        assert_eq!(a.test_chat.as_ref().unwrap().images, [0]);
+        assert!(!a.pending_media.contains_key("telegram:-7"));
+        // The note lives in the turn only; stored messages keep the placeholder.
+        let stored = a.store.recent_in_ns(&Namespace::Group("telegram:-7".into()), 10).unwrap();
+        assert!(stored.iter().all(|m| !m.text.contains("这些图片你没看到")));
+    }
+
+    #[tokio::test]
+    async fn chiming_in_does_not_spend_a_look() {
+        let mut t = TestAgli::new("chime-images").await;
+        let a = &mut t.agli;
+        a.test_chat = Some(TestChat::new(&["插一句"], &[Outcome::Sent]));
+        let messages = vec![with_image(group_messages(&["[图片]"], false).remove(0))];
+        a.on_messages(messages).await.unwrap();
+        let ctx = ChatCtx {
+            key: "telegram:-7".into(), platform: "telegram", chat_id: "-7".into(), message_id: None,
+            ns: Namespace::Group("telegram:-7".into()), scope: Scope::Group { id: "telegram:-7".into() }, flow_ns: None,
+            audience: Audience::group("telegram:-7", std::iter::empty::<String>()), is_group: true, partner: None,
+        };
+        a.converse_group(&ctx, true).await.unwrap();
+        let turn = &a.test_chat.as_ref().unwrap().turns[0].1;
+        assert!(turn.contains("[图片]") && !turn.contains("这些图片你没看到"), "{turn}");
+        assert_eq!(a.pending_media["telegram:-7"].len(), 1);
     }
 
     #[tokio::test]

@@ -55,7 +55,7 @@ impl Router {
     /// Allowed models for the scenario with dominated ones removed.
     fn front(&self, sc: &Scenario, policy: &ProcessingPolicy) -> Vec<&ModelEntry> {
         let cands: Vec<&ModelEntry> =
-            self.models.iter().filter(|m| m.q >= sc.q_min && policy.allows(m)).collect();
+            self.models.iter().filter(|m| m.q >= sc.q_min && policy.allows(m) && (m.vision || !sc.vision)).collect();
         cands.iter().copied().filter(|b| !cands.iter().any(|a| dominates(a, b))).collect()
     }
 
@@ -67,6 +67,7 @@ impl Router {
             let model = self.model(id).ok_or_else(|| anyhow!("pinned model `{id}` is not available for scenario `{scenario}`"))?;
             anyhow::ensure!(policy.allows(model), "pinned model `{id}` is not allowed by {policy:?}");
             anyhow::ensure!(model.q >= sc.q_min, "pinned model `{id}` does not meet scenario `{scenario}` Q floor {}", sc.q_min);
+            anyhow::ensure!(model.vision || !sc.vision, "pinned model `{id}` lacks the vision scenario `{scenario}` requires");
             return Ok(model);
         }
         let front = self.front(sc, policy);
@@ -148,11 +149,12 @@ mod tests {
             fallbacks: None,
             stream: false,
             enable_thinking: None,
+            vision: false,
         }
     }
 
     fn scenario(q_min: f64, priority: Priority, budget_exempt: bool) -> Scenario {
-        Scenario { model: None, q_min, priority, review: false, budget_exempt, effort: None }
+        Scenario { model: None, q_min, priority, review: false, budget_exempt, effort: None, vision: false }
     }
 
     /// The 4-row sample table from docs/DESIGN.md 5b, plus one deliberately dominated row.
@@ -172,6 +174,27 @@ mod tests {
             ("research".to_string(), scenario(7.0, Priority::Quality, false)),
         ]);
         Router::new(models, scenarios)
+    }
+
+    #[test]
+    fn vision_scenarios_only_route_to_vision_models() {
+        let mut r = router();
+        let any = ProcessingPolicy::Any;
+        r.models.iter_mut().find(|m| m.id == "mid").unwrap().vision = true;
+        r.models.iter_mut().find(|m| m.id == "top").unwrap().vision = true;
+        r.scenarios.get_mut("chat").unwrap().vision = true;
+        assert_eq!(r.select("chat", &any, false).unwrap().id, "mid");
+        // Budget pressure and escalation stay inside the vision models.
+        assert_eq!(r.select("chat", &any, true).unwrap().id, "mid");
+        assert_eq!(r.next_stronger("chat", &any, "mid").unwrap().id, "top");
+        assert!(r.select("chat", &ProcessingPolicy::LocalOnly, false).is_err());
+        // Other scenarios still see the whole table.
+        assert_eq!(r.select("extract", &any, false).unwrap().id, "local");
+
+        r.scenarios.get_mut("chat").unwrap().model = Some("cheap".into());
+        assert!(r.select("chat", &any, false).is_err());
+        r.scenarios.get_mut("chat").unwrap().model = Some("top".into());
+        assert_eq!(r.select("chat", &any, false).unwrap().id, "top");
     }
 
     #[test]
@@ -280,19 +303,24 @@ mod tests {
     }
 
     #[test]
-    fn bailian_alone_covers_repo_scenarios() {
+    fn bailian_alone_covers_repo_scenarios_except_chat() {
         let cfg = crate::config::Config::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
         let full = Router::new(cfg.models.models.clone(), cfg.scenarios.clone());
         let models = cfg.models.models.into_iter().filter(|m| m.provider == "bailian").collect();
         let r = Router::new(models, cfg.scenarios);
         // `evolve` is owner-triggered and falls back to owner review, so it may need a non-bailian model.
         assert!(full.select("evolve", &ProcessingPolicy::Any, false).is_ok());
-        for name in r.scenarios.keys().filter(|n| *n != "evolve") {
+        for name in r.scenarios.keys().filter(|n| *n != "evolve" && *n != "chat") {
             for exhausted in [false, true] {
                 assert_eq!(r.select(name, &ProcessingPolicy::Any, exhausted).unwrap().provider, "bailian");
             }
         }
-        assert_eq!(r.select("chat", &ProcessingPolicy::Any, false).unwrap().id, "qwen-flash");
-        assert!(r.select("chat", &ProcessingPolicy::LocalOnly, false).is_err());
+        // Chat needs vision, and only the Gemini models are confirmed to have it.
+        assert!(r.select("chat", &ProcessingPolicy::Any, false).is_err());
+        // The pin means no budget fallback or escalation for chat.
+        assert_eq!(full.select("chat", &ProcessingPolicy::Any, false).unwrap().id, "gemini-4-argon-medium");
+        assert!(full.select("chat", &ProcessingPolicy::Any, true).is_err());
+        assert!(full.next_stronger("chat", &ProcessingPolicy::Any, "gemini-4-argon-medium").is_none());
+        assert!(full.select("chat", &ProcessingPolicy::LocalOnly, false).is_err());
     }
 }

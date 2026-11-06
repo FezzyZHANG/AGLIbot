@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::Envelope;
+use super::{Attachment, AttachmentKind, Envelope};
 use crate::config::TelegramCfg;
 
 /// Telegram's limit is 4096 UTF-16 units; stay well under it in chars.
@@ -95,6 +95,18 @@ impl Telegram {
         Ok(out)
     }
 
+    /// Download a file by id. The token is in every URL here, so errors drop the URL.
+    pub async fn fetch_file(&self, file_id: &str, max: usize) -> Result<Vec<u8>> {
+        let v: Value = self.http.get(format!("{}/getFile", self.base)).query(&[("file_id", file_id)])
+            .send().await.map_err(reqwest::Error::without_url)?
+            .json().await.map_err(reqwest::Error::without_url)?;
+        let Some(path) = v.pointer("/result/file_path").and_then(Value::as_str) else { bail!("getFile returned no path") };
+        let url = format!("{}/{path}", self.base.replacen("/bot", "/file/bot", 1));
+        let response = self.http.get(url).send().await.map_err(reqwest::Error::without_url)?
+            .error_for_status().map_err(reqwest::Error::without_url)?;
+        super::read_capped(response, max).await
+    }
+
     pub async fn send(&self, chat_id: &str, text: &str) -> Result<()> {
         for chunk in chunks(text, CHUNK_CHARS) {
             let v: Value = self
@@ -123,15 +135,42 @@ fn http_client(cfg: &TelegramCfg) -> Result<reqwest::Client> {
     builder.build().context("building Telegram HTTP client")
 }
 
+/// A photo or sticker as its placeholder and reference. Animated and video stickers keep only the
+/// placeholder: nothing here decodes TGS or WebM.
+fn media(msg: &Value) -> Option<(&'static str, Option<Attachment>)> {
+    let attachment = |kind, file: &Value| Some(Attachment {
+        kind,
+        url: None,
+        file_id: Some(file.get("file_id")?.as_str()?.to_string()),
+        name: None,
+        size: file.get("file_size").and_then(Value::as_u64),
+    });
+    if let Some(sizes) = msg.get("photo").and_then(Value::as_array) {
+        // Sizes run smallest to largest; one photo, not several images.
+        return Some(("[图片]", attachment(AttachmentKind::Image, sizes.last()?)));
+    }
+    let sticker = msg.get("sticker")?;
+    let moving = sticker.get("is_animated").and_then(Value::as_bool).unwrap_or(false)
+        || sticker.get("is_video").and_then(Value::as_bool).unwrap_or(false);
+    Some(("[动画表情]", if moving { None } else { attachment(AttachmentKind::Sticker, sticker) }))
+}
+
 fn parse_message(msg: &Value, me_id: i64, me_username: &str) -> Option<Envelope> {
-    let text = msg.get("text")?.as_str()?.to_string();
+    let (placeholder, attachment) = media(msg).map_or((None, None), |(p, a)| (Some(p), a));
+    let written = msg.get("text").or_else(|| msg.get("caption")).and_then(Value::as_str);
+    let text = match (placeholder, written) {
+        (Some(placeholder), Some(written)) => format!("{placeholder} {written}"),
+        (Some(placeholder), None) => placeholder.to_string(),
+        (None, Some(written)) => written.to_string(),
+        (None, None) => return None,
+    };
     let from = msg.get("from")?;
     let chat = msg.get("chat")?;
     let chat_type = chat.get("type")?.as_str()?;
     let replied_to_me = me_id != 0 && msg.pointer("/reply_to_message/from/id").and_then(Value::as_i64) == Some(me_id);
     let mentioned = !me_username.is_empty() && text.contains(&format!("@{me_username}"));
     Some(Envelope {
-        notice: false, attachments: Vec::new(),
+        notice: false, attachments: attachment.into_iter().collect(),
         arrived: Some(tokio::time::Instant::now()),
         platform: "telegram",
         chat_id: chat.get("id")?.as_i64()?.to_string(),
@@ -181,6 +220,37 @@ mod tests {
         assert!(!group(json!({})).mentions_me);
         assert!(group(json!({"text": "@aglibot 你怎么看"})).mentions_me);
         assert!(group(json!({"reply_to_message": {"from": {"id": 7}}})).mentions_me);
+    }
+
+    #[test]
+    fn photos_and_stickers_carry_references_and_placeholders() {
+        let base = |extra: Value| {
+            let mut m = json!({"message_id": 3, "from": {"id": 5, "first_name": "A"}, "chat": {"id": 5, "type": "private"}});
+            for (k, v) in extra.as_object().unwrap() {
+                m[k] = v.clone();
+            }
+            parse_message(&m, 7, "aglibot")
+        };
+        let photo = base(json!({"caption": "/看 @aglibot", "photo": [
+            {"file_id": "small", "file_size": 10}, {"file_id": "large", "file_size": 2000},
+        ]})).unwrap();
+        // A caption can never pass for a command: the placeholder comes first.
+        assert_eq!(photo.text, "[图片] /看 @aglibot");
+        assert!(photo.mentions_me);
+        assert_eq!(photo.attachments.len(), 1);
+        assert_eq!(photo.attachments[0].file_id.as_deref(), Some("large"));
+        assert_eq!(photo.attachments[0].size, Some(2000));
+        assert!(matches!(photo.attachments[0].kind, AttachmentKind::Image));
+
+        let sticker = base(json!({"sticker": {"file_id": "s", "is_animated": false, "is_video": false}})).unwrap();
+        assert_eq!(sticker.text, "[动画表情]");
+        assert!(matches!(sticker.attachments[0].kind, AttachmentKind::Sticker));
+        for flag in ["is_animated", "is_video"] {
+            let moving = base(json!({"sticker": {"file_id": "s", flag: true}})).unwrap();
+            assert_eq!(moving.text, "[动画表情]");
+            assert!(moving.attachments.is_empty());
+        }
+        assert!(base(json!({"voice": {"file_id": "v"}})).is_none());
     }
 
     #[test]

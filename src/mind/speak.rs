@@ -11,12 +11,18 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use tracing::info;
 
-use super::llm::{Prompt, Turn};
+use super::llm::{Part, Prompt, Turn};
 use super::models::Models;
 use crate::config::SessionCfg;
 use crate::ns::ProcessingPolicy;
 
 const SCENARIO: &str = "chat";
+/// Past this a session rotates rather than replaying more images on every turn.
+const MAX_SESSION_IMAGES: usize = 16;
+
+fn image_count(parts: &[Part]) -> usize {
+    parts.iter().filter(|part| matches!(part, Part::Jpeg(_))).count()
+}
 
 struct Session {
     id: String,
@@ -25,6 +31,15 @@ struct Session {
     l2: String,
     turns: Vec<Turn>,
     last_active: DateTime<Utc>,
+}
+
+impl Session {
+    fn images(&self) -> usize {
+        self.turns.iter().map(|turn| match turn {
+            Turn::UserParts(parts) => image_count(parts),
+            _ => 0,
+        }).sum()
+    }
 }
 
 pub struct Speaker {
@@ -62,8 +77,8 @@ impl Speaker {
         }
     }
 
-    /// Append `user_text` to the chat's session and get his reply. `frame` builds L2 and is only
-    /// called when a new session starts.
+    /// Append `user_text`, followed by `images` when he is looking at some, to the chat's session
+    /// and get his reply. `frame` builds L2 and is only called when a new session starts.
     pub async fn say(
         &mut self,
         models: &Models,
@@ -71,6 +86,7 @@ impl Speaker {
         policy: &ProcessingPolicy,
         now: DateTime<Utc>,
         user_text: String,
+        images: Vec<Part>,
         frame: impl FnOnce() -> Result<String>,
     ) -> Result<String> {
         let exhausted = models.budget_exhausted();
@@ -84,6 +100,7 @@ impl Speaker {
                     || &s.policy != policy
                     || models.router().model(&s.model_id).is_none()
                     || (exhausted && s.model_id != desired)
+                    || s.images() + image_count(&images) > MAX_SESSION_IMAGES
             }
         };
         if rotate {
@@ -95,7 +112,13 @@ impl Speaker {
             self.sessions.insert(key.to_string(), session);
         }
         let session = self.sessions.get_mut(key).ok_or_else(|| anyhow!("session missing"))?;
-        session.turns.push(Turn::User(user_text));
+        session.turns.push(if images.is_empty() {
+            Turn::User(user_text)
+        } else {
+            let mut parts = vec![Part::Text(user_text)];
+            parts.extend(images);
+            Turn::UserParts(parts)
+        });
         session.last_active = now;
 
         let effort = models.effort(SCENARIO);
@@ -124,6 +147,17 @@ mod tests {
             id: "test".into(), model_id: "test".into(), policy: ProcessingPolicy::Any,
             l2: "frozen frame".into(), turns: vec![Turn::User("previous turn".into())], last_active: Utc::now(),
         }
+    }
+
+    #[test]
+    fn sessions_count_the_images_they_replay() {
+        let mut s = session();
+        assert_eq!(s.images(), 0);
+        let parts = vec![Part::Text("看".into()), Part::Jpeg("QQ==".into()), Part::Jpeg("Qg==".into())];
+        assert_eq!(image_count(&parts), 2);
+        s.turns.push(Turn::UserParts(parts));
+        s.turns.push(Turn::Assistant { text: "好".into(), raw: None });
+        assert_eq!(s.images(), 2);
     }
 
     #[test]
