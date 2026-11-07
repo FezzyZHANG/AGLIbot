@@ -91,10 +91,20 @@ struct Shared {
     /// His QQ nickname, for self-authored forward nodes.
     nickname: Mutex<Option<String>>,
     pokes: Mutex<HashMap<(String, i64), tokio::time::Instant>>,
-    own_messages: Mutex<VecDeque<String>>,
+    own_messages: Mutex<VecDeque<SentMessage>>,
     recent: Mutex<VecDeque<(String, Quoted)>>,
     /// Unknown segment types already logged.
     unknown_types: Mutex<HashSet<String>>,
+}
+
+struct SentMessage {
+    chat_id: String,
+    id: String,
+    preview: String,
+}
+
+fn message_preview(text: &str) -> String {
+    cut(&text.replace("\r\n", " ").replace(['\r', '\n'], " "), 40)
 }
 
 #[derive(Clone)]
@@ -129,16 +139,16 @@ impl Shared {
         }
     }
 
-    fn remember(&self, id: String) {
+    fn remember(&self, chat_id: &str, id: String, text: &str) {
         let mut q = self.own_messages.lock().unwrap_or_else(|e| e.into_inner());
-        q.push_back(id);
+        q.push_back(SentMessage { chat_id: chat_id.into(), id, preview: message_preview(text) });
         while q.len() > OWN_MESSAGES {
             q.pop_front();
         }
     }
 
     fn is_mine(&self, id: &str) -> bool {
-        self.own_messages.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|m| m == id)
+        self.own_messages.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|m| m.id == id)
     }
 }
 
@@ -163,7 +173,11 @@ pub fn spawn(url: String, token: Option<String>, inbound: mpsc::Sender<Envelope>
 
 /// Resolve what an event needs from NapCat, in arrival order, then hand it on.
 async fn enrich(mut raw: mpsc::Receiver<Pending>, qq: QqHandle, inbound: mpsc::Sender<Envelope>) {
-    while let Some(p) = raw.recv().await {
+    while let Some(mut p) = raw.recv().await {
+        if let Some(target) = p.reaction_target.take() {
+            let Some(preview) = qq.reaction_preview(&p.env.chat_id, &target).await else { continue };
+            p.env.text = format!("[对你的消息 #{target}「{preview}」{}]", p.env.text);
+        }
         // Record arrival before potentially slow reply/forward lookups; notices never replace it.
         if !p.env.notice {
             qq.shared.last_inbound.lock().unwrap_or_else(|e| e.into_inner())
@@ -229,7 +243,7 @@ impl QqHandle {
             let params = forward_params(key, id, self.shared.self_id.load(Ordering::Relaxed), &nickname, &chunks);
             match self.call(forward_action, params).await {
                 Ok(data) => {
-                    self.cache_sent(&data, &chunks[0]);
+                    self.cache_sent(chat_id, &data, &chunks[0]);
                     return Ok(());
                 }
                 Err(e) => warn!("qq forward failed, falling back to chunks: {e:#}"),
@@ -242,7 +256,7 @@ impl QqHandle {
                 reply_prefix(pieces, chunk.len())
             } else { vec![ReplyPiece::Text(chunk.clone())] };
             let data = self.call(action, reply_params(key, id, self.self_id(), &body, quote)).await?;
-            self.cache_sent(&data, chunk);
+            self.cache_sent(chat_id, &data, chunk);
         }
         Ok(())
     }
@@ -258,7 +272,7 @@ impl QqHandle {
         let (action, _, key, id) = chat_target(chat_id)?;
         let quote = if key == "group_id" { self.quote(chat_id, reply_to) } else { None };
         let data = self.call(action, sticker_params(key, id, bytes, quote)).await?;
-        self.cache_sent(&data, "[动画表情]");
+        self.cache_sent(chat_id, &data, "[动画表情]");
         Ok(())
     }
 
@@ -279,15 +293,31 @@ impl QqHandle {
         n
     }
 
-    fn cache_sent(&self, data: &Value, text: &str) {
+    fn cache_sent(&self, chat_id: &str, data: &Value, text: &str) {
         if let Some(mid) = data.get("message_id") {
-            self.shared.remember(id_string(mid));
+            self.shared.remember(chat_id, id_string(mid), text);
             self.shared.cache(id_string(mid), Quoted { name: "我".into(), text: text.to_string(), images: Vec::new() });
         }
     }
 
     async fn get_message(&self, id: &str) -> Result<Value> {
         tokio::time::timeout(FORWARD_TIMEOUT, self.call("get_msg", json!({ "message_id": id }))).await.map_err(|_| anyhow!("get_msg timed out"))?
+    }
+
+    async fn reaction_preview(&self, chat_id: &str, id: &str) -> Option<String> {
+        if let Some(msg) = self.shared.own_messages.lock().unwrap_or_else(|e| e.into_inner())
+            .iter().rev().find(|msg| msg.chat_id == chat_id && msg.id == id) {
+            return Some(msg.preview.clone());
+        }
+        let data = self.get_message(id).await.ok()?;
+        let group = data.get("group_id").map(id_string)?;
+        let author = data.pointer("/sender/user_id").or_else(|| data.get("user_id"))?;
+        if chat_id.strip_prefix("group:") != Some(group.as_str()) || id_string(author) != self.self_id().to_string() {
+            return None;
+        }
+        let forwards = Forwards::new();
+        let render = Render { self_id: self.self_id().to_string(), shared: &self.shared, forwards: &forwards };
+        Some(message_preview(&render.segments(&node_segments(&data), FORWARD_DEPTH, None)))
     }
 
     /// A fresh download URL for a received image.
@@ -483,6 +513,7 @@ struct Pending {
     env: Envelope,
     message: Vec<Value>,
     recalled_id: Option<String>,
+    reaction_target: Option<String>,
 }
 
 /// Merged-forward nodes by forward id; `None` when fetching failed.
@@ -523,7 +554,22 @@ fn parse_event(v: &Value, shared: &Shared) -> Option<Pending> {
         },
         message,
         recalled_id: None,
+        reaction_target: None,
     })
+}
+
+/// NapCat uses short numeric QQ face IDs and decimal Unicode code points.
+fn reaction_label(like_entry: &Value) -> Option<String> {
+    let id = id_string(like_entry.get("emoji_id")?);
+    let value = id.parse::<u32>().ok()?;
+    if id.len() > 3 {
+        return Some(char::from_u32(value).filter(|c| !c.is_control())
+            .map_or_else(|| format!("表情 #{id}"), |c| c.to_string()));
+    }
+    // QSid and QDes from NapCat's built-in sysface table.
+    let name = include_str!("qq_faces.tsv").lines().filter_map(|line| line.split_once('\t'))
+        .find_map(|(key, name)| (key == id).then_some(name));
+    Some(name.map_or_else(|| format!("QQ表情 #{id}"), |s| format!("/{s}")))
 }
 
 /// Notice bodies are finished in the ordered enrichment task, after preceding messages enter the LRU.
@@ -534,7 +580,23 @@ fn parse_notice(v: &Value, shared: &Shared) -> Option<Pending> {
     let kind = v.get("notice_type")?.as_str()?;
     let is_group = v.get("group_id").and_then(Value::as_i64).is_some_and(|id| id != 0);
     let chat_id = if is_group { format!("group:{}", v["group_id"].as_i64()?) } else { format!("private:{member}") };
+    let mut reaction_target = None;
+    let reaction_text;
     let (sender, text, mentions_me) = match kind {
+        "group_msg_emoji_like" if is_group && member > 0 => {
+            let id = id_string(v.get("message_id")?);
+            id.parse::<i64>().ok()?;
+            let labels: Vec<_> = v.get("likes")?.as_array()?.iter().filter_map(reaction_label).collect();
+            if labels.is_empty() { return None; }
+            let verb = match v.get("is_add").map(Value::as_bool) {
+                Some(Some(true)) | None => "贴了",
+                Some(Some(false)) => "取消了",
+                Some(None) => return None,
+            };
+            reaction_target = Some(id);
+            reaction_text = format!("{verb} {}", labels.join("、"));
+            (member, reaction_text.as_str(), false)
+        }
         "group_recall" | "friend_recall" => (
             v.get("operator_id").and_then(Value::as_i64).unwrap_or(member), "[撤回了一条消息]", false),
         "notify" if v["sub_type"] == "poke" && v["target_id"].as_i64() == Some(self_id) => {
@@ -559,6 +621,7 @@ fn parse_notice(v: &Value, shared: &Shared) -> Option<Pending> {
             arrived: Some(tokio::time::Instant::now()),
         },
         message: Vec::new(),
+        reaction_target,
         recalled_id: matches!(kind, "group_recall" | "friend_recall")
             .then(|| v.get("message_id").filter(|id| !id.is_null()).map(id_string)).flatten(),
     })
@@ -614,7 +677,7 @@ fn finish(mut p: Pending, forwards: &Forwards, shared: &Shared, reply: &str) -> 
             let mut recent = shared.recent.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(i) = recent.iter().position(|(key, _)| key == &id) {
                 let (_, quoted) = recent.remove(i)?;
-                p.env.text = format!("[撤回了一条消息: {}]", cut(&quoted.text.replace("\r\n", " ").replace(['\r', '\n'], " "), 40));
+                p.env.text = format!("[撤回了一条消息: {}]", message_preview(&quoted.text));
             }
         }
         return Some(p.env);
@@ -719,7 +782,7 @@ where
         Some(q) => {
             let from = Some(q.name.clone()).filter(|name| !name.is_empty());
             let images = q.images.iter().map(|a| Attachment { quoted_from: a.quoted_from.clone().or_else(|| from.clone()), ..a.clone() }).collect();
-            (format!("[回复 {}: {}]", q.name, cut(&q.text.replace("\r\n", " ").replace(['\r', '\n'], " "), 40)), images)
+            (format!("[回复 {}: {}]", q.name, message_preview(&q.text)), images)
         }
         None => ("[回复]".into(), Vec::new()),
     }
@@ -952,6 +1015,48 @@ mod tests {
     fn notice(kind: &str) -> Value {
         json!({"post_type":"notice", "notice_type":kind, "user_id":12, "group_id":34,
             "operator_id":56, "message_id":7})
+    }
+
+    #[tokio::test]
+    async fn emoji_reactions_reach_the_group_with_actor_target_and_faces() {
+        let (tx, mut requests) = mpsc::channel(4);
+        let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+        qq.cache_sent("group:34", &json!({"message_id":7}), "今晚\n见");
+        let (raw_tx, raw_rx) = mpsc::channel(4);
+        let (in_tx, mut inbound) = mpsc::channel(4);
+        let mut event = notice("group_msg_emoji_like");
+        event["likes"] = json!([{"emoji_id":"128077","count":1},{"emoji_id":"76","count":1}]);
+        for add in [true, false] {
+            event["is_add"] = json!(add);
+            raw_tx.send(super::parse_event(&event, &qq.shared).unwrap()).await.unwrap();
+        }
+        drop(raw_tx);
+        enrich(raw_rx, qq.clone(), in_tx).await;
+        for verb in ["贴了", "取消了"] {
+            let env = inbound.recv().await.unwrap();
+            assert_eq!(env.text, format!("[对你的消息 #7「今晚 见」{verb} 👍、/赞]"));
+            assert_eq!((&*env.sender_id, &*env.chat_id), ("12", "group:34"));
+            assert!(env.notice && !env.mentions_me && env.message_id.is_none());
+        }
+        assert!(requests.try_recv().is_err());
+        event["user_id"] = json!(99);
+        assert!(super::parse_event(&event, &qq.shared).is_none());
+    }
+
+    #[tokio::test]
+    async fn older_reaction_targets_require_matching_group_and_author() {
+        let (tx, mut requests) = mpsc::channel::<Request>(4);
+        let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+        for (group, author, expected) in [(34,99,Some("旧消息")), (35,99,None), (34,10,None)] {
+            let respond = async {
+                let req = requests.recv().await.unwrap();
+                assert_eq!(req.action, "get_msg");
+                assert_eq!(req.params["message_id"], "-9");
+                req.reply.send(Ok(json!({"group_id": group, "sender":{"user_id":author}, "message":"旧消息"}))).unwrap();
+            };
+            let (actual, ()) = tokio::join!(qq.reaction_preview("group:34", "-9"), respond);
+            assert_eq!(actual.as_deref(), expected);
+        }
     }
 
     #[test]
@@ -1231,7 +1336,7 @@ mod tests {
     #[test]
     fn parses_group_message_with_at_and_reply() {
         let s = shared(99);
-        s.remember("555".into());
+        s.remember("group:34", "555".into(), "");
         let ev = json!({
             "post_type": "message", "message_type": "group", "self_id": 99,
             "user_id": 12, "group_id": 34, "message_id": 777,
@@ -1327,7 +1432,7 @@ mod tests {
     #[test]
     fn mentions_inside_a_forward_do_not_mention_him() {
         let s = shared(99);
-        s.remember("555".into());
+        s.remember("group:34", "555".into(), "");
         let inner = json!([{"type": "reply", "data": {"id": "555"}}, {"type": "at", "data": {"qq": "99"}}, text("你好")]);
         let env = parse_event(&group(json!([{"type": "forward", "data": {"id": "a", "content": [node("甲", inner)]}}])), &s).unwrap();
         assert!(!env.mentions_me);
@@ -1384,7 +1489,7 @@ mod tests {
     #[tokio::test]
     async fn reply_uses_cache_and_preserves_own_mention() {
         let s = shared(99);
-        s.remember("555".into());
+        s.remember("group:34", "555".into(), "");
         s.cache("555".into(), Quoted { name: "我".into(), text: "你好\r\n世界".into(), images: Vec::new() });
         let msg = json!([reply("555"), text("对")]);
         let (prefix, _) = resolve_reply(msg.as_array().unwrap(), &s, |_| async { panic!("cache hit must not fetch") }).await;
