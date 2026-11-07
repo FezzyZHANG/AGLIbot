@@ -1,6 +1,6 @@
 # Gate #58: a self-collecting sticker store
 
-2026-11-06. Stage 1 below is built (`src/mind/media.rs`, `src/stickers_web.rs`), which supersedes this note where they differ; stage 2 is not authorized. Extends [memes.md](memes.md), whose repository baseline is out of date: inbound images and stickers reach the chat model since #55 (see [vision.md](vision.md)). Sending a sticker is still not implemented; replies are text and @ only.
+2026-11-06. Stage 1 below is built (`src/mind/media.rs`, `src/stickers_web.rs`), which supersedes this note where they differ; the owner authorized sending on 2026-11-07, before the planned week of review, as a QQ-only first cut (`src/mind/expression.rs`) with no per-chat limit and no tag fallback. Extends [memes.md](memes.md), whose repository baseline is out of date: inbound images and stickers reach the chat model since #55 (see [vision.md](vision.md)).
 
 Probes were single requests from this machine against the live runtime's credentials and database. Prices come from `config/models.yaml`, which holds routing estimates, not quotations. External facts use numbered sources. No retrieval or filtering quality has been measured.
 

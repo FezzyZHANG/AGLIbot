@@ -221,12 +221,7 @@ impl QqHandle {
     }
 
     pub async fn send_reply(&self, chat_id: &str, pieces: &[ReplyPiece], reply_to: Option<&str>) -> Result<()> {
-        let (action, forward_action, key, id) = match chat_id.split_once(':') {
-            Some(("private", id)) => ("send_private_msg", "send_private_forward_msg", "user_id", id),
-            Some(("group", id)) => ("send_group_msg", "send_group_forward_msg", "group_id", id),
-            _ => bail!("bad qq chat id `{chat_id}`"),
-        };
-        let id: i64 = id.parse().with_context(|| format!("bad qq chat id `{chat_id}`"))?;
+        let (action, forward_action, key, id) = chat_target(chat_id)?;
         let text = reply_text(pieces);
         let chunks = super::telegram::chunks(&text, CHUNK_CHARS);
         if chunks.len() > 2 {
@@ -241,10 +236,7 @@ impl QqHandle {
             }
         }
         for (i, chunk) in chunks.iter().enumerate() {
-            let quote = if i == 0 && key == "group_id" && let Some(target) = reply_to {
-                let last = self.shared.last_inbound.lock().unwrap_or_else(|e| e.into_inner());
-                (last.get(chat_id).and_then(|id| id.as_deref()) != Some(target)).then_some(target)
-            } else { None };
+            let quote = if i == 0 && key == "group_id" { self.quote(chat_id, reply_to) } else { None };
             // Forward messages (including failure fallback) and later chunks stay plain.
             let body = if i == 0 && chunks.len() <= 2 {
                 reply_prefix(pieces, chunk.len())
@@ -252,6 +244,27 @@ impl QqHandle {
             let data = self.call(action, reply_params(key, id, self.self_id(), &body, quote)).await?;
             self.cache_sent(&data, chunk);
         }
+        Ok(())
+    }
+
+    /// Quote only when other messages came after the one being answered.
+    fn quote<'a>(&self, chat_id: &str, reply_to: Option<&'a str>) -> Option<&'a str> {
+        let target = reply_to?;
+        let last = self.shared.last_inbound.lock().unwrap_or_else(|e| e.into_inner());
+        (last.get(chat_id).and_then(|id| id.as_deref()) != Some(target)).then_some(target)
+    }
+
+    pub async fn send_sticker(&self, chat_id: &str, bytes: &[u8], reply_to: Option<&str>) -> Result<()> {
+        let (action, _, key, id) = chat_target(chat_id)?;
+        let quote = if key == "group_id" { self.quote(chat_id, reply_to) } else { None };
+        let data = self.call(action, sticker_params(key, id, bytes, quote)).await?;
+        self.cache_sent(&data, "[动画表情]");
+        Ok(())
+    }
+
+    /// `emoji_id` is a code point; NapCat treats ids longer than three digits as emoji.
+    pub async fn react(&self, message_id: &str, emoji_id: &str) -> Result<()> {
+        self.call("set_msg_emoji_like", json!({"message_id": message_id, "emoji_id": emoji_id, "set": true})).await?;
         Ok(())
     }
 
@@ -305,6 +318,28 @@ impl QqHandle {
             _ => bail!("get_forward_msg returned no messages: {data}"),
         }
     }
+}
+
+fn chat_target(chat_id: &str) -> Result<(&'static str, &'static str, &'static str, i64)> {
+    let (action, forward_action, key, id) = match chat_id.split_once(':') {
+        Some(("private", id)) => ("send_private_msg", "send_private_forward_msg", "user_id", id),
+        Some(("group", id)) => ("send_group_msg", "send_group_forward_msg", "group_id", id),
+        _ => bail!("bad qq chat id `{chat_id}`"),
+    };
+    let id: i64 = id.parse().with_context(|| format!("bad qq chat id `{chat_id}`"))?;
+    Ok((action, forward_action, key, id))
+}
+
+/// `sub_type` 1 shows the image at sticker size.
+fn sticker_params(key: &str, id: i64, bytes: &[u8], quote: Option<&str>) -> Value {
+    use base64::Engine as _;
+    let file = format!("base64://{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+    let mut message = Vec::new();
+    if let Some(target) = quote {
+        message.push(json!({"type": "reply", "data": {"id": target}}));
+    }
+    message.push(json!({"type": "image", "data": {"file": file, "sub_type": 1}}));
+    json!({key: id, "message": message})
 }
 
 fn reply_params(key: &str, id: i64, self_id: i64, pieces: &[ReplyPiece], quote: Option<&str>) -> Value {
@@ -1690,5 +1725,13 @@ mod tests {
         let info = qq.call("get_login_info", json!({})).await?;
         assert!(info.get("user_id").is_some(), "{info}");
         Ok(())
+    }
+
+    #[test]
+    fn stickers_go_as_sticker_sized_base64_images() {
+        assert_eq!(sticker_params("group_id", 7, b"abc", Some("5")), json!({"group_id": 7, "message": [
+            {"type": "reply", "data": {"id": "5"}},
+            {"type": "image", "data": {"file": "base64://YWJj", "sub_type": 1}},
+        ]}));
     }
 }

@@ -259,6 +259,10 @@ pub struct Intent {
     pub tasks: Vec<(TaskKind, String)>,
     pub relay: Option<String>,
     pub followups: Vec<(String, String)>,
+    /// An id from this turn's offered stickers.
+    pub sticker: Option<String>,
+    /// One emoji to put on the message he is answering.
+    pub reaction: Option<String>,
 }
 
 fn take_tag(text: &mut String, open_prefix: &str, close: &str) -> Option<(String, String)> {
@@ -286,10 +290,25 @@ pub fn parse_intent(raw: &str) -> Intent {
         let id = attrs.trim().strip_prefix("任务=\"").and_then(|s| s.strip_suffix('"')).unwrap_or_default();
         followups.push((id.to_string(), body));
     }
-    let pieces = parse_mentions(text.trim());
-    let text = reply_text(&pieces);
-    let silent = text.is_empty() || text == "[沉默]" || text == "[不发]";
-    Intent { text, pieces, silent, tasks, relay, followups }
+    let mut sticker = None;
+    while let Some((_, body)) = take_tag(&mut text, "<表情包", "</表情包>") {
+        sticker.get_or_insert(body);
+    }
+    let mut reaction = None;
+    while let Some((_, body)) = take_tag(&mut text, "<贴表情", "</贴表情>") {
+        if crate::mind::expression::reaction_id(&body).is_some() {
+            reaction.get_or_insert(body);
+        }
+    }
+    let mut pieces = parse_mentions(text.trim());
+    let mut text = reply_text(&pieces);
+    let quiet = text.is_empty() || text == "[沉默]" || text == "[不发]";
+    let silent = quiet && sticker.is_none() && reaction.is_none();
+    if quiet && !silent {
+        pieces.clear();
+        text.clear();
+    }
+    Intent { text, pieces, silent, tasks, relay, followups, sticker, reaction }
 }
 
 fn parse_mentions(text: &str) -> Vec<ReplyPiece> {
@@ -1162,6 +1181,8 @@ impl Agli {
         let mut body = format!("群里的新消息：\n{}", lines.join("\n"));
         if unsolicited {
             body.push_str("\n\n（没人叫你，你觉得可以插一句。说的时候要自然；改主意就只回复 [沉默]。）");
+        } else {
+            body.push_str("\n\n（有人点名叫你，这次一定要回应，不能用 [沉默]；没什么要说的话，只回一个表情也行。）");
         }
         self.converse(ctx, body, n, unsolicited).await
     }
@@ -1286,6 +1307,8 @@ impl Agli {
     }
 
     async fn converse_with_claim(&mut self, ctx: &ChatCtx, mut body: String, current: usize, unsolicited: bool, claim: Option<&str>) -> Result<()> {
+        // A sticker answers the people, not this turn's instructions to him.
+        let sticker_query = self.media.render(body.split("\n\n（").next().unwrap_or(&body), &[]);
         // Addressed turns only: chiming in never spends a look, and the images keep waiting.
         let look = match self.pending_media.remove(&ctx.key) {
             Some(pending) if !unsolicited => crate::mind::vision::look(&self.outlets, &self.media, pending).await,
@@ -1305,6 +1328,8 @@ impl Agli {
             .collect();
         // Slang goes in the tail, never L1/L2, so the cached prefix is unchanged.
         notes.extend(self.slang_note(ctx, &body, now));
+        let offers = if !unsolicited && current > 0 && claim.is_none() { self.sticker_offers(ctx, &sticker_query).await } else { Vec::new() };
+        notes.extend(crate::mind::expression::note(&offers));
         let turn_tail = tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref(), &notes);
         let text = user_turn(&turn_tail, &body);
         // Recall runs on every turn (cheap at this volume) so the policy is known before routing.
@@ -1355,6 +1380,12 @@ impl Agli {
         };
         let raw = watchlist::accept_reply(self.store.as_ref(), &self.cfg.mind_dir(), &raw, ctx.owner_private(), &ctx.key, now)?;
         let mut intent = parse_intent(&raw);
+        let sticker = intent.sticker.take().and_then(|id| {
+            let found = offers.iter().find(|o| o.id == id);
+            if found.is_none() { warn!("ignored sticker `{id}`, not offered in {}", ctx.key); }
+            found
+        });
+        intent.silent = intent.silent || (intent.text.is_empty() && sticker.is_none() && intent.reaction.is_none());
         let from_owner = ctx.partner.as_ref().is_some_and(|w| w.is_owner);
         for (kind, title) in &intent.tasks {
             if from_owner {
@@ -1375,12 +1406,16 @@ impl Agli {
         attach_followups(&mut self.board(), ctx, &mut intent);
         if intent.silent {
             anyhow::ensure!(claim.is_none(), "focus catch-up produced no reply; keeping held messages");
-            info!("chose not to speak in {}", ctx.key);
+            if ctx.is_group && !unsolicited {
+                warn!("stayed silent though addressed in {}", ctx.key);
+            } else {
+                info!("chose not to speak in {}", ctx.key);
+            }
             return Ok(());
         }
         intent.pieces = self.cap_group_reply(ctx, unsolicited, &policy, intent.pieces).await;
         intent.text = reply_text(&intent.pieces);
-        if intent.text.is_empty() { return Ok(()) }
+        if intent.text.is_empty() && sticker.is_none() && intent.reaction.is_none() { return Ok(()) }
         if ctx.is_group {
             self.floor.spoke(&ctx.key, unsolicited, now);
         }
@@ -1389,11 +1424,29 @@ impl Agli {
         let speakers = self.speakers.get(&ctx.key).map(Vec::as_slice).unwrap_or_default();
         let self_id = self.outlets.qq.as_ref().map_or(0, |qq| qq.self_id());
         resolve_mentions(&mut intent.pieces, ctx, speakers, &self.people, self_id);
-        let outcome = self.send_bubbles(ctx, &intent.pieces).await;
+        let mut stored = Vec::new();
+        if let Some(emoji) = intent.reaction.take() {
+            if self.react(ctx, &emoji).await {
+                stored.push(format!("[贴表情 {emoji}]"));
+            } else if intent.text.is_empty() && sticker.is_none() {
+                intent.text = emoji.clone();
+                intent.pieces = vec![ReplyPiece::Text(emoji)];
+            }
+        }
+        let outcome = if intent.text.is_empty() { Outcome::Sent } else { self.send_bubbles(ctx, &intent.pieces).await };
         if unsolicited {
             self.audit("me", "group_chime_in", true, &ctx.key, outcome)?;
         }
         anyhow::ensure!(outcome == Outcome::Sent, "reply delivery in {}: {outcome:?}", ctx.key);
+        if let Some(offer) = sticker {
+            // Text already went out, so its record below still matters; a lone sticker has nothing to keep.
+            match self.send_sticker(ctx, offer).await {
+                Ok(()) => stored.push(format!("[表情包：{}]", offer.record.description)),
+                Err(e) if intent.text.is_empty() && stored.is_empty() => return Err(e),
+                Err(e) => error!("sticker not sent in {}: {e:#}", ctx.key),
+            }
+        }
+        if !intent.text.is_empty() { stored.insert(0, intent.text.clone()); }
         if current > 0 && self.cfg.social.reflects_normally(&ctx.ns) {
             for message in self.store.recent_in_ns(&ctx.ns, current)? {
                 if !message.outgoing && message.platform == ctx.platform && message.chat_id == ctx.chat_id
@@ -1409,10 +1462,61 @@ impl Agli {
             sender: "me".into(),
             sender_name: String::new(),
             outgoing: true,
-            text: intent.text.clone(),
+            text: stored.join(" "),
             ns: ctx.ns.clone(),
             scope: ctx.scope.clone(),
         })?;
+        Ok(())
+    }
+
+    async fn sticker_offers(&self, ctx: &ChatCtx, query: &str) -> Vec<crate::mind::expression::Offer> {
+        #[cfg(test)]
+        if let Some(test) = &self.test_chat { return test.offers.clone(); }
+        if ctx.platform != "qq" { return Vec::new() }
+        let dir = crate::mind::media::media_dir(&self.cfg);
+        let sendable = |r: &crate::store::MediaRecord| crate::mind::media::file_path(&dir, &r.hash, &r.ext).exists();
+        crate::mind::expression::offers(self.store.as_ref(), &self.models, &ctx.key, query, sendable).await
+            .unwrap_or_else(|e| { warn!("no stickers offered in {}: {e:#}", ctx.key); Vec::new() })
+    }
+
+    /// False when it did not land, or the chat has no reactions.
+    async fn react(&self, ctx: &ChatCtx, emoji: &str) -> bool {
+        let Some(id) = crate::mind::expression::reaction_id(emoji) else { return false };
+        #[cfg(test)]
+        if let Some(test) = &self.test_chat {
+            test.sent_texts.lock().unwrap().push(format!("react:{id}"));
+            return test.sends.lock().unwrap().pop_front().expect("unexpected reaction") == Outcome::Sent;
+        }
+        let (true, Some(message_id)) = (ctx.is_group, ctx.message_id.as_deref()) else { return false };
+        match self.outlets.react(ctx.platform, message_id, &id).await {
+            Ok(()) => { info!("reacted {emoji} in {}", ctx.key); true }
+            Err(e) => { warn!("reaction failed in {}: {e:#}", ctx.key); false }
+        }
+    }
+
+    async fn send_sticker(&self, ctx: &ChatCtx, offer: &crate::mind::expression::Offer) -> Result<()> {
+        let reply_to = if ctx.is_group { ctx.message_id.as_deref() } else { None };
+        let record = &offer.record;
+        #[cfg(test)]
+        let sent = if let Some(test) = &self.test_chat {
+            test.sent_texts.lock().unwrap().push(format!("sticker:{}", offer.id));
+            let outcome = test.sends.lock().unwrap().pop_front().expect("unexpected sticker");
+            anyhow::ensure!(outcome == Outcome::Sent, "sticker delivery: {outcome:?}");
+            true
+        } else { false };
+        #[cfg(not(test))]
+        let sent = false;
+        if !sent {
+            let path = crate::mind::media::file_path(&crate::mind::media::media_dir(&self.cfg), &record.hash, &record.ext);
+            let bytes = tokio::fs::read(&path).await.map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+            self.outlets.send_sticker(ctx.platform, &ctx.chat_id, &bytes, reply_to).await?;
+        }
+        info!("sent sticker {} in {}", offer.id, ctx.key);
+        if let Some(mut fresh) = self.store.media(&record.hash)? {
+            fresh.sent_count += 1;
+            fresh.last_sent = Some(Utc::now());
+            self.store.save_media(&fresh)?;
+        }
         Ok(())
     }
 
@@ -2641,6 +2745,7 @@ mod tests {
         pub(super) rewrite_prompts: Mutex<Vec<(ProcessingPolicy, String)>>,
         pub(super) sent_texts: Mutex<Vec<String>>,
         pub(super) reply_targets: Mutex<Vec<Option<String>>>,
+        pub(super) offers: Vec<crate::mind::expression::Offer>,
     }
 
     impl TestChat {
@@ -2649,7 +2754,7 @@ mod tests {
                 replies: replies.iter().map(|s| Ok((*s).into())).collect(), turns: Vec::new(), images: Vec::new(),
                 sends: Mutex::new(sends.iter().copied().collect()),
                 rewrites: Mutex::new(VecDeque::new()), rewrite_prompts: Mutex::new(Vec::new()),
-                sent_texts: Mutex::new(Vec::new()), reply_targets: Mutex::new(Vec::new()),
+                sent_texts: Mutex::new(Vec::new()), reply_targets: Mutex::new(Vec::new()), offers: Vec::new(),
             }
         }
     }
@@ -4094,6 +4199,73 @@ mod tests {
         let turn = &a.test_chat.as_ref().unwrap().turns[0].1;
         assert!(turn.contains("[图片]") && !turn.contains("这些图片你没看到"), "{turn}");
         assert_eq!(a.pending_media["telegram:-7"].len(), 1);
+    }
+
+    fn offer(id: &str) -> crate::mind::expression::Offer {
+        let now = Utc::now();
+        crate::mind::expression::Offer { id: id.into(), record: crate::store::MediaRecord {
+            hash: format!("{id}rest"), ext: "gif".into(), status: crate::store::MediaStatus::Active, keep: true,
+            description: "猫瞪着屏幕".into(), text: String::new(), use_when: "对方说了离谱的话".into(), avoid: String::new(),
+            tags: vec![], scope: crate::store::StickerScope::Any, scope_reason: String::new(), origin: "telegram:-7".into(),
+            first_seen: now, last_seen: now, sightings: 1, sent_count: 0, last_sent: None,
+        } }
+    }
+
+    #[tokio::test]
+    async fn an_addressed_turn_may_answer_with_one_expression() {
+        let mut test = TestAgli::new("one-expression").await;
+        let a = &mut test.agli;
+        let mut chat = TestChat::new(
+            &["<表情包>ab12cd34</表情包>", "<贴表情>👍</贴表情>", "<贴表情>👍</贴表情>", "👍", "<表情包>notoffer</表情包>"],
+            &[Outcome::Sent, Outcome::Sent, Outcome::Failed, Outcome::Sent, Outcome::Sent],
+        );
+        chat.offers = vec![offer("ab12cd34")];
+        a.test_chat = Some(chat);
+        a.store.save_media(&offer("ab12cd34").record).unwrap();
+        for text in ["一", "二", "三", "四", "五"] {
+            a.on_messages(group_messages(&[text], true)).await.unwrap();
+        }
+        let chat = a.test_chat.as_ref().unwrap();
+        assert!(chat.turns[0].1.contains("ab12cd34：猫瞪着屏幕（适合：对方说了离谱的话）"), "{}", chat.turns[0].1);
+        // A reaction that fails falls back to the emoji as text; an id he was not offered sends nothing.
+        assert_eq!(*chat.sent_texts.lock().unwrap(), ["sticker:ab12cd34", "react:128077", "react:128077", "👍", "👍"]);
+        let record = a.store.media("ab12cd34rest").unwrap().unwrap();
+        assert_eq!(record.sent_count, 1);
+        assert!(record.last_sent.is_some());
+        let ns = Namespace::Group("telegram:-7".into());
+        let mine: Vec<String> = a.store.recent_in_ns(&ns, 20).unwrap().into_iter().filter(|m| m.outgoing).map(|m| m.text).collect();
+        assert_eq!(mine, ["[表情包：猫瞪着屏幕]", "[贴表情 👍]", "👍", "👍"]);
+    }
+
+    #[test]
+    fn expression_markers_are_not_silence_and_never_reach_the_text() {
+        let lone = parse_intent("<贴表情>👍</贴表情>");
+        assert!(!lone.silent && lone.text.is_empty() && lone.reaction.as_deref() == Some("👍"));
+        let hushed = parse_intent("[沉默]<表情包>ab</表情包>");
+        assert!(!hushed.silent && hushed.text.is_empty() && hushed.sticker.as_deref() == Some("ab"));
+        let bad = parse_intent("<贴表情>赞</贴表情>");
+        assert!(bad.silent && bad.reaction.is_none());
+        let mixed = parse_intent("离谱<表情包>a</表情包><表情包>b</表情包>");
+        assert_eq!((mixed.text.as_str(), mixed.sticker.as_deref()), ("离谱", Some("a")));
+    }
+
+    #[tokio::test]
+    async fn only_addressed_group_turns_forbid_silence() {
+        let mut test = TestAgli::new("addressed-no-silence").await;
+        let a = &mut test.agli;
+        a.test_chat = Some(TestChat::new(&["在呢", "插一句"], &[Outcome::Sent, Outcome::Sent]));
+        a.on_messages(group_messages(&["在吗"], true)).await.unwrap();
+        let addressed = a.test_chat.as_ref().unwrap().turns[0].1.clone();
+        assert!(addressed.contains("不能用 [沉默]"), "{addressed}");
+        a.on_messages(group_messages(&["随便聊聊"], false)).await.unwrap();
+        let ctx = ChatCtx {
+            key: "telegram:-7".into(), platform: "telegram", chat_id: "-7".into(), message_id: None,
+            ns: Namespace::Group("telegram:-7".into()), scope: Scope::Group { id: "telegram:-7".into() }, flow_ns: None,
+            audience: Audience::group("telegram:-7", std::iter::empty::<String>()), is_group: true, partner: None,
+        };
+        a.converse_group(&ctx, true).await.unwrap();
+        let unsolicited = &a.test_chat.as_ref().unwrap().turns[1].1;
+        assert!(!unsolicited.contains("不能用 [沉默]"), "{unsolicited}");
     }
 
     #[tokio::test]

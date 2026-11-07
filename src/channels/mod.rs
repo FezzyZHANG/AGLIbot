@@ -214,6 +214,22 @@ impl Outlets {
         self.send_reply(platform, chat_id, &[ReplyPiece::Text(text.into())], None).await
     }
 
+    /// Only QQ sends stickers so far.
+    pub async fn send_sticker(&self, platform: &str, chat_id: &str, bytes: &[u8], reply_to: Option<&str>) -> Result<()> {
+        match (platform, &self.qq) {
+            ("qq", Some(qq)) => qq.send_sticker(chat_id, bytes, reply_to).await,
+            _ => bail!("{platform} cannot send stickers"),
+        }
+    }
+
+    /// Only QQ has reactions so far.
+    pub async fn react(&self, platform: &str, message_id: &str, emoji_id: &str) -> Result<()> {
+        match (platform, &self.qq) {
+            ("qq", Some(qq)) => qq.react(message_id, emoji_id).await,
+            _ => bail!("{platform} cannot react"),
+        }
+    }
+
     /// The attachment's bytes. QQ URLs expire, so a failed one is refreshed through NapCat once.
     pub async fn fetch_media(&self, platform: &str, attachment: &Attachment, max: usize) -> Result<Vec<u8>> {
         match platform {

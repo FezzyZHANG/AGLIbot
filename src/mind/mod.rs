@@ -2,6 +2,7 @@ pub mod commitments;
 pub mod context;
 pub mod decide;
 pub mod embedding;
+pub mod expression;
 pub mod flow;
 pub mod flow_metrics;
 pub mod judge;
