@@ -40,6 +40,16 @@ impl Session {
             _ => 0,
         }).sum()
     }
+
+    /// Keep only the first `lasting` parts of the turn just answered.
+    fn forget_parts(&mut self, lasting: usize) {
+        let Some(turn) = self.turns.last_mut() else { return };
+        let Turn::UserParts(parts) = turn else { return };
+        parts.truncate(lasting);
+        if let [Part::Text(text)] = parts.as_mut_slice() {
+            *turn = Turn::User(std::mem::take(text));
+        }
+    }
 }
 
 pub struct Speaker {
@@ -78,7 +88,8 @@ impl Speaker {
     }
 
     /// Append `user_text`, followed by `images` when he is looking at some, to the chat's session
-    /// and get his reply. `frame` builds L2 and is only called when a new session starts.
+    /// and get his reply. `this_turn_only` goes with this request and is not replayed later.
+    /// `frame` builds L2 and is only called when a new session starts.
     pub async fn say(
         &mut self,
         models: &Models,
@@ -87,6 +98,7 @@ impl Speaker {
         now: DateTime<Utc>,
         user_text: String,
         images: Vec<Part>,
+        this_turn_only: Vec<Part>,
         frame: impl FnOnce() -> Result<String>,
     ) -> Result<String> {
         let exhausted = models.budget_exhausted();
@@ -112,11 +124,13 @@ impl Speaker {
             self.sessions.insert(key.to_string(), session);
         }
         let session = self.sessions.get_mut(key).ok_or_else(|| anyhow!("session missing"))?;
-        session.turns.push(if images.is_empty() {
+        let lasting = 1 + images.len();
+        session.turns.push(if images.is_empty() && this_turn_only.is_empty() {
             Turn::User(user_text)
         } else {
             let mut parts = vec![Part::Text(user_text)];
             parts.extend(images);
+            parts.extend(this_turn_only);
             Turn::UserParts(parts)
         });
         session.last_active = now;
@@ -126,6 +140,7 @@ impl Speaker {
         match models.run(SCENARIO, policy, &session.model_id, &prompt, &session.id).await {
             Ok((reply, used)) => {
                 session.model_id = used;
+                session.forget_parts(lasting);
                 session.turns.push(Turn::Assistant { text: reply.text.clone(), raw: reply.raw });
                 Ok(reply.text)
             }
@@ -158,6 +173,19 @@ mod tests {
         s.turns.push(Turn::UserParts(parts));
         s.turns.push(Turn::Assistant { text: "好".into(), raw: None });
         assert_eq!(s.images(), 2);
+    }
+
+    #[test]
+    fn parts_for_this_turn_only_are_not_replayed() {
+        let parts = || vec![Part::Text("看".into()), Part::Jpeg("QQ==".into()), Part::Text("候选".into()), Part::Jpeg("Qg==".into())];
+        let mut s = session();
+        s.turns.push(Turn::UserParts(parts()));
+        s.forget_parts(2);
+        assert_eq!(s.images(), 1);
+        let mut s = session();
+        s.turns.push(Turn::UserParts(parts()));
+        s.forget_parts(1);
+        assert!(matches!(s.turns.last(), Some(Turn::User(text)) if text == "看"));
     }
 
     #[test]

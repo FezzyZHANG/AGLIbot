@@ -68,9 +68,14 @@ impl Failure {
 
 /// An image's frames as base64 JPEG, for a description model.
 pub fn jpeg_frames(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
-    let image = normalize(bytes, MAX_FRAMES).map_err(|failure| anyhow::anyhow!("image not readable: {}", failure.reason()))?;
+    Ok(sampled_frames(bytes, MAX_FRAMES)?.0)
+}
+
+/// Up to `max` frames as base64 JPEG, and how many frames the image has.
+pub fn sampled_frames(bytes: &[u8], max: usize) -> anyhow::Result<(Vec<String>, usize)> {
+    let image = normalize(bytes, max).map_err(|failure| anyhow::anyhow!("image not readable: {}", failure.reason()))?;
     let engine = base64::engine::general_purpose::STANDARD;
-    Ok(image.frames.iter().map(|jpeg| engine.encode(jpeg)).collect())
+    Ok((image.frames.iter().map(|jpeg| engine.encode(jpeg)).collect(), image.total_frames))
 }
 
 /// Keep image and sticker references, newest last, dropping the oldest past the limit. Quoting an
@@ -448,8 +453,8 @@ mod tests {
         });
         let chat = models.pick("chat", &policy).unwrap().id;
         let now = chrono::Utc::now();
-        let first = speaker.say(&models, "k", &policy, now, "甲：这动图依次是什么颜色？".into(), seen.parts, || Ok(String::new())).await.unwrap();
-        let second = speaker.say(&models, "k", &policy, now, "甲：第一帧是什么颜色？".into(), Vec::new(), || Ok(String::new())).await.unwrap();
+        let first = speaker.say(&models, "k", &policy, now, "甲：这动图依次是什么颜色？".into(), seen.parts, Vec::new(), || Ok(String::new())).await.unwrap();
+        let second = speaker.say(&models, "k", &policy, now, "甲：第一帧是什么颜色？".into(), Vec::new(), Vec::new(), || Ok(String::new())).await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         println!("model {chat}\nfirst: {first}\nsecond: {second}");
         assert!(first.contains('红') && first.contains('绿') && first.contains('蓝'), "{first}");

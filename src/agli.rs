@@ -1329,7 +1329,7 @@ impl Agli {
         // Slang goes in the tail, never L1/L2, so the cached prefix is unchanged.
         notes.extend(self.slang_note(ctx, &body, now));
         let offers = if !unsolicited && current > 0 && claim.is_none() { self.sticker_offers(ctx, &sticker_query).await } else { Vec::new() };
-        notes.extend(crate::mind::expression::note(&offers));
+        let (mut offers, sticker_parts) = crate::mind::expression::show(&crate::mind::media::media_dir(&self.cfg), offers).await;
         let turn_tail = tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref(), &notes);
         let text = user_turn(&turn_tail, &body);
         // Recall runs on every turn (cheap at this volume) so the policy is known before routing.
@@ -1346,7 +1346,11 @@ impl Agli {
         #[cfg(test)]
         let response = if let Some(test) = &mut self.test_chat {
             test.turns.push((ctx.key.clone(), text.clone(), l2.clone()));
-            test.images.push(look.parts.iter().filter(|p| matches!(p, crate::mind::llm::Part::Jpeg(_))).count());
+            test.images.push(look.parts.iter().chain(&sticker_parts).filter(|p| matches!(p, crate::mind::llm::Part::Jpeg(_))).count());
+            test.labels.extend(sticker_parts.iter().filter_map(|p| match p {
+                crate::mind::llm::Part::Text(text) => Some(text.clone()),
+                _ => None,
+            }));
             Some(test.replies.pop_front().expect("unexpected model call"))
         } else {
             None
@@ -1356,13 +1360,14 @@ impl Agli {
         let response = match response {
             Some(r) => r,
             None => {
-                let had_images = !look.parts.is_empty();
-                let first = self.speaker.say(&self.models, &ctx.key, &policy, now, text, look.parts, || Ok(l2.clone())).await;
+                let had_images = !look.parts.is_empty() || !sticker_parts.is_empty();
+                let first = self.speaker.say(&self.models, &ctx.key, &policy, now, text, look.parts, sticker_parts, || Ok(l2.clone())).await;
                 match first {
                     Err(e) if had_images => {
                         warn!("reply with images failed, retrying without them: {e:#}");
                         let text = user_turn(&turn_tail, &without_parts);
-                        self.speaker.say(&self.models, &ctx.key, &policy, now, text, Vec::new(), || Ok(l2)).await
+                        offers.clear();
+                        self.speaker.say(&self.models, &ctx.key, &policy, now, text, Vec::new(), Vec::new(), || Ok(l2)).await
                     }
                     other => other,
                 }
@@ -2746,6 +2751,7 @@ mod tests {
         pub(super) sent_texts: Mutex<Vec<String>>,
         pub(super) reply_targets: Mutex<Vec<Option<String>>>,
         pub(super) offers: Vec<crate::mind::expression::Offer>,
+        pub(super) labels: Vec<String>,
     }
 
     impl TestChat {
@@ -2754,7 +2760,7 @@ mod tests {
                 replies: replies.iter().map(|s| Ok((*s).into())).collect(), turns: Vec::new(), images: Vec::new(),
                 sends: Mutex::new(sends.iter().copied().collect()),
                 rewrites: Mutex::new(VecDeque::new()), rewrite_prompts: Mutex::new(Vec::new()),
-                sent_texts: Mutex::new(Vec::new()), reply_targets: Mutex::new(Vec::new()), offers: Vec::new(),
+                sent_texts: Mutex::new(Vec::new()), reply_targets: Mutex::new(Vec::new()), offers: Vec::new(), labels: Vec::new(),
             }
         }
     }
@@ -4204,7 +4210,7 @@ mod tests {
     fn offer(id: &str) -> crate::mind::expression::Offer {
         let now = Utc::now();
         crate::mind::expression::Offer { id: id.into(), record: crate::store::MediaRecord {
-            hash: format!("{id}rest"), ext: "gif".into(), status: crate::store::MediaStatus::Active, keep: true,
+            hash: format!("{id}rest"), ext: "png".into(), status: crate::store::MediaStatus::Active, keep: true,
             description: "猫瞪着屏幕".into(), text: String::new(), use_when: "对方说了离谱的话".into(), avoid: String::new(),
             tags: vec![], scope: crate::store::StickerScope::Any, scope_reason: String::new(), origin: "telegram:-7".into(),
             first_seen: now, last_seen: now, sightings: 1, sent_count: 0, last_sent: None,
@@ -4222,11 +4228,18 @@ mod tests {
         chat.offers = vec![offer("ab12cd34")];
         a.test_chat = Some(chat);
         a.store.save_media(&offer("ab12cd34").record).unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(4, 4).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let dir = crate::mind::media::media_dir(&a.cfg);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(crate::mind::media::file_path(&dir, "ab12cd34rest", "png"), png.into_inner()).unwrap();
         for text in ["一", "二", "三", "四", "五"] {
             a.on_messages(group_messages(&[text], true)).await.unwrap();
         }
         let chat = a.test_chat.as_ref().unwrap();
-        assert!(chat.turns[0].1.contains("ab12cd34：猫瞪着屏幕（适合：对方说了离谱的话）"), "{}", chat.turns[0].1);
+        assert_eq!(chat.images[0], 1);
+        assert!(chat.labels.iter().any(|label| label == "ab12cd34："), "{:?}", chat.labels);
+        assert!(!chat.turns[0].1.contains("猫瞪着屏幕"), "{}", chat.turns[0].1);
         // A reaction that fails falls back to the emoji as text; an id he was not offered sends nothing.
         assert_eq!(*chat.sent_texts.lock().unwrap(), ["sticker:ab12cd34", "react:128077", "react:128077", "👍", "👍"]);
         let record = a.store.media("ab12cd34rest").unwrap().unwrap();
