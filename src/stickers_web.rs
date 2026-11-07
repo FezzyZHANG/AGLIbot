@@ -1,14 +1,15 @@
 //! `aglibot stickers-web`: the owner's page for reviewing collected stickers. A separate process so
-//! it stays up while the bot restarts, bound to loopback with no login. Edits reach the bot through
+//! it stays up while the bot restarts, open to the local network with no login. Edits reach the bot through
 //! the store; changed text makes the worker rebuild that sticker's vector.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -51,14 +52,14 @@ pub async fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
     let root = std::env::var_os("AGLI_ROOT").map(PathBuf::from).unwrap_or(std::env::current_dir()?);
     let cfg = Config::load(&root)?;
     let store = crate::store::open(&cfg.runtime.mongo, &cfg.data_dir())?;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.with_context(|| format!("binding port {port}"))?;
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.with_context(|| format!("binding port {port}"))?;
     let app = Arc::new(App {
         store, dir: media_dir(&cfg), port,
         llm: LlmClient::new(cfg.models.providers.clone())?,
         embedding: cfg.models.sticker_embedding.clone(),
     });
-    println!("stickers at http://127.0.0.1:{port}");
-    axum::serve(listener, router(app)).await?;
+    println!("stickers at http://0.0.0.0:{port}");
+    axum::serve(listener, router(app).into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
@@ -74,11 +75,26 @@ fn router(app: Shared) -> Router {
         .with_state(app)
 }
 
-/// Loopback is not enough on its own: any web page can reach it. Checking Host stops DNS rebinding,
-/// and the custom header stops cross-site writes.
-async fn guard(State(app): State<Shared>, request: Request, next: Next) -> Response {
+fn local_ip(ip: Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_private()
+}
+
+fn local_peer(peer: IpAddr) -> bool {
+    matches!(peer, IpAddr::V4(ip) if local_ip(ip))
+}
+
+/// A rebinding attack arrives under its own domain name, so only local addresses are accepted.
+fn local_host(host: &str, port: u16) -> bool {
+    let Some((name, given)) = host.rsplit_once(':') else { return false };
+    given.parse() == Ok(port) && (name == "localhost" || name.parse().is_ok_and(local_ip))
+}
+
+/// The network is not enough on its own: any web page a visitor opens can reach it. The peer check
+/// keeps out anything forwarded from outside, Host stops DNS rebinding, and the custom header stops
+/// cross-site writes.
+async fn guard(State(app): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketAddr>, request: Request, next: Next) -> Response {
     let host = request.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or_default();
-    if host != format!("127.0.0.1:{}", app.port) && host != format!("localhost:{}", app.port) {
+    if !local_peer(peer.ip()) || !local_host(host, app.port) {
         return StatusCode::FORBIDDEN.into_response();
     }
     if request.method() != axum::http::Method::GET && !request.headers().contains_key(UI_HEADER) {
@@ -358,7 +374,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let app = Arc::new(App { store: store.clone(), dir: dir.clone(), port, llm: LlmClient::new(Default::default()).unwrap(), embedding: None });
-        tokio::spawn(async move { axum::serve(listener, router(app)).await.unwrap() });
+        tokio::spawn(async move { axum::serve(listener, router(app).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         Running { base: format!("http://127.0.0.1:{port}"), port, store, dir, http }
     }
@@ -384,11 +400,26 @@ mod tests {
         assert_eq!(web.http.patch(&url).json(&change).send().await.unwrap().status(), 403);
         assert_eq!(web.http.get(format!("{}/api/stickers", web.base)).header("host", "evil.example").send().await.unwrap().status(), 403);
         assert_eq!(web.store.media(HASH).unwrap().unwrap().status, MediaStatus::Active);
-        let _ = web.port;
+        for host in ["8.8.8.8", "192.168.1.9.evil.example"] {
+            let response = web.http.get(format!("{}/api/stickers", web.base)).header("host", format!("{host}:{}", web.port)).send().await.unwrap();
+            assert_eq!(response.status(), 403, "{host}");
+        }
+        assert_eq!(web.http.get(format!("{}/api/stickers", web.base)).header("host", "192.168.1.9:1").send().await.unwrap().status(), 403);
+        assert_eq!(web.http.get(format!("{}/api/stickers", web.base)).header("host", format!("192.168.1.9:{}", web.port)).send().await.unwrap().status(), 200);
 
         let response = web.http.patch(&url).header(UI_HEADER, "1").json(&change).send().await.unwrap();
         assert_eq!(response.status(), 200);
         assert_eq!(web.store.media(HASH).unwrap().unwrap().status, MediaStatus::Disabled);
+    }
+
+    #[test]
+    fn only_local_network_peers_are_served() {
+        for peer in ["127.0.0.1", "192.168.1.20", "10.0.0.2", "172.22.96.5"] {
+            assert!(local_peer(peer.parse().unwrap()), "{peer}");
+        }
+        for peer in ["8.8.8.8", "169.254.1.1", "::1", "2001:db8::1"] {
+            assert!(!local_peer(peer.parse().unwrap()), "{peer}");
+        }
     }
 
     #[tokio::test]

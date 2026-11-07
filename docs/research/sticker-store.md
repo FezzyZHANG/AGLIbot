@@ -125,7 +125,7 @@ There is no approval step: stickers go live on collection, and the UI is how the
 | Disable or delete | Disable keeps the hash, so it is never re-collected; delete removes the entry and file. Both work in bulk |
 | Search test | Type a chat line, see the top 5 with scores, the main way to debug retrieval |
 
-**Shape:** a subcommand of the bot's own exe, `aglibot stickers-web`, run as a separate process serving one embedded page on `127.0.0.1:8790`. Host and custom-header checks stop other sites from driving it.
+**Shape:** a subcommand of the bot's own exe, `aglibot stickers-web`, run as a separate process serving one embedded page on port 8790 to this machine and the local network. Peer, Host and custom-header checks stop other sites from driving it.
 
 - **Why not inside the bot:** the bot has no HTTP server today, and a page in the live process would stop at every restart and add a server to the chat process. A separate process stays usable while the bot is down or being deployed.
 - **Why not Moldloft:** it tracks tickets and notes, and its contract keeps it to that.
