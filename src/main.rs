@@ -68,6 +68,9 @@ async fn main() -> Result<()> {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("stickers-web")) {
         return stickers_web::run(std::env::args_os().skip(2)).await;
     }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("stickers-recaption")) {
+        return mind::media::recaption_command(std::env::args_os().skip(2)).await;
+    }
     // start-bot.ps1 sets this so the log shows in the bot's console window and still lands in a file.
     let log_writer = match std::env::var_os("AGLI_LOG_FILE") {
         Some(path) => {

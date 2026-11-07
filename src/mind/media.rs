@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
+use futures_util::{StreamExt, stream};
 use image::ImageFormat;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -35,6 +36,8 @@ const QUEUE: usize = 256;
 /// Long, because this holds up only other images and the relay sometimes stalls for a minute or more.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const INDEX_ENTRIES: usize = 4096;
+/// Descriptions at once in `stickers-recaption`. The bot's own worker stays one at a time.
+const RECAPTION_AT_ONCE: usize = 10;
 const DESCRIPTION_CHARS: usize = 200;
 /// Files of images that did not become stickers are deleted this long after they were last seen.
 const UNUSED_FILE_DAYS: i64 = 7;
@@ -310,6 +313,90 @@ fn status_for(collect: bool, keep: bool) -> MediaStatus {
     }
 }
 
+fn fill_text(record: &mut MediaRecord, caption: &Caption) {
+    record.description = one_line(&caption.description, DESCRIPTION_CHARS);
+    record.text = one_line(&caption.text, DESCRIPTION_CHARS);
+    record.use_when = one_line(&caption.use_when, DESCRIPTION_CHARS);
+    record.avoid = one_line(&caption.avoid, DESCRIPTION_CHARS);
+    record.tags = caption.tags.iter().map(|t| one_line(t, 24)).filter(|t| !t.is_empty()).take(12).collect();
+}
+
+/// `aglibot stickers-recaption [--skip FILE]`: describe every active sticker again with the current
+/// prompt. The running bot rebuilds their vectors, since the text changed. FILE is this command's
+/// earlier output, to resume without paying for what it finished.
+pub async fn recaption_command(args: impl Iterator<Item = std::ffi::OsString>) -> Result<()> {
+    let args: Vec<_> = args.collect();
+    let skip = match args.as_slice() {
+        [] => Vec::new(),
+        [flag, file] if flag == "--skip" => finished_prefixes(&std::fs::read_to_string(file)?),
+        _ => anyhow::bail!("usage: aglibot stickers-recaption [--skip FILE]"),
+    };
+    let root = std::env::var_os("AGLI_ROOT").map(PathBuf::from).unwrap_or(std::env::current_dir()?);
+    let cfg = Config::load(&root)?;
+    let store = crate::store::open(&cfg.runtime.mongo, &cfg.data_dir())?;
+    let models = Models::new(&cfg, store.clone()).await?;
+    let done = recaption_active(store.as_ref(), &models, &media_dir(&cfg), &skip).await?;
+    println!("rewritten {}, left alone because the model would not keep them {:?}, failed {:?}", done.rewritten, done.declined, done.failed);
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct Recaptioned {
+    rewritten: usize,
+    declined: Vec<String>,
+    failed: Vec<String>,
+}
+
+fn finished_prefixes(output: &str) -> Vec<String> {
+    output.lines().filter(|line| !line.contains(" failed: ")).filter_map(|line| line.split_whitespace().next()).map(str::to_string).collect()
+}
+
+/// Failures get one more try at the end, since relay stalls come in bursts.
+async fn recaption_active(store: &dyn Store, models: &Models, dir: &Path, skip: &[String]) -> Result<Recaptioned> {
+    let mut waiting: Vec<String> = store.all_media()?.into_iter()
+        .filter(|r| r.status == MediaStatus::Active && !skip.iter().any(|done| r.hash.starts_with(done.as_str())))
+        .map(|r| r.hash).collect();
+    let mut done = Recaptioned::default();
+    for _ in 0..2 {
+        let mut failed = Vec::new();
+        let mut running = std::pin::pin!(stream::iter(waiting).map(|hash| async move {
+            let result = recaption_one(&hash, store, models, dir).await;
+            (hash, result)
+        }).buffer_unordered(RECAPTION_AT_ONCE));
+        while let Some((hash, result)) = running.next().await {
+            match result {
+                Ok(true) => {
+                    done.rewritten += 1;
+                    println!("{} {}", &hash[..12], store.media(&hash)?.map(|r| r.description).unwrap_or_default());
+                }
+                Ok(false) => done.declined.push(hash),
+                Err(e) => {
+                    println!("{} failed: {e:#}", &hash[..12]);
+                    failed.push(hash);
+                }
+            }
+        }
+        waiting = failed;
+    }
+    done.failed = waiting;
+    Ok(done)
+}
+
+/// Only the model's text changes. Status and scope are decisions the owner may have made, so an
+/// answer that would not keep the image leaves the record as it was, for the owner to look at.
+async fn recaption_one(hash: &str, store: &dyn Store, models: &Models, dir: &Path) -> Result<bool> {
+    if models.budget_exhausted() { anyhow::bail!("daily budget used up"); }
+    let record = store.media(hash)?.ok_or_else(|| anyhow!("record is gone"))?;
+    let bytes = std::fs::read(file_path(dir, &record.hash, &record.ext))?;
+    let caption = describe(&bytes, &ProcessingPolicy::Any, models).await?;
+    if !caption.keep { return Ok(false); }
+    // Read again: the description took a while, and the bot or the page may have changed this.
+    let Some(mut fresh) = store.media(hash)?.filter(|r| r.status == MediaStatus::Active) else { return Ok(true) };
+    fill_text(&mut fresh, &caption);
+    store.save_media(&fresh)?;
+    Ok(true)
+}
+
 async fn describe(bytes: &[u8], policy: &ProcessingPolicy, models: &Models) -> Result<Caption> {
     let owned = bytes.to_vec();
     let frames = tokio::task::spawn_blocking(move || vision::jpeg_frames(&owned)).await??;
@@ -351,16 +438,16 @@ async fn process(job: &MediaJob, handle: &MediaHandle, store: &dyn Store, models
                     return Err(e);
                 }
             };
-            let record = MediaRecord {
+            let mut record = MediaRecord {
                 hash: hash.clone(),
                 ext: ext.into(),
                 status: status_for(job.collect, caption.keep),
                 keep: caption.keep,
-                description: one_line(&caption.description, DESCRIPTION_CHARS),
-                text: one_line(&caption.text, DESCRIPTION_CHARS),
-                use_when: one_line(&caption.use_when, DESCRIPTION_CHARS),
-                avoid: one_line(&caption.avoid, DESCRIPTION_CHARS),
-                tags: caption.tags.iter().map(|t| one_line(t, 24)).filter(|t| !t.is_empty()).take(12).collect(),
+                description: String::new(),
+                text: String::new(),
+                use_when: String::new(),
+                avoid: String::new(),
+                tags: Vec::new(),
                 scope: if caption.scope == "origin" { StickerScope::Origin } else { StickerScope::Any },
                 scope_reason: one_line(&caption.scope_reason, DESCRIPTION_CHARS),
                 origin: job.origin.clone(),
@@ -370,6 +457,7 @@ async fn process(job: &MediaJob, handle: &MediaHandle, store: &dyn Store, models
                 sent_count: 0,
                 last_sent: None,
             };
+            fill_text(&mut record, &caption);
             store.save_media(&record)?;
             info!(hash = %&record.hash[..12], status = ?record.status, chat = %job.origin, "image described");
             record
@@ -523,6 +611,69 @@ mod tests {
         let record = store.media(&hash_of(&png(2))).unwrap().unwrap();
         assert_eq!(record.status, MediaStatus::Rejected);
         assert_eq!(record.sightings, 2);
+    }
+
+    #[tokio::test]
+    async fn recaptioning_changes_only_the_text_of_active_stickers() {
+        let dir = temp("recaption");
+        let store: Arc<dyn Store> = Arc::new(JsonlStore::open(&dir).unwrap());
+        let models = Models::stub(store.clone(), vec![KEEP.into(), REJECT.into()]);
+        let handle = handle(&dir);
+        let job = job(1, "a.png", true);
+        seed(&handle, &job, &png(3));
+        let hash = hash_of(&png(3));
+        let mut record = MediaRecord {
+            hash: hash.clone(), ext: "png".into(), status: MediaStatus::Active, keep: true, description: "旧描述".into(), text: String::new(),
+            use_when: "旧场合".into(), avoid: String::new(), tags: vec!["旧".into()], scope: StickerScope::Any, scope_reason: "主人定的".into(),
+            origin: "qq:group:1".into(), first_seen: Utc::now(), last_seen: Utc::now(), sightings: 5, sent_count: 2, last_sent: None,
+        };
+        store.save_media(&record).unwrap();
+        // Disabled stickers make no model call: a second reply would go unused, a third would panic.
+        record.hash = "disabled".into();
+        record.status = MediaStatus::Disabled;
+        store.save_media(&record).unwrap();
+
+        let done = recaption_active(store.as_ref(), &models, &dir, &[]).await.unwrap();
+        assert_eq!(done.rewritten, 1);
+        let fresh = store.media(&hash).unwrap().unwrap();
+        assert_eq!(fresh.description, "猫瞪着屏幕");
+        assert_eq!(fresh.tags, ["猫"]);
+        assert_eq!((fresh.status, fresh.scope, fresh.sightings, fresh.sent_count), (MediaStatus::Active, StickerScope::Any, 5, 2));
+        assert_eq!(store.media("disabled").unwrap().unwrap().description, "旧描述");
+
+        // The model no longer wants it: the sticker stays as it was and is reported.
+        let done = recaption_active(store.as_ref(), &models, &dir, &[]).await.unwrap();
+        assert_eq!(done.declined, [hash.clone()]);
+        assert_eq!(store.media(&hash).unwrap().unwrap().description, "猫瞪着屏幕");
+    }
+
+    #[test]
+    fn resuming_skips_what_finished_and_retries_what_failed() {
+        let output = "aaaaaaaaaaaa 一只猫
+bbbbbbbbbbbb failed: description timed out
+rewritten 1, left alone";
+        assert_eq!(finished_prefixes(output)[..1], ["aaaaaaaaaaaa"]);
+        assert!(!finished_prefixes(output).contains(&"bbbbbbbbbbbb".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_sticker_whose_file_is_missing_is_reported_not_lost() {
+        let dir = temp("recaption-missing");
+        let store: Arc<dyn Store> = Arc::new(JsonlStore::open(&dir).unwrap());
+        let models = Models::stub(store.clone(), vec![]);
+        let handle = handle(&dir);
+        let job = job(1, "a.png", true);
+        seed(&handle, &job, &png(4));
+        let hash = hash_of(&png(4));
+        std::fs::remove_file(file_path(&dir, &hash, "png")).unwrap();
+        store.save_media(&MediaRecord {
+            hash: hash.clone(), ext: "png".into(), status: MediaStatus::Active, keep: true, description: "旧描述".into(), text: String::new(),
+            use_when: String::new(), avoid: String::new(), tags: Vec::new(), scope: StickerScope::Any, scope_reason: String::new(),
+            origin: "qq:group:1".into(), first_seen: Utc::now(), last_seen: Utc::now(), sightings: 1, sent_count: 0, last_sent: None,
+        }).unwrap();
+        let done = recaption_active(store.as_ref(), &models, &dir, &[]).await.unwrap();
+        assert_eq!(done.failed, [hash.clone()]);
+        assert_eq!(store.media(&hash).unwrap().unwrap().description, "旧描述");
     }
 
     #[tokio::test]

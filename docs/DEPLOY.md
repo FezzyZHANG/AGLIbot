@@ -50,6 +50,8 @@ bot 启动时会在日志里写一行 `release <commit> (<origin>)`。如果正�
 
 `ops/start-stickers-web.ps1 -Runtime <根> [-Port 8790] [-Restart]` 用指针里的 exe 启动 `aglibot stickers-web`，监听所有网卡，只接受本机和局域网（私有地址）的连接，没有登录：同一局域网里的任何人都能查看、修改和删除。局域网访问还需要放行防火墙的这个端口。pid 记在 `<根>/data/logs/stickers-web.json`。它是单独的进程，没有窗口，bot 重启时页面照常可用；`deploy.ps1` 重启 bot 后会一起重启它，机器重启后要手动再跑一次这个脚本。
 
+提示词改了以后，可以在设好 `AGLI_ROOT` 的情况下运行 `aglibot stickers-recaption`，按当前提示词重新描述所有使用中的表情包。它同时跑 10 个描述调用，只改描述类文字，不改状态和范围，并会覆盖页面上手改过的描述。中断后加 `--skip <上次的输出文件>` 可以跳过已完成的。
+
 向量依赖本机的 Ollama：要在运行，并已 `ollama pull bge-m3`，否则向量排队等待，聊天不受影响。
 
 ## config 的两份
