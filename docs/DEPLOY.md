@@ -48,7 +48,7 @@ bot 启动时会在日志里写一行 `release <commit> (<origin>)`。如果正�
 
 ## 表情包页面
 
-`ops/start-stickers-web.ps1 -Runtime <根> [-Port 8790] [-Restart]` 用指针里的 exe 启动 `aglibot stickers-web`，只监听 `127.0.0.1`，没有登录。pid 记在 `<根>/data/logs/stickers-web.json`。它是单独的进程，bot 重启或部署时页面照常可用；`deploy.ps1` 重启 bot 后会一起重启它。
+`ops/start-stickers-web.ps1 -Runtime <根> [-Port 8790] [-Restart]` 用指针里的 exe 启动 `aglibot stickers-web`，只监听 `127.0.0.1`，没有登录。pid 记在 `<根>/data/logs/stickers-web.json`。它是单独的进程，没有窗口，bot 重启时页面照常可用；`deploy.ps1` 重启 bot 后会一起重启它，机器重启后要手动再跑一次这个脚本。
 
 向量依赖本机的 Ollama：要在运行，并已 `ollama pull bge-m3`，否则向量排队等待，聊天不受影响。
 

@@ -22,8 +22,10 @@ $release = Get-Content -Raw -LiteralPath (Join-Path $rt 'data\release.json') | C
 $out = Join-Path $rt 'data\logs\stickers-web.out.log'
 $err = Join-Path $rt 'data\logs\stickers-web.err.log'
 # WMI starts it outside the caller's process tree, so it survives the shell that ran this.
+# Hidden: its output goes to the logs, and closing an empty console window would kill the page.
 $line = "cmd.exe /d /s /c `"set `"AGLI_ROOT=$rt`"&& `"$($release.exe)`" stickers-web --port $Port 1>`"$out`" 2>`"$err`"`""
-$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $line; CurrentDirectory = $rt }
+$hidden = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $line; CurrentDirectory = $rt; ProcessStartupInformation = $hidden }
 if ($r.ReturnValue -ne 0) { throw "Win32_Process.Create failed: $($r.ReturnValue)" }
 
 $page = $null
