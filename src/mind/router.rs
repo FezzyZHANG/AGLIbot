@@ -319,9 +319,9 @@ mod tests {
         // Chat needs vision, and only the Gemini models are confirmed to have it.
         assert!(r.select("chat", &ProcessingPolicy::Any, false).is_err());
         // The pin means no budget fallback or escalation for chat.
-        assert_eq!(full.select("chat", &ProcessingPolicy::Any, false).unwrap().id, "gemini-4-carbon");
+        assert_eq!(full.select("chat", &ProcessingPolicy::Any, false).unwrap().id, "gemini-4-argon");
         assert!(full.select("chat", &ProcessingPolicy::Any, true).is_err());
-        assert!(full.next_stronger("chat", &ProcessingPolicy::Any, "gemini-4-carbon").is_none());
+        assert!(full.next_stronger("chat", &ProcessingPolicy::Any, "gemini-4-argon").is_none());
         assert!(full.select("chat", &ProcessingPolicy::LocalOnly, false).is_err());
     }
 }

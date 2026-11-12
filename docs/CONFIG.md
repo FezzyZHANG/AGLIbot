@@ -38,7 +38,7 @@
 | `models[].fallbacks` | 可空字符串 | 无 | Anthropic 服务端拒答回退参数；不是 AGLI 自己的升级链；当前仅部分模型填写 |
 | `models[].stream` | bool | false | 兼容接口使用 SSE；内部收齐正文后发送，不向渠道转发推理增量 |
 | `models[].enable_thinking` | 可空 bool | 无（不发该参数） | 兼容接口 thinking 参数；场景 effort 为 low 时实际发 false；当前仅部分模型填写 |
-| `models[].reasoning_effort` | bool | false | 兼容接口按场景 effort 发 `reasoning_effort`；场景没填 effort 时不发；当前用于 Gemini 中转的 Carbon |
+| `models[].reasoning_effort` | bool | false | 兼容接口按场景 effort 发 `reasoning_effort`；场景没填 effort 时不发；当前用于 Gemini 中转的 Argon 与 Carbon |
 | `sticker_embedding` | 可空对象 | 无（不建表情包向量） | 字段同 `embedding`，只用到 provider、model、local；和语义召回分开，当前为本地 `bge-m3`，基址用 `127.0.0.1`（`localhost` 在这台机器上每次多 2 秒） |
 | `embedding` | 可空对象 | 无（关闭语义召回） | **可选块，当前未配置**；独立于聊天模型列表 |
 | `embedding.provider` | 字符串 | 块内必填 | 引用 providers，调用时要求 openai_compat |
@@ -76,7 +76,7 @@ embedding:
 | `*.review` | bool | false | 记录设计意图；**不自动接入 judge**，实际审查由调用处显式执行 |
 | `*.budget_exempt` | bool | false | 超预算时仍保留原优先项；当前 verify / act / evolve 为 true |
 | `*.effort` | 可空字符串 | 无 | Anthropic 的 output_config.effort；另外 low 会关闭兼容接口模型显式配置的 thinking |
-| `*.vision` | bool | false | 只路由到 `vision: true` 的模型，固定 `model` 时也检查；当前 `chat` 为 true 并固定到 `gemini-4-carbon`，[看图](../src/mind/vision.rs)把图片直接放进被叫到的那一轮 |
+| `*.vision` | bool | false | 只路由到 `vision: true` 的模型，固定 `model` 时也检查；当前 `chat` 为 true 并固定到 `gemini-4-argon`，[看图](../src/mind/vision.rs)把图片直接放进被叫到的那一轮 |
 
 当前部分场景省略 q_min 以外的可选字段，按上述默认值处理；effort 的字符串不在配置层校验。依据：[Scenario](../src/config.rs)、[router.rs](../src/mind/router.rs)、[llm.rs](../src/mind/llm.rs)、[judge.rs](../src/mind/judge.rs)。
 

@@ -92,9 +92,9 @@ models:
   # c = 人民币价格 / 6.65，单位仍为 USD/M tokens；汇率为 2026-11-02 的近似估值。
   # 汇率参考：https://www.investing.com/currencies/usd-cny-historical-data
   # Flash 输入/输出/缓存读取：¥0.375 / ¥1.875 / ¥0.0375；缓存写入免费。
-  # Carbon 输入/输出/缓存读取：¥1 / ¥5 / ¥0.05（与已下线的 Argon 同价）；未提供独立缓存写入价。
+  # Argon、Carbon 输入/输出/缓存读取：¥1 / ¥5 / ¥0.05（两者同价）；未提供独立缓存写入价。
   # q/l 均为待实测的路由估计。
-  # 2026-11-12 中转下线了 Argon（含 low/medium/high 别名）；Carbon 用 reasoning_effort 控制思考。
+  # 2026-11-12 中转下线了 Argon 的 low/medium/high 别名，基础 gemini-4-argon 仍在；思考档位改用 reasoning_effort。
   # 先使用非流式请求。2026-11-06 五个 Gemini 型号都通过了中转收图实测；
   # chat 要求 vision，目前只有它们可选。其他提供商未实测，实测后再加 vision: true。
   - id: gemini-3.8-flash
@@ -105,6 +105,15 @@ models:
     q: 8.3
     c: { input: 0.056391, cached: 0.005639, output: 0.281955, cache_write: 0 }
     l: 1.0
+  - id: gemini-4-argon
+    provider: gemini_relay
+    model: gemini-4-argon
+    stream: false
+    vision: true
+    reasoning_effort: true   # 2026-11-12 实测：low 正常（~2.5 秒）；medium 连续 524 超时，别用
+    q: 9.5
+    c: { input: 0.150376, cached: 0.007519, output: 0.751880 }
+    l: 3.0
   - id: gemini-4-carbon
     provider: gemini_relay
     model: gemini-4-carbon
@@ -112,7 +121,7 @@ models:
     vision: true
     reasoning_effort: true   # 2026-11-12 实测：low ~160 token/2.5 秒，high 3000+ token；不发则几乎不思考
     q: 9.5
-    c: { input: 0.150376, cached: 0.007519, output: 0.751880 }   # 主人 2026-11-12 确认与 Argon 同价
+    c: { input: 0.150376, cached: 0.007519, output: 0.751880 }   # 主人 2026-11-12 确认与 Argon 同价；主人偏好 Argon，Carbon 留作备选
     l: 3.0
   - id: local
     provider: local
