@@ -55,6 +55,9 @@ pub struct ModelEntry {
     pub stream: bool,
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    /// Forward the scenario's effort as OpenAI-style `reasoning_effort` (compat providers only).
+    #[serde(default)]
+    pub reasoning_effort: bool,
     /// Confirmed to accept image input.
     #[serde(default)]
     pub vision: bool,

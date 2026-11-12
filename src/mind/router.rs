@@ -149,6 +149,7 @@ mod tests {
             fallbacks: None,
             stream: false,
             enable_thinking: None,
+            reasoning_effort: false,
             vision: false,
         }
     }

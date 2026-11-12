@@ -125,6 +125,10 @@ pub fn openai_body(m: &ModelEntry, p: &Prompt<'_>) -> Value {
     if let Some(thinking) = m.enable_thinking {
         body["enable_thinking"] = json!(thinking && p.effort != Some("low"));
     }
+    // Relays that take `reasoning_effort` (the Gemini one) get the scenario's level directly.
+    if let (true, Some(effort)) = (m.reasoning_effort, p.effort) {
+        body["reasoning_effort"] = json!(effort);
+    }
     body
 }
 
@@ -392,6 +396,7 @@ mod tests {
             fallbacks: fallbacks.map(String::from),
             stream: false,
             enable_thinking: None,
+            reasoning_effort: false,
             vision: false,
         }
     }
@@ -486,6 +491,17 @@ mod tests {
         assert_eq!(deep["enable_thinking"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert!(body.get("output_config").is_none());
+        assert!(body.get("reasoning_effort").is_none(), "only sent when the model opts in");
+    }
+
+    #[test]
+    fn reasoning_effort_follows_the_scenario_when_the_model_opts_in() {
+        let mut m = model(None);
+        m.reasoning_effort = true;
+        let prompt = Prompt { l1: "system", l2: "", turns: &[], effort: Some("low") };
+        assert_eq!(openai_body(&m, &prompt)["reasoning_effort"], "low");
+        assert!(openai_body(&m, &Prompt { effort: None, ..prompt }).get("reasoning_effort").is_none());
+        assert!(openai_body(&m, &prompt).get("enable_thinking").is_none());
     }
 
     #[test]

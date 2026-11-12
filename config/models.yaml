@@ -137,6 +137,15 @@ models:
     q: 9.5
     c: { input: 0.150376, cached: 0.007519, output: 0.751880 }
     l: 3.0
+  - id: gemini-4-carbon
+    provider: gemini_relay
+    model: gemini-4-carbon
+    stream: false
+    vision: true
+    reasoning_effort: true   # 2026-11-12 实测：low ~160 token/2.5 秒，high 3000+ token；不发则几乎不思考
+    q: 9.5
+    c: { input: 0.150376, cached: 0.007519, output: 0.751880 }   # 暂按 Argon 价，待主人确认
+    l: 3.0
   - id: local
     provider: local
     model: qwen3:8b

@@ -38,6 +38,7 @@
 | `models[].fallbacks` | 可空字符串 | 无 | Anthropic 服务端拒答回退参数；不是 AGLI 自己的升级链；当前仅部分模型填写 |
 | `models[].stream` | bool | false | 兼容接口使用 SSE；内部收齐正文后发送，不向渠道转发推理增量 |
 | `models[].enable_thinking` | 可空 bool | 无（不发该参数） | 兼容接口 thinking 参数；场景 effort 为 low 时实际发 false；当前仅部分模型填写 |
+| `models[].reasoning_effort` | bool | false | 兼容接口按场景 effort 发 `reasoning_effort`；场景没填 effort 时不发；当前用于 Gemini 中转的 Carbon |
 | `sticker_embedding` | 可空对象 | 无（不建表情包向量） | 字段同 `embedding`，只用到 provider、model、local；和语义召回分开，当前为本地 `bge-m3`，基址用 `127.0.0.1`（`localhost` 在这台机器上每次多 2 秒） |
 | `embedding` | 可空对象 | 无（关闭语义召回） | **可选块，当前未配置**；独立于聊天模型列表 |
 | `embedding.provider` | 字符串 | 块内必填 | 引用 providers，调用时要求 openai_compat |
