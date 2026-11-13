@@ -368,6 +368,12 @@ fn resolve_mentions(pieces: &mut [ReplyPiece], ctx: &ChatCtx, speakers: &[String
 /// The formatter's answer for "send the draft as it is".
 const KEEP_DRAFT: &str = "[原样]";
 
+/// What the chat shows today: neither QQ nor Telegram renders Markdown, so it arrives as raw
+/// characters. Image-rendered replies will be a second surface beside this one.
+const PLAIN_TEXT: &str = "现在是纯文字模式：对方看到的就是你打出来的字符，Markdown 不会被渲染。\
+不要用 **粗体**、# 标题、- 或 1. 开头的列表、`反引号`、代码块、表格；要强调就换个说法，要分点就用短句分行，\
+编号、命令、链接直接写出来。";
+
 /// A lone `[…]` the formatter may answer with instead of a message; never sent as text.
 fn bare_token(text: &str) -> bool {
     text.starts_with('[') && text.ends_with(']') && text.chars().count() <= 8 && !text[1..].contains('[')
@@ -1646,8 +1652,9 @@ impl Agli {
         let quit = if may_quit { "改主意不想发了，就只回复 [不发]。" } else { "这条必须发出，不能取消。" };
         let prompt = format!(
             "（系统：这是发出前的最后一步。把你刚才那条回复整理成最终要发的消息，只输出正文，不解释。\
+             {PLAIN_TEXT}\
              要求：像聊天打字那样自然；{length}；可以用空行分成几条消息；保留 <提及>名字</提及>，别写其他标记。\
-             原文已经合适就只回复 [原样]。{quit}）"
+             原文已经合适（包括没有 Markdown）就只回复 [原样]。{quit}）"
         );
         let mut pieces = match self.step(ctx, policy, prompt, Vec::new(), KEEP_DRAFT).await {
             Ok(raw) => match raw.trim() {
@@ -3310,7 +3317,7 @@ mod tests {
             let out = a.format_reply(&ctx, false, may_quit, &ProcessingPolicy::Any, draft()).await;
             assert_eq!(out.as_deref().map(reply_text).as_deref(), expected, "{answer:?} may_quit={may_quit}");
             let prompt = &a.test_chat.as_ref().unwrap().step_prompts.lock().unwrap()[0].1;
-            assert!(prompt.contains("[原样]"), "{prompt}");
+            assert!(prompt.contains("[原样]") && prompt.contains("纯文字模式"), "{prompt}");
             assert_eq!(prompt.contains("[不发]"), may_quit, "{prompt}");
         }
     }
