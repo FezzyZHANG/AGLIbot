@@ -151,6 +151,48 @@ impl Speaker {
             }
         }
     }
+
+    /// Where the reply just drafted by `say` sits in the chat's session, for `settle`.
+    pub fn draft_at(&self, key: &str) -> Option<usize> {
+        self.sessions.get(key).and_then(|s| s.turns.len().checked_sub(1))
+    }
+
+    /// One more exchange on the open session after a draft (sticker pick, formatting). It never
+    /// rotates the session, so the prefix up to the draft is the one the provider just cached.
+    /// `parts` go with this request only.
+    pub async fn follow(&mut self, models: &Models, key: &str, policy: &ProcessingPolicy, text: String, parts: Vec<Part>) -> Result<String> {
+        let session = self.sessions.get_mut(key).ok_or_else(|| anyhow!("no open session to follow up in {key}"))?;
+        session.turns.push(if parts.is_empty() {
+            Turn::User(text)
+        } else {
+            let mut all = vec![Part::Text(text)];
+            all.extend(parts);
+            Turn::UserParts(all)
+        });
+        let effort = models.effort(SCENARIO);
+        let prompt = Prompt { l1: &self.l1, l2: &session.l2, turns: &session.turns, effort: effort.as_deref() };
+        match models.run(SCENARIO, policy, &session.model_id, &prompt, &session.id).await {
+            Ok((reply, used)) => {
+                session.model_id = used;
+                session.forget_parts(1);
+                session.turns.push(Turn::Assistant { text: reply.text.clone(), raw: reply.raw });
+                Ok(reply.text)
+            }
+            Err(e) => {
+                session.turns.pop();
+                Err(e)
+            }
+        }
+    }
+
+    /// Replace the draft at `at` and every step after it with what was actually sent, so later
+    /// turns see his real words and none of the scaffolding.
+    pub fn settle(&mut self, key: &str, at: usize, said: String) {
+        let Some(session) = self.sessions.get_mut(key) else { return };
+        if at >= session.turns.len() || !matches!(session.turns[at], Turn::Assistant { .. }) { return }
+        session.turns.truncate(at);
+        session.turns.push(Turn::Assistant { text: said, raw: None });
+    }
 }
 
 #[cfg(test)]
@@ -186,6 +228,28 @@ mod tests {
         s.turns.push(Turn::UserParts(parts()));
         s.forget_parts(1);
         assert!(matches!(s.turns.last(), Some(Turn::User(text)) if text == "看"));
+    }
+
+    #[test]
+    fn settling_replaces_the_draft_and_its_steps_with_what_was_sent() {
+        let mut s = Speaker::new(String::new(), SessionCfg {
+            max_turns: 20, idle_minutes: 30, recap_messages: 10, debounce: Default::default(),
+        });
+        let mut session = session();
+        session.turns.push(Turn::Assistant { text: "draft".into(), raw: Some(serde_json::json!(["draft"])) });
+        s.sessions.insert("group".into(), session);
+        let at = s.draft_at("group").unwrap();
+        assert_eq!(at, 1);
+        let turns = &mut s.sessions.get_mut("group").unwrap().turns;
+        turns.push(Turn::User("format it".into()));
+        turns.push(Turn::Assistant { text: "formatted".into(), raw: None });
+        s.settle("group", at, "sent".into());
+        let turns = &s.sessions["group"].turns;
+        assert_eq!(turns.len(), 2);
+        assert!(matches!(&turns[1], Turn::Assistant { text, raw: None } if text == "sent"));
+        // A stale position never cuts into a user turn.
+        s.settle("group", 0, "nope".into());
+        assert_eq!(s.sessions["group"].turns.len(), 2);
     }
 
     #[test]

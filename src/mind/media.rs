@@ -56,26 +56,46 @@ use_when：keep 时写什么场合发合适；\
 avoid：keep 时写什么场合不该发；\
 tags：keep 时写几个检索用的短词；\
 scope：keep 时填 any 或 origin。any 表示通用，哪里都能发；origin 表示只适合原来的群，比如群内梗或群友的脸；\
-scope_reason：一句话说明 scope 的理由。";
+scope_reason：一句话说明 scope 的理由。\
+keep 为 false 时，use_when、avoid、scope、scope_reason 写空字符串，tags 写空数组；任何字段都不要写 null。\
+图看不清、打不开或是空白，就 description 写“看不清”，keep 写 false。";
 
+/// Fields that do not apply come back as `null`, `false` or missing; each is read as empty rather
+/// than losing the whole caption.
 #[derive(Debug, Deserialize)]
 struct Caption {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     description: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     text: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     keep: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     use_when: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     avoid: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_tags")]
     tags: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     scope: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     scope_reason: String,
+}
+
+/// The value when it has the expected type, the default otherwise.
+fn lenient<'de, D, T>(de: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(de)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// Tags that are strings; anything else in the list, or no list, is dropped.
+fn lenient_tags<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<String>, D::Error> {
+    let value = serde_json::Value::deserialize(de)?;
+    Ok(value.as_array().map(|tags| tags.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default())
 }
 
 /// One image in one inbound message.
@@ -526,6 +546,19 @@ pub fn caption_parts(frames: Vec<String>) -> Vec<Part> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn captions_survive_null_and_mistyped_fields() {
+        let caption: super::Caption = serde_json::from_str(r#"{
+            "description": "一张聊天截图", "text": null, "keep": false,
+            "use_when": null, "avoid": null, "tags": [null, "截图", 3], "scope": false, "scope_reason": null
+        }"#).unwrap();
+        assert_eq!(caption.description, "一张聊天截图");
+        assert!(!caption.keep && caption.text.is_empty() && caption.use_when.is_empty() && caption.scope.is_empty());
+        assert_eq!(caption.tags, ["截图"]);
+        let caption: super::Caption = serde_json::from_str(r#"{"description": "猫", "keep": null, "tags": null}"#).unwrap();
+        assert!(!caption.keep && caption.tags.is_empty());
+    }
+
     use std::io::Cursor;
 
     use image::{DynamicImage, RgbaImage};

@@ -319,7 +319,7 @@ impl LlmClient {
                 let base = provider_base_url(provider).unwrap_or_else(|| "https://api.anthropic.com".into());
                 let mut req = self
                     .http
-                    .post(format!("{}/v1/messages", base.trim_end_matches('/')))
+                    .post(messages_url(&base))
                     .header("anthropic-version", ANTHROPIC_VERSION)
                     .json(&anthropic_body(m, p));
                 if let Some(key) = &key {
@@ -355,6 +355,13 @@ impl LlmClient {
     }
 }
 
+/// Messages endpoint for a base URL with or without the `/v1` an OpenAI-style base carries,
+/// so one relay URL serves both kinds.
+fn messages_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    format!("{}/v1/messages", base.strip_suffix("/v1").unwrap_or(base))
+}
+
 async fn send_json(req: reqwest::RequestBuilder) -> Result<Value> {
     serde_json::from_str(&send_text(req).await?).context("response is not JSON")
 }
@@ -382,6 +389,13 @@ async fn send_text(req: reqwest::RequestBuilder) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn messages_url_accepts_bases_with_or_without_v1() {
+        for base in ["https://relay.test", "https://relay.test/", "https://relay.test/v1", "https://relay.test/v1/"] {
+            assert_eq!(messages_url(base), "https://relay.test/v1/messages", "{base}");
+        }
+    }
     use crate::config::Price;
 
     fn model(fallbacks: Option<&str>) -> ModelEntry {
