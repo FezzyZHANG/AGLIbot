@@ -23,7 +23,7 @@ providers:
     base_url_env: BAILIAN_BASE_URL_OAI
     api_key_env: BAILIAN_API_KEY
   gemini_relay:
-    kind: openai_compat
+    kind: anthropic   # 2026-11-13 改走 /v1/messages；中转同样支持图片和 output_config.effort
     base_url_env: GEMINI_RELAY_BASE_URL
     api_key_env: GEMINI_RELAY_API_KEY
   local:
