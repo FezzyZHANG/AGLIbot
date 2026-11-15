@@ -311,7 +311,10 @@ mod tests {
         let r = Router::new(models, cfg.scenarios);
         // `evolve` is owner-triggered and falls back to owner review, so it may need a non-bailian model.
         assert!(full.select("evolve", &ProcessingPolicy::Any, false).is_ok());
-        for name in r.scenarios.keys().filter(|n| *n != "evolve" && *n != "chat" && *n != "caption") {
+        // `format` is pinned to DeepSeek Flash on bailian, so no budget fallback either.
+        assert_eq!(r.select("format", &ProcessingPolicy::Any, false).unwrap().id, "bailian-deepseek-flash");
+        assert!(r.select("format", &ProcessingPolicy::Any, true).is_err());
+        for name in r.scenarios.keys().filter(|n| !["evolve", "chat", "caption", "format"].contains(&n.as_str())) {
             for exhausted in [false, true] {
                 assert_eq!(r.select(name, &ProcessingPolicy::Any, exhausted).unwrap().provider, "bailian");
             }

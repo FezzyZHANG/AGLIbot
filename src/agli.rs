@@ -367,6 +367,8 @@ fn resolve_mentions(pieces: &mut [ReplyPiece], ctx: &ChatCtx, speakers: &[String
 
 /// The formatter's answer for "send the draft as it is".
 const KEEP_DRAFT: &str = "[原样]";
+/// The scenario the formatter runs on (config/scenarios.yaml).
+const FORMAT_SCENARIO: &str = "format";
 
 /// What the chat shows today: neither QQ nor Telegram renders Markdown, so it arrives as raw
 /// characters. Image-rendered replies will be a second surface beside this one.
@@ -1616,6 +1618,18 @@ impl Agli {
         self.speaker.follow(&self.models, &ctx.key, policy, prompt, parts).await
     }
 
+    /// The formatter's standalone call on the `format` scenario. Tests answer from `steps`, and an
+    /// unscripted call keeps the draft.
+    async fn format_call(&mut self, policy: &ProcessingPolicy, prompt: String) -> Result<String> {
+        #[cfg(test)]
+        if let Some(test) = &self.test_chat {
+            test.step_prompts.lock().unwrap().push((policy.clone(), prompt));
+            test.step_images.lock().unwrap().push(0);
+            return test.steps.lock().unwrap().pop_front().unwrap_or_else(|| Ok(KEEP_DRAFT.to_string()));
+        }
+        self.models.ask_once(FORMAT_SCENARIO, policy, "", &prompt).await
+    }
+
     /// He asked for a sticker: search by his own words and let him pick one, or none.
     async fn pick_sticker(&mut self, ctx: &ChatCtx, policy: &ProcessingPolicy, wish: &str) -> Option<crate::mind::expression::Offer> {
         let offers = self.sticker_offers(ctx, wish).await;
@@ -1638,25 +1652,28 @@ impl Agli {
         found
     }
 
-    /// The formatter: every reply with text goes back to him once as the message about to be sent,
-    /// in the same session, so he still sees the chat and any images. Only `<提及>` survives from
-    /// what he writes here; markers he adds are not acted on. In groups the length cap is his to
-    /// meet, and truncation is only the last resort.
-    /// `None` when he took the reply back, which only a turn that allowed silence (`may_quit`) can.
+    /// The formatter: every reply with text is passed once, as the message about to be sent, to the
+    /// `format` scenario's model in a standalone call (not the chat session; it sees only the
+    /// draft). Only `<提及>` survives from what it writes; markers it adds are not acted on. In
+    /// groups the length cap is its to meet, and truncation is only the last resort.
+    /// `None` when the reply was taken back, which only a turn that allowed silence (`may_quit`) can.
     async fn format_reply(&mut self, ctx: &ChatCtx, unsolicited: bool, may_quit: bool, policy: &ProcessingPolicy, pieces: Vec<ReplyPiece>) -> Option<Vec<ReplyPiece>> {
         let cap = ctx.is_group.then(|| if unsolicited { self.cfg.social.interjection_max } else { self.cfg.social.group_reply_max });
         let length = match cap {
             Some(cap) => format!("不超过 {cap} 字（汉字每字计 1，其他连续字母或数字计 1，标点不计），超了就只留最要紧的话，不加新内容"),
             None => "长短保持原意，不加新内容".to_string(),
         };
-        let quit = if may_quit { "改主意不想发了，就只回复 [不发]。" } else { "这条必须发出，不能取消。" };
+        let quit = if may_quit { "觉得这条其实不该发，就只回复 [不发]。" } else { "这条必须发出，不能取消。" };
         let prompt = format!(
-            "（系统：这是发出前的最后一步。把你刚才那条回复整理成最终要发的消息，只输出正文，不解释。\
+            "下面 <草稿> 里是一个聊天机器人马上要在{where_}发出的消息。把它整理成最终要发的消息，只输出正文，不解释。\
              {PLAIN_TEXT}\
-             要求：像聊天打字那样自然；{length}；可以用空行分成几条消息；保留 <提及>名字</提及>，别写其他标记。\
-             原文已经合适（包括没有 Markdown）就只回复 [原样]。{quit}）"
+             要求：保持原来的语气、人称和意思，像聊天打字那样自然；{length}；可以用空行分成几条消息；\
+             原样保留 <提及>名字</提及>，别写其他标记。\
+             原文已经合适（包括没有 Markdown）就只回复 [原样]。{quit}\n\n<草稿>\n{draft}\n</草稿>",
+            where_ = if ctx.is_group { "群聊里" } else { "私聊里" },
+            draft = markup(&pieces),
         );
-        let mut pieces = match self.step(ctx, policy, prompt, Vec::new(), KEEP_DRAFT).await {
+        let mut pieces = match self.format_call(policy, prompt).await {
             Ok(raw) => match raw.trim() {
                 "" | KEEP_DRAFT => pieces,
                 "[不发]" | "[沉默]" if may_quit => {
