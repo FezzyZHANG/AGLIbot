@@ -65,7 +65,9 @@ impl Telegram {
                         }
                     }
                 }
+                Err(_) if tx.is_closed() => return,
                 Err(e) => {
+                    crate::error_report::report(crate::error_report::Fault::TelegramPoll);
                     tracing::warn!("telegram poll failed: {e:#}");
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }

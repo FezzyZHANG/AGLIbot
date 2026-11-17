@@ -351,8 +351,8 @@ impl Models {
         user: &str,
         limit: Option<SpendLimit>,
     ) -> Result<T> {
-        if let Some(limit) = limit {
-            anyhow::ensure!(!limit.exhausted(self.store.as_ref())?, "read-only reflection cost budget exhausted");
+        if let Some(limit) = limit && limit.exhausted(self.store.as_ref())? {
+            return Err(super::router::BudgetDenied("read-only reflection cost budget exhausted".into()).into());
         }
         #[cfg(test)]
         if self.stub.is_some() {

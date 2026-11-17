@@ -269,6 +269,20 @@ ID 的非空环境内容必须能解析为 i64，否则加载失败。`owner.tel
 
 Telegram token 从固定变量 TELEGRAM_BOT_TOKEN 读取；无 token 或初始化失败则不启用该渠道。两条渠道都不可用时程序退出。Telegram 代理作用于其 HTTP 客户端，不是模型客户端的代理配置。`telegram.proxy`、`qq.url`、`qq.token` 是内部解析字段，不能在 YAML 中直接赋值。依据：[main.rs](../src/main.rs)、[telegram.rs](../src/channels/telegram.rs)、[qq.rs](../src/channels/qq.rs)。
 
+## Telegram 运行通知
+
+主人的 Telegram 私聊是固定收件处。启动时读取 `acl.owner.telegram_user_id_env` 指定的用户 ID（仓库默认 `OWNER_TELEGRAM_ID`），并使用现有的 `TELEGRAM_BOT_TOKEN` 和 Telegram 代理。机器人须能向该私聊发送消息。即使主人最近使用 QQ 或机器人处于冻结状态，通知仍走 Telegram。
+
+| 代码 | 说明 |
+|---|---|
+| E1001–E1005 | 依次对应启动配置、数据存储、模型初始化、机器人运行状态初始化、无可用聊天渠道 |
+| E2001–E2004 | Telegram 身份验证、Telegram 收消息、QQ 连接、聊天消息投递 |
+| E3001–E3005 | 生成聊天回复、网页读取、文件读取、任务执行、审查模型调用。E3005 对应的事项会转交主人审查 |
+| E4001–E4004 | 运行事件处理、运行状态保存、后台作业、进化重启 |
+| S1001 / S1002 | 已冻结 / 已解冻。冻结保留日常聊天，解冻后恢复正常调度 |
+
+通知中有可直接发送的 `/freeze`、`/unfreeze` 命令。故障发生时先记本机日志，再由独立队列向主人发送固定的中文描述。同码 60 秒内合并，冻结、解冻的实际状态切换逐次通知。Telegram 暂不可达或投递结果不确定时，本机日志记录未确认投递；主人 ID 或通知通道无法解析时只能通过本机日志排查。
+
 ## tools.yaml（可选文件，全部需重启；#16）
 
 **当前文件不存在。** 由 [flow_metrics.rs](../src/mind/flow_metrics.rs) 独立加载，而非 Config::load。它只描述服务商缓存策略，用于心流恢复时的 debug 提示；不会修改请求 TTL、预热缓存、改变路由，也不会按 min_tokens 拒绝调用。

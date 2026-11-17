@@ -84,6 +84,7 @@ pub async fn run(job: Job) -> Outcome {
                     Err(error) => job.log(&format!("恢复核实审查项保存失败：{error:#}")),
                 }
             }
+            crate::error_report::report(crate::error_report::Fault::TaskExecution);
             job.log(&format!("失败：{e:#}"));
             Outcome {
                 task_id: job.task.id.clone(),

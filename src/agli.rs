@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use crate::error_report::{Fault, OwnerState, notify_state, report};
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -43,6 +44,11 @@ use crate::work::research::{self, Job};
 
 mod evolution;
 mod reading;
+
+// Report once, where the actor consumes the error. More specific operations attach a fault as context.
+fn report_error(error: &anyhow::Error, fallback: Fault) {
+    report(error.downcast_ref::<Fault>().copied().unwrap_or(fallback));
+}
 
 pub enum Event {
     Inbound(Envelope),
@@ -746,6 +752,7 @@ impl Agli {
     pub async fn handle(&mut self, ev: WorkItem) {
         // Startup clears interrupted focus; drain before another event can start a new task.
         if let Err(e) = self.catch_up_focus().await {
+            report_error(&e, Fault::Background);
             warn!("focus catch-up failed: {e:#}");
         }
         let result = match ev {
@@ -754,15 +761,19 @@ impl Agli {
             WorkItem::JobDone(o) => self.on_job_done(o).await,
         };
         if let Err(e) = result {
+            report_error(&e, Fault::EventHandling);
             error!("{e:#}");
         }
         if let Err(e) = self.catch_up_focus().await {
+            report_error(&e, Fault::Background);
             warn!("focus catch-up failed: {e:#}");
         }
         if let Err(e) = self.push_urgent().await {
+            report_error(&e, Fault::Background);
             warn!("urgent review delivery failed: {e:#}");
         }
         if let Err(e) = self.state.save(&self.cfg.data_dir()).and_then(|_| self.flow.save(&self.cfg.data_dir())) {
+            report_error(&e, Fault::StateSave);
             warn!("saving state failed: {e:#}");
         }
     }
@@ -785,7 +796,10 @@ impl Agli {
             };
             let mut batch = ReplyBatch { busy_reply, ..ReplyBatch::default() };
             for env in messages {
-                if let Err(e) = self.on_message(env, &mut batch, None).await { error!("{e:#}"); }
+                if let Err(e) = self.on_message(env, &mut batch, None).await {
+                    report_error(&e, Fault::EventHandling);
+                    error!("{e:#}");
+                }
             }
             return batch;
         }
@@ -912,6 +926,7 @@ impl Agli {
         let mut batch = ReplyBatch::default();
         for env in messages {
             if let Err(e) = self.on_message(env, &mut batch, flow_ns.as_ref()).await {
+                report_error(&e, Fault::EventHandling);
                 error!("{e:#}");
             }
         }
@@ -1226,7 +1241,10 @@ impl Agli {
                     self.store.kv_set(OVERNIGHT_CHATS, json!(remaining))?;
                 }
                 Ok(false) => {}
-                Err(e) => warn!("overnight catch-up in {}:{} failed: {e:#}", chat.platform, chat.chat_id),
+                Err(e) => {
+                    report_error(&e, Fault::Background);
+                    warn!("overnight catch-up in {}:{} failed: {e:#}", chat.platform, chat.chat_id);
+                }
             }
         }
         Ok(())
@@ -1485,16 +1503,17 @@ impl Agli {
         };
         // A failed generation has already popped its user turn. The last draft then belongs to an earlier reply.
         let draft_at = if response.is_ok() { self.speaker.draft_at(&ctx.key) } else { None };
+        if response.is_err() && !read_errors.is_empty() { report(Fault::ChatReply); }
         let raw = match response {
             _ if !read_errors.is_empty() && !readable_text && !readable_pixels => String::new(),
             Ok(r) => r,
             Err(_) if !read_errors.is_empty() => String::new(),
             Err(e) => {
                 error!("reply failed: {e:#}");
-                if !ctx.is_group {
-                    let _ = self.outlets.send(ctx.platform, &ctx.chat_id, "（刚才走神了，你再说一遍？）").await;
+                if !ctx.is_group && self.outlets.send(ctx.platform, &ctx.chat_id, "（刚才走神了，你再说一遍？）").await.is_err() {
+                    report(Fault::Delivery);
                 }
-                return Err(e);
+                return Err(e.context(Fault::ChatReply));
             }
         };
         let raw = watchlist::accept_reply(self.store.as_ref(), &self.cfg.mind_dir(), &raw, ctx.owner_private(), &ctx.key, now)?;
@@ -1586,13 +1605,18 @@ impl Agli {
         if unsolicited {
             self.audit("me", "group_chime_in", true, &ctx.key, outcome)?;
         }
-        anyhow::ensure!(outcome == Outcome::Sent, "reply delivery in {}: {outcome:?}", ctx.key);
+        if outcome != Outcome::Sent {
+            return Err(anyhow::anyhow!("reply delivery in {}: {outcome:?}", ctx.key).context(Fault::Delivery));
+        }
         if let Some(offer) = &sticker {
             // Text already went out, so its record below still matters; a lone sticker has nothing to keep.
             match self.send_sticker(ctx, offer).await {
                 Ok(()) => stored.push(format!("[表情包：{}]", offer.record.description)),
-                Err(e) if intent.text.is_empty() && stored.is_empty() => return Err(e),
-                Err(e) => error!("sticker not sent in {}: {e:#}", ctx.key),
+                Err(e) if intent.text.is_empty() && stored.is_empty() => return Err(e.context(Fault::Delivery)),
+                Err(e) => {
+                    report(Fault::Delivery);
+                    error!("sticker not sent in {}: {e:#}", ctx.key);
+                }
             }
         }
         if !intent.text.is_empty() { stored.insert(0, intent.text.clone()); }
@@ -1807,10 +1831,12 @@ impl Agli {
         if let Some(test) = &self.test_chat {
             test.sent_texts.lock().unwrap().push(text.to_string());
             let outcome = test.sends.lock().unwrap().pop_front().expect("unexpected plain send");
-            anyhow::ensure!(outcome == Outcome::Sent, "plain delivery: {outcome:?}");
+            if outcome != Outcome::Sent {
+                return Err(anyhow::anyhow!("plain delivery: {outcome:?}").context(Fault::Delivery));
+            }
             return Ok(());
         }
-        self.outlets.send(ctx.platform, &ctx.chat_id, text).await
+        self.outlets.send(ctx.platform, &ctx.chat_id, text).await.context(Fault::Delivery)
     }
 
     fn audit(&self, requester: &str, tool: &str, allowed: bool, reason: &str, outcome: Outcome) -> Result<()> {
@@ -1926,22 +1952,21 @@ impl Agli {
                     _ => if evolution { "已停下进化检查或提交；记录已保留，未自动重试。".into() } else { "现在没在做任务。".into() },
                 }
             }
-            "/freeze" => {
-                self.store.kv_set("frozen", json!(true))?;
-                self.stop_evolution().await?;
-                let ids = self.stop_jobs().await;
-                if !ids.is_empty() {
-                    for id in &ids { self.board().set_status(id, TaskStatus::Waiting, "冻结")?; }
-                    if self.cfg.runtime.hands.max_jobs == 1 || self.flow.task_id.as_ref().is_some_and(|id| ids.contains(id)) {
-                        self.exit_flow();
-                    }
-                    self.catch_up_focus().await?;
+            "/freeze" | "/unfreeze" => {
+                anyhow::ensure!(ctx.owner_private(), "仅主人私聊可以更改冻结状态");
+                let freeze = cmd == "/freeze";
+                let state = if freeze { OwnerState::Frozen } else { OwnerState::Unfrozen };
+                let before = self.store.kv_get("frozen").inspect_err(|_| report(Fault::StateSave))?.and_then(|v| v.as_bool()).unwrap_or(false);
+                if before != freeze {
+                    self.store.kv_set("frozen", json!(freeze)).inspect_err(|_| report(Fault::StateSave))?;
+                    if ctx.platform != "telegram" { notify_state(state); }
                 }
-                "已冻结：不再主动找人、不开始任务、不动用工具。聊天照常。".into()
-            }
-            "/unfreeze" => {
-                self.store.kv_set("frozen", json!(false))?;
-                "已解冻。".into()
+                if freeze && let Err(e) = self.stop_for_freeze().await {
+                    report_error(&e, Fault::Background);
+                    warn!("freeze cleanup failed: {e:#}");
+                    return Ok(format!("{}\n停止任务或保存收尾记录时出错。", state.message()));
+                }
+                state.message().into()
             }
             "/digest" => judge::digest(self.store.as_ref())?.unwrap_or_else(|| "没有待你决定的事。".into()),
             "/approve" | "/reject" => {
@@ -2150,6 +2175,19 @@ impl Agli {
         Some(job.id)
     }
 
+    async fn stop_for_freeze(&mut self) -> Result<()> {
+        let evolution = self.stop_evolution().await;
+        let ids = self.stop_jobs().await;
+        if !ids.is_empty() {
+            for id in &ids { self.board().set_status(id, TaskStatus::Waiting, "冻结")?; }
+            if self.cfg.runtime.hands.max_jobs == 1 || self.flow.task_id.as_ref().is_some_and(|id| ids.contains(id)) {
+                self.exit_flow();
+            }
+            self.catch_up_focus().await?;
+        }
+        evolution.map(|_| ())
+    }
+
     async fn stop_jobs(&mut self) -> Vec<String> {
         let ids: Vec<_> = self.jobs.keys().cloned().collect();
         let mut stopped = Vec::new();
@@ -2309,6 +2347,7 @@ impl Agli {
             let outcome = match self.outlets.send(ctx.platform, &ctx.chat_id, &text).await {
                 Ok(()) => Outcome::Sent,
                 Err(e) => {
+                    report(Fault::Delivery);
                     error!("digest send failed: {e:#}");
                     Outcome::Failed
                 }
@@ -2328,6 +2367,7 @@ impl Agli {
                     Outcome::Sent
                 }
                 Err(e) => {
+                    report(Fault::Delivery);
                     warn!(id = item.id, "urgent review send failed: {e:#}");
                     Outcome::Unknown
                 }
@@ -2381,10 +2421,12 @@ impl Agli {
             info!("journal written: {}", path.display());
         }
         if let Err(e) = crate::mind::reciprocity::nightly(&self.models, self.store.as_ref(), &mut self.people, date, Utc::now()).await {
+            report_error(&e, Fault::Background);
             warn!("nightly reciprocity failed: {e:#}");
         }
         if let Err(e) = crate::social::cards::nightly(self.store.as_ref(), &self.cfg.data_dir(),
             &self.cfg.acl.owner.person_id, &self.cfg.acl.known_agents) {
+            report_error(&e, Fault::Background);
             warn!("nightly person cards failed: {e:#}");
         }
         match crate::mind::growth::weekly(&self.models, &self.cfg.mind_dir(), date, self.cfg.runtime.memory.weekly_weekday).await {
@@ -2394,12 +2436,14 @@ impl Agli {
         }
         if let Err(e) = crate::mind::probes::weekly(&self.models, self.store.as_ref(), &self.cfg.mind_dir(),
             &self.cfg.data_dir(), date, self.cfg.runtime.memory.weekly_weekday, self.speaker.l1()).await {
+            report_error(&e, Fault::Background);
             warn!("weekly persona probes failed: {e:#}");
         }
         // Archiving is housekeeping: a failure must not make the whole nightly pass (journal
         // included) rerun on every tick.
         if let Err(e) = reflect::archive_nightly(&self.models, self.store.as_ref(), &self.cfg.runtime.memory,
             &self.cfg.social, date, Utc::now()).await {
+            report_error(&e, Fault::Background);
             warn!("nightly archive failed: {e:#}");
         }
         crate::mind::embedding::nightly(&self.models, self.store.as_ref()).await;
@@ -3243,6 +3287,46 @@ mod tests {
             restarted.on_messages(vec![env]).await.unwrap();
         }
         assert_eq!(restarted.store.reviews().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn owner_freeze_receipts_follow_persisted_state_and_permissions() {
+        let mut test = TestAgli::new("freeze-receipts").await;
+        let a = &mut test.agli;
+        let mut ctx = a.focus_ctx("telegram", "42", "42").unwrap();
+        for (cmd, state) in [("/freeze", OwnerState::Frozen), ("/freeze", OwnerState::Frozen),
+                            ("/unfreeze", OwnerState::Unfrozen), ("/unfreeze", OwnerState::Unfrozen)] {
+            assert_eq!(a.run_command(cmd, "", &ctx).await.unwrap(), state.message());
+            assert_eq!(a.frozen(), cmd == "/freeze");
+        }
+        ctx.is_group = true;
+        assert!(a.run_command("/freeze", "", &ctx).await.is_err());
+        ctx.is_group = false;
+        ctx.partner.as_mut().unwrap().is_owner = false;
+        assert!(a.run_command("/freeze", "", &ctx).await.is_err());
+        assert!(!a.frozen());
+    }
+
+    #[tokio::test]
+    async fn chat_faults_reach_owner_catalog_once_at_event_boundary() {
+        let mut test = TestAgli::new("chat-fault-boundary").await;
+        let a = &mut test.agli;
+        a.test_chat = Some(TestChat::new(&["正常草稿"], &[Outcome::Unknown]));
+        let (_, faults) = crate::error_report::capture(a.handle(WorkItem::Messages(
+            vec![private_message("7", "用户敏感输入")]))).await;
+        assert_eq!(faults, [Fault::Delivery]);
+
+        a.test_chat = Some(TestChat::new(&[], &[]));
+        a.test_chat.as_mut().unwrap().replies.push_back(Err(anyhow::anyhow!("provider secret")));
+        let (_, faults) = crate::error_report::capture(a.handle(WorkItem::Messages(
+            group_messages(&["用户敏感输入"], true)))).await;
+        assert_eq!(faults, [Fault::ChatReply]);
+
+        a.test_chat = Some(TestChat::new(&[], &[Outcome::Failed]));
+        let (_, faults) = crate::error_report::capture(a.handle(WorkItem::Messages(
+            vec![private_message("42", "/freeze")]))).await;
+        assert!(a.frozen());
+        assert_eq!(faults, [Fault::Delivery]);
     }
 
     #[tokio::test]

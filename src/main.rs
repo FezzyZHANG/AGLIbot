@@ -2,6 +2,7 @@ mod agli;
 mod channels;
 mod config;
 mod config_watch;
+mod error_report;
 mod evolution;
 mod hands;
 mod mind;
@@ -24,6 +25,7 @@ use agli::{Agli, Event, WorkItem, WorkQueue, next_work};
 use channels::Outlets;
 use channels::telegram::Telegram;
 use config::Config;
+use error_report::{Fault, Reporter, report};
 use mind::models::Models;
 
 async fn recv_work(events: &mut mpsc::Receiver<Event>, queued: &mut WorkQueue, acl: &config::AclCfg, session: &config::SessionCfg) -> Option<WorkItem> {
@@ -87,27 +89,58 @@ async fn main() -> Result<()> {
         .init();
 
     let root = std::env::var_os("AGLI_ROOT").map(PathBuf::from).unwrap_or(std::env::current_dir()?);
-    let cfg = Arc::new(Config::load(&root)?);
-    let mut config_watcher = config_watch::ConfigWatcher::new(&cfg)?;
+    let cfg = match Config::load(&root) {
+        Ok(cfg) => Arc::new(cfg),
+        Err(error) => {
+            let reporter = Config::owner_telegram(&root).ok().and_then(|(id, cfg)| {
+                Reporter::start(Telegram::from_env(&cfg).ok().as_ref(), id)
+            });
+            report(Fault::StartupConfig);
+            if let Some(reporter) = reporter {
+                reporter.shutdown().await;
+            } else {
+                warn!("startup error could not be sent to the Telegram owner");
+            }
+            return Err(error);
+        }
+    };
+    let telegram = Telegram::from_env(&cfg.channels.telegram);
+    let reporter = Reporter::start(telegram.as_ref().ok(), cfg.acl.owner.telegram_user_id);
+    if reporter.is_none() {
+        warn!("Telegram owner notifications unavailable; check bot token, proxy and owner user ID");
+    }
+    let result = run(cfg, telegram).await;
+    if let Some(reporter) = reporter { reporter.shutdown().await; }
+    result
+}
+
+async fn run(cfg: Arc<Config>, telegram: Result<Telegram>) -> Result<()> {
+    let mut config_watcher = config_watch::ConfigWatcher::new(&cfg)
+        .inspect_err(|_| report(Fault::StartupConfig))?;
     let owner = &cfg.acl.owner;
     if owner.telegram_user_id == 0 && owner.qq_user_id == 0 {
         warn!("没有设置主人的 ID（OWNER_TELEGRAM_ID / OWNER_QQ_ID）：没人能使用主人权限，日志会打印发信人的 ID");
     }
-    let store = store::open(&cfg.runtime.mongo, &cfg.data_dir())?;
-    let models = Arc::new(Models::new(&cfg, store.clone()).await?);
+    let store = store::open(&cfg.runtime.mongo, &cfg.data_dir())
+        .inspect_err(|_| report(Fault::StartupStore))?;
+    let models = Arc::new(Models::new(&cfg, store.clone()).await
+        .inspect_err(|_| report(Fault::StartupModels))?);
 
     let (events_tx, mut events) = mpsc::channel::<Event>(256);
     let (inbound_tx, mut inbound) = mpsc::channel(256);
     let mut outlets = Outlets::default();
 
-    match Telegram::from_env(&cfg.channels.telegram) {
+    match telegram {
         Ok(mut tg) => match tg.identify().await {
             Ok(()) => {
                 outlets.telegram = Some(tg.clone());
                 tokio::spawn(tg.run(inbound_tx.clone()));
                 info!("telegram connected");
             }
-            Err(e) => warn!("telegram unavailable: {e:#}"),
+            Err(e) => {
+                report(Fault::TelegramIdentity);
+                warn!("telegram unavailable: {e:#}");
+            }
         },
         Err(e) => warn!("telegram disabled: {e:#}"),
     }
@@ -119,6 +152,7 @@ async fn main() -> Result<()> {
     }
     drop(inbound_tx);
     if outlets.telegram.is_none() && outlets.qq.is_none() {
+        report(Fault::StartupChannels);
         anyhow::bail!("没有可用的聊天渠道：请配置 TELEGRAM_BOT_TOKEN 或 ONEBOT_URL");
     }
 
@@ -147,10 +181,11 @@ async fn main() -> Result<()> {
     }
 
     let mut queued = WorkQueue::with_store(store.clone());
-    let mut agli = Agli::new(cfg.clone(), store, models, outlets, events_tx)?;
+    let mut agli = Agli::new(cfg.clone(), store, models, outlets, events_tx)
+        .inspect_err(|_| report(Fault::StartupRuntime))?;
     let mut config_poll = tokio::time::interval(Duration::from_secs(2));
     config_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    agli.acknowledge_evolution_start()?;
+    agli.acknowledge_evolution_start().inspect_err(|_| report(Fault::StartupRuntime))?;
     agli.start_media();
     info!("{}", evolution::restart::describe_release(&cfg.data_dir()));
     info!("AGLI is up");
@@ -170,6 +205,7 @@ async fn main() -> Result<()> {
             match restart.launch().await {
                 Ok(()) => break,
                 Err(e) => {
+                    report(Fault::EvolutionRestart);
                     let _ = restart.receipt("failed", Some(&format!("{e:#}")));
                     warn!("evolution restart failed; old bot remains running: {e:#}");
                 }

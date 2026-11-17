@@ -459,6 +459,23 @@ pub struct Config {
 }
 
 impl Config {
+    /// Recover the owner's notification route if unrelated runtime configuration
+    /// prevents startup. Use the same identity, proxy and environment rules as load().
+    pub(crate) fn owner_telegram(root: &Path) -> Result<(i64, TelegramCfg)> {
+        #[derive(Deserialize)]
+        struct TelegramSection { telegram: TelegramCfg }
+        let dir = root.join("config");
+        let acl: AclCfg = read_yaml(&dir.join("acl.yaml"))?;
+        let mut channels: TelegramSection = read_yaml(&dir.join("channels.yaml"))?;
+        let id = Self::resolve_telegram(&acl.owner, &mut channels.telegram)?;
+        Ok((id, channels.telegram))
+    }
+
+    fn resolve_telegram(owner: &Owner, tg: &mut TelegramCfg) -> Result<i64> {
+        tg.proxy = tg.proxy_env.as_deref().and_then(env_value);
+        env_id(&owner.telegram_user_id_env)
+    }
+
     pub fn load(root: &Path) -> Result<Self> {
         let dir = root.join("config");
         let mut cfg = Config {
@@ -493,12 +510,10 @@ impl Config {
     /// Machine- and person-specific values live in env vars (or `.env`), not in the repo.
     fn resolve_env(&mut self) -> Result<()> {
         let owner = &mut self.acl.owner;
-        owner.telegram_user_id = env_id(&owner.telegram_user_id_env)?;
+        owner.telegram_user_id = Self::resolve_telegram(owner, &mut self.channels.telegram)?;
         if let Some(var) = &owner.qq_user_id_env {
             owner.qq_user_id = env_id(var)?;
         }
-        let tg = &mut self.channels.telegram;
-        tg.proxy = tg.proxy_env.as_deref().and_then(env_value);
         let qq = &mut self.channels.qq;
         qq.url = env_value(&qq.url_env);
         qq.token = env_value(&qq.token_env);
@@ -549,6 +564,21 @@ fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broken_unrelated_config_preserves_only_a_configured_owner_route() {
+        let fixture = crate::config_watch::tests::Fixture::new("error-reporter");
+        fixture.write("models.yaml", "[broken");
+        fixture.write("channels.yaml", "telegram: { poll_timeout_s: 12 }");
+        assert!(Config::load(&fixture.root).is_err());
+        let (owner_id, telegram) = Config::owner_telegram(&fixture.root).unwrap();
+        assert_eq!(owner_id, 0);
+        assert_eq!(telegram.poll_timeout_s, 12);
+        assert!(telegram.proxy.is_none());
+
+        fixture.write("acl.yaml", "owner: { person_id: nobody }");
+        assert!(Config::owner_telegram(&fixture.root).is_err());
+    }
 
     #[test]
     fn hands_validation_rejects_dsh_code_and_zero_minutes() {

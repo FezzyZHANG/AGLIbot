@@ -52,6 +52,10 @@ Telegram 的收发消息走环境变量 `TELEGRAM_PROXY` 指定的代理（例�
 `/stop` 停下当前任务 · `/freeze` / `/unfreeze` 冻结主动行为和工具 · `/digest` 现在发待决事项 ·
 `/approve 编号` / `/reject 编号 理由` · `/reflect` 现在整理记忆
 
+运行故障会通过 Telegram 私聊发给 `OWNER_TELEGRAM_ID` 指定的主人。例如，`E3001 聊天回复生成失败`。通知附有 `/freeze` 和 `/unfreeze`，同一错误码在一分钟内最多提醒一次。可以用错误码和发生时间查本机日志。通知只含预定义的故障描述，聊天内容、文件名和上游响应留在原处理路径。
+
+在主人私聊发送 `/freeze` 后，状态码为 `S1001`；发送 `/unfreeze` 后为 `S1002`。从 Telegram 操作时直接收到带码的回执，从 QQ 切换状态时 Telegram 也会收到通知。重复执行只回报当前状态。配置与错误码见[运行通知](docs/CONFIG.md#telegram-运行通知)。
+
 聊天及反思调用仍串行占用主循环；慢请求期间上述命令、Ctrl+C 和心跳检查会等待当前处理返回，`/freeze` 目前不具备即时抢占能力。
 
 核心代码提案：`/evolve 提案ID` 开始检查，`/evolve-status 提案ID` 查看状态；通过构建、

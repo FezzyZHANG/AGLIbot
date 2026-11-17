@@ -12,6 +12,15 @@ use chrono::{Local, NaiveDate};
 use crate::config::{ModelEntry, Priority, Scenario, ScenariosCfg};
 use crate::ns::ProcessingPolicy;
 
+#[derive(Debug)]
+pub(super) struct BudgetDenied(pub String);
+
+impl std::fmt::Display for BudgetDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+
+impl std::error::Error for BudgetDenied {}
+
 pub struct Router {
     models: Vec<ModelEntry>,
     scenarios: ScenariosCfg,
@@ -62,8 +71,9 @@ impl Router {
     pub fn select(&self, scenario: &str, policy: &ProcessingPolicy, budget_exhausted: bool) -> Result<&ModelEntry> {
         let sc = self.scenario(scenario)?;
         if let Some(id) = &sc.model {
-            anyhow::ensure!(!budget_exhausted || sc.budget_exempt,
-                "scenario `{scenario}` is pinned to `{id}` but its daily budget is exhausted");
+            if budget_exhausted && !sc.budget_exempt {
+                return Err(BudgetDenied(format!("scenario `{scenario}` is pinned to `{id}` but its daily budget is exhausted")).into());
+            }
             let model = self.model(id).ok_or_else(|| anyhow!("pinned model `{id}` is not available for scenario `{scenario}`"))?;
             anyhow::ensure!(policy.allows(model), "pinned model `{id}` is not allowed by {policy:?}");
             anyhow::ensure!(model.q >= sc.q_min, "pinned model `{id}` does not meet scenario `{scenario}` Q floor {}", sc.q_min);

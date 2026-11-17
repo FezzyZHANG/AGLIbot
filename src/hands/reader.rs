@@ -1,4 +1,5 @@
 //! Standalone DeepSeek tools. Callers authorize the disclosure before invoking these methods.
+use crate::error_report::{Fault, report};
 use anyhow::{Context, Result, anyhow, ensure};
 use reqwest::{Client, Method, RequestBuilder, multipart};
 use serde_json::{Value, json};
@@ -81,13 +82,30 @@ fn matches_header(ext: &str, b: &[u8]) -> bool {
     }
 }
 
+#[derive(Debug)]
+struct UnreadableInput(String);
+
+impl std::fmt::Display for UnreadableInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnreadableInput {}
+
+fn remote_failure(error: &anyhow::Error, fault: Fault) {
+    if !error.is::<UnreadableInput>() {
+        report(fault);
+    }
+}
+
 fn bounded(s: &str) -> Result<String> {
     let mut chars = s
         .trim()
         .chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'));
     let mut out: String = chars.by_ref().take(TEXT_LIMIT).collect();
-    ensure!(!out.trim().is_empty(), "没有可读取的正文");
+    if out.trim().is_empty() { return Err(UnreadableInput("没有可读取的正文".into()).into()); }
     if chars.next().is_some() {
         out.push_str("\n[节选]");
     }
@@ -138,6 +156,9 @@ impl Reader {
     }
 
     async fn response_json(mut response: reqwest::Response) -> Result<Value> {
+        if matches!(response.status().as_u16(), 400 | 404 | 413 | 415 | 422) {
+            return Err(UnreadableInput(format!("DeepSeek HTTP {}", response.status().as_u16())).into());
+        }
         ensure!(
             response.status().is_success(),
             "DeepSeek HTTP {}",
@@ -168,6 +189,10 @@ impl Reader {
             "含访问凭据的链接不能提交至网页读取服务"
         );
         let (url, _) = crate::channels::public_url(url).await?;
+        self.fetch_public(&url).await.inspect_err(|e| remote_failure(e, Fault::WebRead))
+    }
+
+    async fn fetch_public(&self, url: &reqwest::Url) -> Result<String> {
         let request = || {
             self.request(Method::POST, "/v1/tools/fetch")
                 .json(&json!({"url": url.as_str()}))
@@ -207,14 +232,18 @@ impl Reader {
         let ext = extension(name);
         ensure!(bytes.len() <= MAX_DOCUMENT_BYTES, "文件超出大小限制");
         ensure!(matches_header(&ext, &bytes), "文件类型或文件头不受支持");
+        self.extract(&ext, bytes, question).await.inspect_err(|e| remote_failure(e, Fault::FileRead))
+    }
+
+    async fn extract(&self, ext: &str, bytes: Vec<u8>, question: &str) -> Result<String> {
         let part = multipart::Part::bytes(bytes)
             .file_name(format!("attachment.{ext}"))
             .mime_str("application/octet-stream")?;
         let question: String = question.chars().take(1024).collect();
-        if matches!(ext.as_str(), "xlsx" | "xls") {
+        if matches!(ext, "xlsx" | "xls") {
             return self.file_chat(part, "user_data", &question).await;
         }
-        if matches!(ext.as_str(), "pdf" | "doc" | "docx" | "ppt" | "pptx")
+        if matches!(ext, "pdf" | "doc" | "docx" | "ppt" | "pptx")
             && needs_layout(&question)
         {
             return self
@@ -354,7 +383,7 @@ fn ocr_pages(v: &Value) -> Result<String> {
         has_text |= !text.trim().is_empty();
         out.push_str(&format!("[第 {} 页{status}]\n{text}\n", index + 1));
     }
-    ensure!(has_text, "没有可读取的正文");
+    if !has_text { return Err(UnreadableInput("没有可读取的正文".into()).into()); }
     bounded(&out)
 }
 
@@ -424,20 +453,21 @@ mod tests {
         let r = Reader::at(format!("http://{}", listener.local_addr()?));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         assert_eq!(r.fetch("https://1.1.1.1/").await?, "T\nreadable");
-        assert!(r.fetch("http://127.0.0.1/").await.is_err());
+        let (result, faults) = crate::error_report::capture(r.fetch("http://127.0.0.1/")).await;
+        assert!(result.is_err() && faults.is_empty());
         assert_eq!(
             r.document("secret.pdf", b"%PDF-1".to_vec()).await?,
             "[第 1 页，节选]\ncanary"
         );
-        assert!(r.document("secret.pdf", b"MZ".to_vec()).await.is_err());
-        let err = r
+        let (result, faults) = crate::error_report::capture(r.document("secret.pdf", b"MZ".to_vec())).await;
+        assert!(result.is_err() && faults.is_empty());
+        let (result, faults) = crate::error_report::capture(r
             .document(
                 "secret.xls",
                 b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1W\0o\0r\0k\0b\0o\0o\0k\0\0\0".to_vec(),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(err.to_string(), "DeepSeek 处理失败");
+            )).await;
+        assert_eq!(faults, [Fault::FileRead]);
+        assert_eq!(result.unwrap_err().to_string(), "DeepSeek 处理失败");
         assert!(deletes.load(std::sync::atomic::Ordering::SeqCst));
         assert!(
             r.document_for_question(

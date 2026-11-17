@@ -127,7 +127,10 @@ impl Agli {
                 anyhow::ensure!(ctx.scope.permits(&ctx.audience) && !self.frozen(), "当前权限或冻结状态禁止读取");
                 let cloud = || -> Result<&Reader> {
                     anyhow::ensure!(policy.allows_executor("deepseek"), "当前处理策略禁止将材料交给 DeepSeek");
-                    reader.as_ref().map_err(|_| anyhow::anyhow!("DeepSeek 阅读服务未配置"))
+                    reader.as_ref().map_err(|_| {
+                        report(if matches!(file.kind, AttachmentKind::Link) { Fault::WebRead } else { Fault::FileRead });
+                        anyhow::anyhow!("DeepSeek 阅读服务未配置")
+                    })
                 };
                 if matches!(file.kind, AttachmentKind::Link) {
                     return Ok(Some(cloud()?.fetch(file.url.as_deref().unwrap_or("")).await?));
@@ -137,7 +140,10 @@ impl Agli {
                 let native = purpose != Purpose::OcrFallback && native_image(file);
                 if !native { cloud()?; }
                 let mut bytes = self.outlets.download_file(ctx.platform, &ctx.chat_id, file, MAX_DOCUMENT_BYTES).await
-                    .map_err(|e| if e.is::<crate::channels::TooLarge>() { anyhow::anyhow!("文件超出大小限制") } else { anyhow::anyhow!("平台附件下载失败") })?;
+                    .map_err(|e| if e.is::<crate::channels::TooLarge>() { anyhow::anyhow!("文件超出大小限制") } else {
+                        report(Fault::FileRead);
+                        anyhow::anyhow!("平台附件下载失败")
+                    })?;
                 if native {
                     let (pixels, original) = tokio::task::spawn_blocking(move || (crate::mind::vision::sampled_frames(&bytes, 1), bytes)).await?;
                     if let Ok((frames, _)) = pixels {

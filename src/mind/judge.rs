@@ -108,6 +108,9 @@ async fn review_scenario(models: &Models, scenario: &str, category: ReviewCatego
     match models.ask_json_with_limit::<Raw>(scenario, &ProcessingPolicy::Any, system, &user, limit).await {
         Ok(raw) => Ok(Judgement { verdict: Verdict::parse(&raw.verdict), reasons: raw.reasons, fixes: raw.fixes, urgent: raw.urgent }),
         Err(e) => {
+            if !e.is::<super::router::BudgetDenied>() {
+                crate::error_report::report(crate::error_report::Fault::ReviewModel);
+            }
             tracing::warn!("review unavailable, forwarding to owner: {e:#}");
             Ok(Judgement { verdict: Verdict::Owner, reasons: format!("没有可用的审查模型：{e}"), fixes: String::new(), urgent: false })
         }
@@ -237,6 +240,24 @@ mod tests {
         for text in ["今天聊得很开心", "deadline tomorrow", "下周截止", "due 2026-11-03"] {
             assert!(!deadline_today(text, day), "{text}");
         }
+    }
+
+    #[tokio::test]
+    async fn work_review_alerts_only_for_reviewer_failure() {
+        use crate::error_report::{Fault, capture};
+        let dir = std::env::temp_dir().join(format!("agli-work-review-alert-{}", std::process::id()));
+        let store = std::sync::Arc::new(crate::store::jsonl::JsonlStore::open(&dir).unwrap());
+        let models = Models::stub(store, vec![r#"{"verdict":"转交主人"}"#.into(), "unusable".into()]);
+        for expected in [vec![], vec![Fault::ReviewModel]] {
+            let (j, faults) = capture(review_work(&models, ReviewCategory::Verify, "subject", "evidence")).await;
+            assert_eq!(j.unwrap().verdict, Verdict::Owner);
+            assert_eq!(faults, expected);
+        }
+        let limit = SpendLimit { since: Utc::now(), max_usd: 0.0 };
+        let (j, faults) = capture(review_with_limit(&models, ReviewCategory::Verify, "subject", "evidence", Some(limit))).await;
+        assert_eq!(j.unwrap().verdict, Verdict::Owner);
+        assert!(faults.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

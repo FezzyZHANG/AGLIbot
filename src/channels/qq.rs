@@ -442,6 +442,8 @@ async fn run(
             }
             Err(e) => warn!("qq connect failed: {e:#}"),
         }
+        if rx.is_closed() || inbound.is_closed() { return; }
+        crate::error_report::report(crate::error_report::Fault::QqConnection);
         // Fail requests queued while disconnected instead of letting them hang.
         while let Ok(req) = rx.try_recv() {
             let _ = req.reply.send(Err(anyhow!("qq is disconnected")));
