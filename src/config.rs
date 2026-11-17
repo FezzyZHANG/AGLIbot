@@ -390,6 +390,7 @@ pub struct JudgeCfg {
 pub struct RuntimeCfg {
     pub data_dir: PathBuf,
     pub mind_dir: PathBuf,
+    #[serde(default = "default_work_dir")]
     pub work_dir: PathBuf,
     pub session: SessionCfg,
     pub routine: RoutineCfg,
@@ -400,6 +401,8 @@ pub struct RuntimeCfg {
     #[serde(default)]
     pub mongo: MongoCfg,
 }
+
+fn default_work_dir() -> PathBuf { "work".into() }
 
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default)]
@@ -652,6 +655,20 @@ timeout_min: 30
         assert_eq!(hands.dsh_profile, "agli-research");
         let hands: HandsCfg = serde_yaml::from_str(&format!("{yaml}stall_minutes: 3\ntotal_budget_minutes: 15")).unwrap();
         assert_eq!((hands.stall_minutes, hands.total_budget_minutes), (3, 15));
+    }
+
+    #[test]
+    fn work_dir_defaults_to_runtime_root_and_respects_override() {
+        let mut cfg = Config::load(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        cfg.root = PathBuf::from("runtime");
+        cfg.source = PathBuf::from("separate-source");
+        let mut yaml: serde_yaml::Value = serde_yaml::from_str(include_str!("../config/runtime.yaml")).unwrap();
+        yaml.as_mapping_mut().unwrap().remove("work_dir");
+        cfg.runtime = serde_yaml::from_value(yaml.clone()).unwrap();
+        assert_eq!(cfg.work_dir(), cfg.root.join("work"));
+        yaml["work_dir"] = serde_yaml::Value::String("custom/tasks".into());
+        cfg.runtime = serde_yaml::from_value(yaml).unwrap();
+        assert_eq!(cfg.work_dir(), cfg.root.join("custom/tasks"));
     }
 
     #[test]

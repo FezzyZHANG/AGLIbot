@@ -183,7 +183,7 @@ mod tests {
 
     fn env(chat_id: &str, is_group: bool) -> Envelope {
         Envelope {
-            notice: false, attachments: Vec::new(), arrived: None, platform: "qq", chat_id: chat_id.into(),
+            authored_text: String::new(), notice: false, attachments: Vec::new(), arrived: None, platform: "qq", chat_id: chat_id.into(),
             message_id: None, sender_id: "5".into(), sender_name: "阿五".into(), sender_is_bot: false,
             is_group, mentions_me: false, text: "hi".into(),
         }

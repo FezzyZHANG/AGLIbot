@@ -320,6 +320,8 @@ impl Models {
 
     /// One-shot call: `system` is the stable prefix (usually L1), `user` the task.
     pub async fn ask(&self, scenario: &str, policy: &ProcessingPolicy, system: &str, user: &str) -> Result<String> {
+        #[cfg(test)]
+        if self.stub.is_some() { return self.stub_reply(scenario, policy, user) }
         let model = self.pick(scenario, policy)?;
         let turns = [Turn::User(user.to_string())];
         let effort = self.effort(scenario);

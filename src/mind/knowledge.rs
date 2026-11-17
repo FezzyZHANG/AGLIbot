@@ -119,8 +119,13 @@ where
     }).collect();
     tasks.sort_by_key(|t| (t.updated, &t.id));
     let mut watermark = checkpoint.watermark;
+    let reviews = store.reviews()?;
     for task in tasks {
         if !checkpoint.tasks.contains_key(&task.id) {
+            // Older boards may mark a deferred, unreviewed, or still-revising report Done.
+            let latest = reviews.iter().filter(|r| r.category == ReviewCategory::Verify && r.payload["task_id"].as_str() == Some(&task.id))
+                .max_by_key(|r| (r.ts, r.id));
+            let Some(review) = latest.filter(|r| r.verdict.split('：').next() == Some("通过")) else { continue };
             ensure!(safe_component(&task.id), "invalid research task id");
             let dir = board.task_dir(&task.id).canonicalize()?;
             ensure!(dir.starts_with(board.task_dir("").canonicalize()?), "task outside research directory");
@@ -128,10 +133,7 @@ where
             let material = material(task, &dir, existing_topics)?;
             let result = cluster(material.clone()).await
                 .with_context(|| format!("clustering research task {}", task.id))?;
-            let verdict = store.reviews()?.into_iter()
-                .filter(|r| r.category == ReviewCategory::Verify && r.payload["task_id"].as_str() == Some(&task.id))
-                .max_by_key(|r| (r.ts, r.id))
-                .map(|r| format!("#{} {}", r.id, r.verdict)).unwrap_or_else(|| "not reviewed".into());
+            let verdict = format!("#{} {}", review.id, review.verdict);
             let cards = cards(task, &material, result, verdict)?;
             info!(task_id = %task.id, cards = cards.len(), unverified = material.claims.iter().filter(|e| !e.verified).count(), "knowledge: clustered finished research");
             checkpoint.tasks.insert(task.id.clone(), cards);
@@ -350,6 +352,9 @@ mod tests {
 
         fn task(&mut self, title: &str, status: TaskStatus) -> Task {
             let task = self.board.add(title, TaskKind::Research, "owner", status, None).unwrap();
+            self.store.save_review(&ReviewItem { id: self.store.next_review_id().unwrap(), ts: task.updated,
+                category: ReviewCategory::Verify, subject: title.into(), detail: "report".into(), verdict: "通过：已核实".into(),
+                status: ReviewStatus::Closed, payload: serde_json::json!({"task_id":task.id}), notified: false, urgent: false, pushed: false }).unwrap();
             let dir = self.board.task_dir(&task.id);
             std::fs::write(dir.join("report.md"), "Report used for grouping, not promoted to a verified fact.").unwrap();
             std::fs::write(dir.join("sources/01-dsh.md"), "fetched: yes\nURL: https://Example.org/a\nRetrieved: today\n\nOriginal").unwrap();
@@ -371,6 +376,22 @@ mod tests {
     fn stub(material: Material) -> std::future::Ready<Result<Clusters>> {
         std::future::ready(Ok(Clusters { cards: vec![Cluster { topic: "Common proposition".into(),
             claims: (0..material.claims.len()).map(|index| Member { index, side: if index == 1 { Side::Opposes } else { Side::Supports } }).collect(), related: vec![] }] }))
+    }
+
+    #[tokio::test]
+    async fn historical_done_tasks_with_missing_or_nonpassing_final_review_are_skipped() {
+        let mut f = Fixture::new();
+        for verdict in ["修改后再审", "暂缓", "转交主人"] {
+            let task = f.task(verdict, TaskStatus::Done);
+            let mut review = f.store.reviews().unwrap().pop().unwrap();
+            review.id = f.store.next_review_id().unwrap();
+            review.verdict = format!("{verdict}：还需核实");
+            assert_eq!(review.payload["task_id"], task.id);
+            f.store.save_review(&review).unwrap();
+        }
+        f.board.add("missing review", TaskKind::Research, "owner", TaskStatus::Done, None).unwrap();
+        process(&f.board, &f.store, &f.output(), |_| async { panic!("unreviewed work reached clustering") }).await.unwrap();
+        assert!(!f.output().join("sources.yaml").exists());
     }
 
     #[tokio::test]
@@ -437,12 +458,12 @@ mod tests {
         std::fs::write(dir.join("claims.yaml"), serde_yaml::to_string(&claims).unwrap()).unwrap();
         for id in [1, 2] {
             f.store.save_review(&ReviewItem { id, ts: task.updated, category: ReviewCategory::Verify, subject: task.title.clone(), detail: "report".into(),
-                verdict: format!("verdict {id}"), status: ReviewStatus::Closed, payload: serde_json::json!({"task_id": task.id}), notified: false, urgent: false, pushed: false }).unwrap();
+                verdict: format!("通过：verdict {id}"), status: ReviewStatus::Closed, payload: serde_json::json!({"task_id": task.id}), notified: false, urgent: false, pushed: false }).unwrap();
         }
         process(&f.board, &f.store, &f.output(), stub).await.unwrap();
         let state = f.checkpoint();
         let card = &state.tasks[&task.id][0];
-        assert_eq!(card.judge_verdict, "#2 verdict 2");
+        assert_eq!(card.judge_verdict, "#2 通过：verdict 2");
         assert!(card.claims[0].0.verified);
         assert!(card.claims[1..].iter().all(|(e, _)| !e.verified && e.verification.starts_with("unverified")));
         let reputation = f.sources();

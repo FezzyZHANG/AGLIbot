@@ -1,12 +1,12 @@
 # 主人配置参考
 
-核对日期：2026-11-02（工单 #69）。本文按当前 `src/config.rs`、加载器和实际调用处整理。`config/` 属于 L4，由主人修改；这里仅提供参考，不代改配置。
+初次核对：2026-11-02（工单 #69）；2026-11-15 更新已漂移的字段和边界，完整发现见[审查报告](reviews/2026-11-15/REVIEW.md)。本文按 `src/config.rs`、加载器和实际调用处整理。`config/` 属于 L4，由主人修改；这里仅提供参考，不代改配置。
 
 ## 怎样读这份表
 
 - **必填**表示没有缺键默认值，删掉会导致反序列化失败；表中其他默认值均表示该键可省略。`无`表示 `Option::None`，不等于空字符串。
 - `*` 是你起的映射名称，`[]` 是列表的一项。`usize/u64` 是非负整数，`i64` 是有符号整数，`f64` 是浮点数，路径用字符串，时间用带引号的 `HH:MM:SS`。
-- **只有 `social.yaml` 的全部字段支持热加载**；其余文件的全部字段均需重启。每节标题标明生效方式，适用于该节每一行。环境变量变更也应重启进程。
+- **只有 `social.yaml` 支持热加载**；其中 `aliases` 仅作启动时的一次词库种子，改它不会更新已创建的词库。其余文件的字段均需重启。环境变量变更也应重启进程。
 - 主程序约每 2 秒轮询配置，连续两次快照相同才尝试加载；加载失败保留旧配置。它会校验所有必需配置，因此其他文件的错误也可能阻止 social 热加载。已启动的后台任务持有启动时的配置快照。
 - 六个现有 YAML 文件必须存在；`tools.yaml` 是唯一可缺失的文件。嵌套对象默认必填，只有明确标为可选的块可整块省略。Config.root 是由启动参数/环境确定的内部字段，不是 YAML 键。示例是需要合并进现有文件的片段，不是完整文件；不要重复创建同名顶层键。
 
@@ -16,7 +16,7 @@
 
 | 键路径 | 类型 | 缺键默认 | 用途 |
 |---|---|---|---|
-| `daily_budget_usd` | f64 | 必填 | 本地自然日预算；耗尽后非豁免场景改走 cheap，embedding 停止。不是所有调用的硬停机开关 |
+| `daily_budget_usd` | f64 | 必填 | 本地自然日路由阈值；耗尽后未固定模型的非豁免场景改走 cheap，固定模型的非豁免场景拒绝调用，embedding / 后台图片描述停止。不是全局硬上限，不含 DSH 费用 |
 | `providers` | 名称 → 对象 | 必填 | 服务商表 |
 | `providers.*.kind` | `anthropic` / `openai_compat` | 必填 | 请求协议 |
 | `providers.*.base_url` | 可空字符串 | 无 | API 基址；Anthropic 未指定时用客户端内置官方基址，兼容接口必须能解析出基址 |
@@ -32,13 +32,13 @@
 | `models[].c.input` | f64 | 必填 | 未缓存输入价格；路由成本比较使用 input + output |
 | `models[].c.cached` | f64 | 必填 | 缓存命中输入价格，用于计费记录 |
 | `models[].c.output` | f64 | 必填 | 输出价格 |
-| `models[].c.cache_write` | 可空 f64 | 无；计费时取 input × 1.25 | 缓存写入价格；当前所有模型均未显式填写 |
+| `models[].c.cache_write` | 可空 f64 | 无；计费时取 input × 1.25 | 缓存写入价格；当前部分模型显式填写，0 也是有效值 |
 | `models[].l` | f64 | 必填 | 首字延迟估计（秒）；fast 路由据此排序，不会自动用实测值覆盖 |
 | `models[].local` | bool | false | 声明为本地处理，可处理 local_only；启动时检查本地服务可达性 |
 | `models[].fallbacks` | 可空字符串 | 无 | Anthropic 服务端拒答回退参数；不是 AGLI 自己的升级链；当前仅部分模型填写 |
 | `models[].stream` | bool | false | 兼容接口使用 SSE；内部收齐正文后发送，不向渠道转发推理增量 |
 | `models[].enable_thinking` | 可空 bool | 无（不发该参数） | 兼容接口 thinking 参数；场景 effort 为 low 时实际发 false；当前仅部分模型填写 |
-| `models[].reasoning_effort` | bool | false | 兼容接口按场景 effort 发 `reasoning_effort`；场景没填 effort 时不发；当前用于 Gemini 中转的 Argon 与 Carbon |
+| `models[].reasoning_effort` | bool | false | 仅 openai_compat 协议按场景 effort 发 `reasoning_effort`；Anthropic 协议不使用此开关，只在场景提供 effort 时发 `output_config.effort`。当前 Gemini provider 已改用 Anthropic 协议 |
 | `sticker_embedding` | 可空对象 | 无（不建表情包向量） | 字段同 `embedding`，只用到 provider、model、local；和语义召回分开，当前为本地 `bge-m3`，基址用 `127.0.0.1`（`localhost` 在这台机器上每次多 2 秒） |
 | `embedding` | 可空对象 | 无（关闭语义召回） | **可选块，当前未配置**；独立于聊天模型列表 |
 | `embedding.provider` | 字符串 | 块内必填 | 引用 providers，调用时要求 openai_compat |
@@ -49,7 +49,7 @@
 | `embedding.threshold` | f64 | 0.75 | 余弦相似度门槛，有限且在 [0,1] 内 |
 | `embedding.nightly_cap` | usize | 200 | 每夜成功补建向量数量上限；0 关闭夜间补建，不关闭提炼后的建向量或查询 |
 
-**语义召回（#2）默认关闭。当前没有任何已配置 provider 被验证可提供 embeddings。** 本地 Ollama 的 `nomic-embed-text` 只是未验证候选；下面不是可用性承诺，启用前由主人确认服务、模型和接口。无需把 embedding 模型加入聊天 QCL 表。
+**记忆语义召回（#2）默认关闭；表情包向量另有 `sticker_embedding: bge-m3` 配置。** 配置本身不证明当前服务在线。本地 Ollama 的 `nomic-embed-text` 仍是下面的示例候选，启用前需确认服务、模型和接口。无需把 embedding 模型加入聊天 QCL 表。
 
 ```yaml
 # models.yaml；沿用已有的 providers.local，候选未验证
@@ -67,18 +67,23 @@ embedding:
 
 ## scenarios.yaml（全部需重启）
 
-顶层是场景名称 → 对象，以下每个字段对每个场景都适用。当前场景为 `caption`（后台描述图片，缺少时图片只存不描述）、`triage`、`chat`、`extract`、`consolidate`、`research_plan`、`verify`、`synthesize`、`act`、`evolve`。前七个由加载器强制要求，后两个虽未在加载阶段强制检查，相关审查流程仍会使用。新增名称本身不会创造新流程。
+顶层以场景名称为键。加载器要求 `chat`、`triage`、`extract`、`consolidate`、`research_plan`、`verify` 和 `synthesize`。调用处还使用 `work_review`（研究与编码任务逐轮审查）、`act`、`evolve`、`caption`（后台描述图片）和 `format`（发送前整理）。缺少 caption 时描述失败，下载文件可能仍保留。已有运行目录升级时，请把仓库的 `work_review` 行同步到运行目录的 `config/scenarios.yaml` 后重启。
+
+`work_review.model` 默认精确指定百炼的 `bailian-deepseek-flash`，使用 `BAILIAN_API_KEY`。审查读取任务要求、材料和本轮产物，修改意见会进入下一轮。直接网页读取和文档解析独立使用官方 `DEEPSEEK_API_KEY`，由当前对话的处理策略决定能否提交。官方工具调用的账单应以 DeepSeek 平台记录为准。
 
 | 键路径 | 类型 | 缺键默认 | 用途 |
 |---|---|---|---|
+| `*.model` | 可空字符串 | 无（正常 QCL 路由） | 精确固定内部模型 ID；仍校验 policy、Q 下限及 vision。固定后不自动升级，非豁免场景超预算时拒绝调用 |
 | `*.q_min` | f64 | 0.0 | 质量下限 |
 | `*.priority` | `cheap` / `fast` / `quality` | 必填 | 帕累托过滤后，分别按成本、延迟、质量排序 |
 | `*.review` | bool | false | 记录设计意图；**不自动接入 judge**，实际审查由调用处显式执行 |
 | `*.budget_exempt` | bool | false | 超预算时仍保留原优先项；当前 verify / act / evolve 为 true |
-| `*.effort` | 可空字符串 | 无 | Anthropic 的 output_config.effort；另外 low 会关闭兼容接口模型显式配置的 thinking |
+| `*.effort` | 可空字符串 | 无 | Anthropic 发 output_config.effort；启用 reasoning_effort 的兼容模型发同名参数；low 还会关闭兼容模型显式配置的 thinking |
 | `*.vision` | bool | false | 只路由到 `vision: true` 的模型，固定 `model` 时也检查；当前 `chat` 为 true 并固定到 `gemini-4-argon`，[看图](../src/mind/vision.rs)把图片直接放进被叫到的那一轮 |
 
 当前部分场景省略 q_min 以外的可选字段，按上述默认值处理；effort 的字符串不在配置层校验。依据：[Scenario](../src/config.rs)、[router.rs](../src/mind/router.rs)、[llm.rs](../src/mind/llm.rs)、[judge.rs](../src/mind/judge.rs)。
+
+仓库默认 `chat` / `caption` 固定到 Gemini Argon，`format` 固定到百炼 DeepSeek Flash，`evolve` 固定到 Opus。启动只验证聊天模型可选，不证明其他场景或提供商可用。另有已确认缺陷：只要默认本地 `qwen3:8b` 可用，日记/成长就选择 LocalOnly，但其 Q=5 不满足 consolidate 的 Q≥6；人格探针的 LocalOnly 又与远程 chat 固定项冲突。具体触发及修复边界见审查报告。
 
 ## runtime.yaml（全部需重启）
 
@@ -86,9 +91,9 @@ embedding:
 
 | 键路径 | 类型 | 缺键默认 | 用途 |
 |---|---|---|---|
-| `data_dir` | 路径 | 必填 | JSONL、状态、审查记录、导出人物卡和探针等运行数据 |
+| `data_dir` | 路径 | 必填 | JSONL、状态、审查记录、导出人物卡和探针等运行数据；Rust 支持自定义，但现有 ops 脚本固定使用 data，尚未对齐 |
 | `mind_dir` | 路径 | 必填 | 人格种子、日记、成长 overlay 等 |
-| `work_dir` | 路径 | 必填 | board 和 tasks 工作目录 |
+| `work_dir` | 路径 | `work` | 默认看板与任务分别写入运行根目录下的 `work/board.yaml` 和 `work/tasks/<id>/`。显式相对路径也从运行根解析，绝对路径直接使用 |
 | `session` | 对象 | 必填 | 会话与连发合并设置 |
 | `session.max_turns` | usize | 必填 | 已存消息达到 2 × 此值时，下次对话重建会话 |
 | `session.idle_minutes` | i64 | 必填 | 空闲超过此分钟数，下次对话重建会话 |
@@ -170,7 +175,7 @@ memory:
 | `hands.stall_minutes` | u64 | 20 | **可选、当前未写**；任务 log.md 无增长或更新达到此分钟数，watchdog 暂停任务 |
 | `hands.total_budget_minutes` | u64 | 90 | **可选、当前未写**；一次运行任务的总时长上限，watchdog 暂停；跨多次执行器调用累计 |
 
-timeout 是单次子进程期限，watchdog 是主循环按 tick 检查的任务级期限，不是精确到秒的定时器。后两项未验证为正，设 0 会在检查时立即触发。DSH 不是安装后就自动就绪：需要独立 home/profile 和专用凭据；详细操作见 [DSH.md](DSH.md)。实现见 [delegate.rs](../src/hands/delegate.rs)、[research.rs](../src/work/research.rs)、[agli.rs](../src/agli.rs)。
+timeout 是单次子进程期限，watchdog 是主循环按 tick 检查的任务级期限；主循环中的慢模型调用还会推迟检查。三项分钟数均在配置加载时要求大于 0。DSH 不是安装后就自动就绪：需要独立 home/profile 和专用凭据；详细操作见 [DSH.md](DSH.md)。实现见 [delegate.rs](../src/hands/delegate.rs)、[research.rs](../src/work/research.rs)、[agli.rs](../src/agli.rs)。
 
 ```yaml
 hands:
@@ -201,14 +206,15 @@ mongo:
 
 指定 Mongo URL 后连接失败会报错，不会静默切回 JSONL（[store::open](../src/store/mod.rs)）。`mongo.url` 和 `mongo.database` 是内部解析结果，不是可编辑 YAML 键；设计树中的 `mongo.yaml` 目前没有加载器。
 
-## social.yaml（本节全部字段热加载）
+## social.yaml（运行设置热加载，aliases 仅作一次启动种子）
 
 依据：[social 类型](../src/config.rs)、[热加载](../src/config_watch.rs)、[群聊处理](../src/agli.rs)、[轮次限制](../src/social/floor.rs)、[反思预算](../src/mind/reflect.rs)。
 
 | 键路径 | 类型 | 缺键默认 | 用途 |
 |---|---|---|---|
 | `groups` | 字符串列表 | `[]` | 可以发言的群白名单，格式 platform:chat_id；不在名单且未忽略的已加入群默认只读记录 |
-| `ignored_groups` | 字符串列表 | `[]` | **可选、当前未写**；忽略这些群，不记录新消息、不反思、不回复；优先于 groups |
+| `ignored_groups` | 字符串列表 | `[]` | **可选、当前未写**；跳过新输入、按群提炼与归档，不回复；优先于 groups。不会删除旧记录或从所有历史记忆派生流程中撤回它们 |
+| `aliases` | 字符串列表 | `[]` | 启动时一次性导入空词库的全局称呼种子；已导入后修改此值或重启均不覆盖现有词库，词库由 Store 管理 |
 | `private_from_others` | bool | 必填 | 是否接受非主人私聊；不授予主人权限 |
 | `group_reply_max` | usize | 150 | **可选、当前未写**；群聊完整回复长度上限；中文按字、其他连续字母/数字按段计数 |
 | `interjection_max` | usize | 80 | **可选、当前未写**；主动插话更短的长度上限；超限先重写一次，再截断 |
@@ -235,7 +241,7 @@ read_only_reflect:
   max_cost_usd: 0.10
 ```
 
-当前 YAML 顶部“不在名单里的群，消息一律不读不记”的旧注释与实现不符；要完全忽略一个群请用 ignored_groups。
+当前 YAML 顶部“不在名单里的群，消息一律不读不记”的旧注释与实现不符；要停止一个群的新增输入及按群提炼/归档，请用 ignored_groups。该设置不会撤回已保存的历史产物。
 
 ## acl.yaml（全部需重启）
 
@@ -291,13 +297,16 @@ provider_cache:
 
 | 名称 | 用途 / 读取位置 |
 |---|---|
-| `AGLI_ROOT` | 主程序选择项目根目录 |
+| `AGLI_ROOT` | 主程序选择运行时根目录 |
+| `AGLI_SOURCE` | 进化闸门使用的源码 checkout；缺省等于运行时根 |
+| `AGLI_LOG_FILE` | 将 bot 标准日志同时写入指定文件 |
 | `RUST_LOG` | tracing 的默认环境日志过滤器（间接通过库读取） |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot 凭据 |
 | `OWNER_TELEGRAM_ID`、`OWNER_QQ_ID` | 当前 acl.yaml 指定的主人数字身份变量名 |
 | `TELEGRAM_PROXY` | 当前 channels.yaml 指定的 Telegram 代理变量名 |
 | `ONEBOT_URL`、`ONEBOT_TOKEN` | 当前 channels.yaml 指定的 QQ URL 与凭据变量名 |
 | `ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`、`BAILIAN_API_KEY` | 当前 models.yaml 指定的 AGLI 模型凭据变量名 |
+| `ANTHROPIC_BASE_URL` | 当前 models.yaml 指定的 Anthropic 中转基址覆盖变量名 |
 | `BAILIAN_BASE_URL_OAI` | 当前 models.yaml 指定的服务商基址覆盖变量名 |
 | `MONGO_URL`、`MONGO_DATABASE` | 默认 Mongo 变量名；import-jsonl 工具也直接读取这两个固定名称 |
 | `AGLI_DSH_BIN` | DSH 可执行文件覆盖；不设时从 PATH 查找平台对应的 dsh 启动程序 |
@@ -322,7 +331,7 @@ http_proxy https_proxy all_proxy no_proxy
 ## 核对时发现的行为差异
 
 - social.yaml 的旧白名单注释、scenarios.yaml 的 review/effort 注释均不能完整反映实现；实际行为见上表。
-- daily_budget_usd 对一般模型路由是降档阈值，不是 DESIGN 所说的全局硬预算；只读反思金额上限也是按记录准入，可能被最后一次调用越过。
+- daily_budget_usd 对未固定模型的一般路由是降档阈值，固定且非豁免的场景则停止；全局硬预算仍是设计目标。只读反思金额上限也是按记录准入，可能被最后一次调用越过。
 - （已修正）hands.code: dsh 与 timeout_min / stall_minutes / total_budget_minutes 为 0 现在在加载配置时报错。facts_in_context 实际按人限制。
 - embedding 的 provider 能力不在启动时验证；tools 的缓存参数仅供观测，新名称部分覆盖也不继承协议策略。
 - Config 的多数结构未启用 deny_unknown_fields，拼错键或给 serde(skip) 内部字段赋值可能被忽略。请使用本文列出的键，不依赖“能解析”证明生效。

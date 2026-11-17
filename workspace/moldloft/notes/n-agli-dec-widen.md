@@ -3,7 +3,7 @@ id: "n-agli-dec-widen"
 title: "Scope widening applies on a passing review"
 kind: "decision"
 state: "accepted"
-relations: []
+relations: [{"type": "relates", "target": "note:n-agli-q-growth-deidentification"}]
 abstract_zh: "扩大可见范围的经验经审查“通过”即生效（另存公开副本并引用原条目），其余情况保持私有或转交主人。"
 abstract_en: "Widening takes effect on a passing review as a separate public copy; otherwise it stays private or goes to the owner."
 ---

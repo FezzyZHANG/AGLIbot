@@ -3,7 +3,7 @@ id: "n-agli-q-dsh-tokens"
 title: "Which token source and budget does DSH use for AGLI's runs?"
 kind: "question"
 state: "resolved"
-relations: [{"type": "relates", "target": "ticket:25"}]
+relations: [{"type": "relates", "target": "ticket:25"}, {"type": "relates", "target": "note:n-agli-dec-deepseek-paid-api"}, {"type": "relates", "target": "note:n-agli-idea-deepseek-app-integration"}]
 abstract_zh: "已定（2026-11-01，2026-11-02 更新）：AGLI 的 DSH 运行用百炼，key 只放 DSH 侧；百炼套餐不支持多 key，暂时与 AGLI 自己的 BAILIAN_API_KEY 共用同一个值，换供应商后再用专属 key。日上限 ¥20 挂起，只记录用量。Codex 额度问题留给 #43。"
 abstract_en: "Resolved 2026-11-01, updated 2026-11-02: AGLI's DSH runs use Bailian; the plan allows one key, so AGLI_DSH_BAILIAN_API_KEY temporarily equals AGLI's BAILIAN_API_KEY until a provider change. CNY 20/day cap parked; usage recorded only. Codex quota stays with #43."
 ---
@@ -28,3 +28,7 @@ Still to verify under #25: whether the Bailian console can enforce a per-key dai
 Update 2026-11-01 (owner): Bailian has no official per-key limit setting, so a provider-side cap is not available. The CNY 20/day cap is parked; no DSH- or AGLI-side enforcement for now. #25 records DSH usage from --json events where reported, without blocking runs. Revisit if spending becomes a concern.
 
 Update 2026-11-02 (owner): the Bailian plan does not support multiple keys, so AGLI_DSH_BAILIAN_API_KEY holds the same key as AGLI's own BAILIAN_API_KEY for now; a dedicated key waits for a provider change. Consequences: usage of DSH and AGLI is not separable on the provider side (only AGLI's accounting from dsh --json events attributes it), and revoking the key stops both. #46's name-based isolation is unchanged; switching to a dedicated key later is an .env edit only.
+
+## November 17 scope update
+
+The November 17 payment decision concerns paid official DeepSeek services. Record direct search/fetch, pages, speech and tokens independently of Bailian DSH inference. No new numeric DSH cap was selected.

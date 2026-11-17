@@ -25,6 +25,11 @@ pub struct Telegram {
 }
 
 impl Telegram {
+    #[cfg(test)]
+    pub(crate) fn fixture(base: String) -> Self {
+        assert!(base.starts_with("http://127.0.0.1:"));
+        Self { http: reqwest::Client::builder().no_proxy().build().unwrap(), base, offset: 0, poll_timeout_s: 1, me_id: 1, me_username: "fixture".into() }
+    }
     pub fn from_env(cfg: &TelegramCfg) -> Result<Self> {
         let token = std::env::var("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN is not set")?;
         let http = http_client(cfg)?;
@@ -146,7 +151,7 @@ fn media(msg: &Value) -> Option<(&'static str, Option<Attachment>)> {
         kind,
         url: None,
         file_id: Some(file.get("file_id")?.as_str()?.to_string()),
-        name: None,
+        name: file.get("file_name").and_then(Value::as_str).map(String::from),
         size: file.get("file_size").and_then(Value::as_u64),
         quoted_from: None,
         media_id: None,
@@ -154,6 +159,9 @@ fn media(msg: &Value) -> Option<(&'static str, Option<Attachment>)> {
     if let Some(sizes) = msg.get("photo").and_then(Value::as_array) {
         // Sizes run smallest to largest; one photo, not several images.
         return Some(("[图片]", attachment(AttachmentKind::Image, sizes.last()?)));
+    }
+    if let Some(file) = msg.get("document") {
+        return Some(("[文件]", attachment(AttachmentKind::File, file)));
     }
     let sticker = msg.get("sticker")?;
     let moving = sticker.get("is_animated").and_then(Value::as_bool).unwrap_or(false)
@@ -175,12 +183,24 @@ fn parse_message(msg: &Value, me_id: i64, me_username: &str) -> Option<Envelope>
     let chat_type = chat.get("type")?.as_str()?;
     let replied_to_me = me_id != 0 && msg.pointer("/reply_to_message/from/id").and_then(Value::as_i64) == Some(me_id);
     let quoted = msg.get("reply_to_message").and_then(|replied| Some(Attachment {
-        quoted_from: replied.pointer("/from/first_name").and_then(Value::as_str).map(String::from),
+        quoted_from: Some(replied.pointer("/from/first_name").and_then(Value::as_str).unwrap_or("引用消息").into()),
         ..media(replied)?.1?
     }));
-    let mentioned = !me_username.is_empty() && text.contains(&format!("@{me_username}"));
+    let forwarded = ["forward_origin", "forward_from", "forward_from_chat", "forward_sender_name", "forward_date"]
+        .iter().any(|key| msg.get(*key).is_some_and(|v| !v.is_null()));
+    let authored = if forwarded { "" } else { written.unwrap_or_default() };
+    let mentioned = !me_username.is_empty() && authored.contains(&format!("@{me_username}"));
+    let mut attachments = Vec::new();
+    if !forwarded {
+        attachments.extend(attachment);
+        attachments.extend(quoted);
+        attachments.extend(super::urls::authored_links(authored));
+        attachments.extend(msg.get("entities").or_else(|| msg.get("caption_entities")).and_then(Value::as_array)
+            .into_iter().flatten().filter(|e| e["type"] == "text_link").filter_map(|e| e["url"].as_str())
+            .flat_map(super::urls::authored_links).take(4));
+    }
     Some(Envelope {
-        notice: false, attachments: attachment.into_iter().chain(quoted).collect(),
+        authored_text: authored.into(), notice: false, attachments,
         arrived: Some(tokio::time::Instant::now()),
         platform: "telegram",
         chat_id: chat.get("id")?.as_i64()?.to_string(),
@@ -244,13 +264,29 @@ mod tests {
         let photo = base(json!({"caption": "/看 @aglibot", "photo": [
             {"file_id": "small", "file_size": 10}, {"file_id": "large", "file_size": 2000},
         ]})).unwrap();
-        // A caption can never pass for a command: the placeholder comes first.
+        // Transcript and command-caption provenance are kept separately.
         assert_eq!(photo.text, "[图片] /看 @aglibot");
         assert!(photo.mentions_me);
         assert_eq!(photo.attachments.len(), 1);
         assert_eq!(photo.attachments[0].file_id.as_deref(), Some("large"));
         assert_eq!(photo.attachments[0].size, Some(2000));
         assert!(matches!(photo.attachments[0].kind, AttachmentKind::Image));
+        let doc = base(json!({"document":{"file_id":"report","file_name":"报告.xlsx","file_size":42},
+            "caption":"看这个和 https://example.com/a", "reply_to_message":{"text":"https://other.example/private","from":{"id":8}}})).unwrap();
+        assert_eq!(doc.authored_text, "看这个和 https://example.com/a");
+        assert_eq!(doc.attachments.len(), 2);
+        assert_eq!(doc.attachments[0].name.as_deref(), Some("报告.xlsx"));
+        assert_eq!(doc.attachments[1].url.as_deref(), Some("https://example.com/a"));
+        let linked = base(json!({"text":"见这里","entities":[{"type":"text_link","url":"https://example.com/b"}],
+            "reply_to_message":{"document":{"file_id":"q","file_name":"quoted.pdf"}}})).unwrap();
+        assert!(linked.attachments[0].quoted_from.is_some());
+        assert_eq!(linked.attachments[1].url.as_deref(), Some("https://example.com/b"));
+        for field in ["forward_origin", "forward_from"] {
+            let forwarded = base(json!({field:{"id":1},"document":{"file_id":"secret"},
+                "caption":"/task https://example.com/private","caption_entities":[{"type":"text_link","url":"https://example.com/b"}]})).unwrap();
+            assert!(forwarded.authored_text.is_empty() && forwarded.attachments.is_empty());
+            assert!(forwarded.text.contains("https://example.com/private"));
+        }
 
         let sticker = base(json!({"sticker": {"file_id": "s", "is_animated": false, "is_video": false}})).unwrap();
         assert_eq!(sticker.text, "[动画表情]");

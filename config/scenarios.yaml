@@ -11,6 +11,7 @@ chat:          { model: gemini-4-argon, q_min: 6, priority: fast, effort: low, v
 extract:       { q_min: 5, priority: cheap }
 consolidate:   { q_min: 6, priority: cheap }
 research_plan: { q_min: 8, priority: quality }
+work_review:   { model: bailian-deepseek-flash, q_min: 8, priority: quality }
 verify:        { q_min: 8, priority: quality, review: true, budget_exempt: true }
 synthesize:    { q_min: 8, priority: quality }
 act:           { q_min: 8, priority: quality, review: true, budget_exempt: true }

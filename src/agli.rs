@@ -42,6 +42,7 @@ use crate::work::board::{Board, TaskKind, TaskStatus, ThreadRef};
 use crate::work::research::{self, Job};
 
 mod evolution;
+mod reading;
 
 pub enum Event {
     Inbound(Envelope),
@@ -56,7 +57,8 @@ pub enum WorkItem {
 }
 
 fn owner_command(acl: &AclCfg, env: &Envelope) -> bool {
-    !env.is_group && env.text.trim_start().starts_with('/') && identify(acl, env).is_owner
+    let task_caption = matches!(env.authored_text.split_whitespace().next(), Some("/task" | "/code"));
+    !env.is_group && (task_caption || (env.authored_text.trim_start().starts_with('/') && env.text.trim_start().starts_with('/'))) && identify(acl, env).is_owner
 }
 
 #[derive(Default)]
@@ -448,6 +450,7 @@ struct ChatCtx {
 
 #[derive(Default)]
 struct ReplyBatch {
+    inputs: reading::Inputs,
     ctx: Option<ChatCtx>,
     lines: Vec<String>,
     current: usize,
@@ -504,12 +507,17 @@ impl ChatCtx {
 }
 
 /// Keep the acknowledgement (including failures and the original supplement) in the sent reply.
-fn attach_followups(board: &mut Board, ctx: &ChatCtx, intent: &mut Intent) {
+fn attach_followups_with_sources(board: &mut Board, ctx: &ChatCtx, intent: &mut Intent, evidence: &[reading::Evidence]) {
     for (id, body) in &intent.followups {
         let reply = if !ctx.owner_private() {
             "任务补充只接受主人私聊。".to_string()
         } else {
-            match board.follow_up(id, body, ctx.thread_ref()) {
+            let save = || -> Result<()> {
+                if evidence.is_empty() { return Ok(()); }
+                anyhow::ensure!(board.get(id).is_some_and(|t| t.status.is_open()), "任务已关闭或不存在");
+                reading::save(board, id, ctx, evidence)
+            };
+            match save().and_then(|()| board.follow_up(id, body, ctx.thread_ref())) {
                 Ok(()) => format!("已补充到任务 {id}（{}）。", board.get(id).unwrap().title),
                 Err(e) => format!("任务 {id} 的补充未完整保存：{e:#}。补充原文：{body}"),
             }
@@ -523,6 +531,11 @@ fn attach_followups(board: &mut Board, ctx: &ChatCtx, intent: &mut Intent) {
         intent.text = reply_text(&intent.pieces);
         intent.silent = false;
     }
+}
+
+#[cfg(test)]
+fn attach_followups(board: &mut Board, ctx: &ChatCtx, intent: &mut Intent) {
+    attach_followups_with_sources(board, ctx, intent, &[]);
 }
 
 #[derive(Deserialize)]
@@ -635,6 +648,8 @@ pub struct Agli {
     unseen: HashMap<String, Vec<UnseenLine>>,
     /// Image references waiting for him to be addressed, per chat key. In memory only.
     pending_media: HashMap<String, Vec<crate::mind::vision::PendingMedia>>,
+    turn_inputs: Option<(String, reading::Inputs)>,
+    owner_sources: HashMap<String, (Instant, Vec<reading::Evidence>)>,
     media: crate::mind::media::MediaHandle,
     /// Task titles whose markers were dropped (not an owner chat), told to him on the chat's next turn.
     dropped_tasks: HashMap<String, Vec<String>>,
@@ -685,6 +700,8 @@ impl Agli {
             evolution_restart: None,
             unseen: HashMap::new(),
             pending_media: HashMap::new(),
+            turn_inputs: None,
+            owner_sources: HashMap::new(),
             media: crate::mind::media::MediaHandle::disabled(crate::mind::media::media_dir(&cfg)),
             dropped_tasks: HashMap::new(),
             lexicon: Default::default(),
@@ -756,6 +773,8 @@ impl Agli {
         if self.flow.is_focused() && !messages.is_empty() && messages.iter().all(|env| {
             !env.is_group && identify(&self.cfg.acl, env).is_owner && !owner_command(&self.cfg.acl, env)
                 && !env.text.contains("<任务") && !env.text.contains("<补充")
+                && !env.attachments.iter().any(|a| a.quoted_from.is_none() && matches!(a.kind,
+                    crate::channels::AttachmentKind::Link | crate::channels::AttachmentKind::File | crate::channels::AttachmentKind::Image))
                 && same_chat(&messages[0], env)
         }) {
             let result = self.busy_triage(&messages).await;
@@ -814,7 +833,7 @@ impl Agli {
     }
 
     fn focus_ctx(&self, platform: &'static str, chat_id: &str, sender_id: &str) -> Option<ChatCtx> {
-        let env = Envelope { notice: false, attachments: Vec::new(), platform, chat_id: chat_id.into(), sender_id: sender_id.into(),
+        let env = Envelope { authored_text: String::new(), notice: false, attachments: Vec::new(), platform, chat_id: chat_id.into(), sender_id: sender_id.into(),
             sender_name: String::new(), sender_is_bot: false, is_group: false, mentions_me: false,
             text: String::new(), message_id: None, arrived: None };
         let who = identify(&self.cfg.acl, &env);
@@ -903,6 +922,7 @@ impl Agli {
         let batch = self.prepare_messages(messages).await;
         let Some(ctx) = batch.ctx else { return Ok(()) };
         if batch.speak {
+            self.turn_inputs = Some((ctx.key.clone(), batch.inputs));
             if ctx.is_group {
                 self.converse_group(&ctx, false).await?;
             } else {
@@ -1057,7 +1077,8 @@ impl Agli {
             self.store.kv_set("owner_last_chat", json!({"platform": env.platform, "chat_id": env.chat_id}))?;
             self.state.talked_with_owner(now);
             if owner_command(&self.cfg.acl, &env) {
-                let reply = self.command(env.text.trim(), &ctx).await;
+                let line = if env.authored_text.trim_start().starts_with('/') { env.authored_text.trim() } else { env.text.trim() };
+                let reply = self.command(line, &ctx, &env).await;
                 return self.send_plain(&ctx, &reply).await;
             }
             if let Some(reply) = &batch.busy_reply {
@@ -1091,6 +1112,7 @@ impl Agli {
                 return Ok(());
             }
             batch.speak = true;
+            if !who.is_agent { batch.inputs.include(&env); }
             return Ok(());
         }
 
@@ -1117,6 +1139,9 @@ impl Agli {
             FloorDecision::Speak => {
                 if self.floor.allow_reply(&self.cfg.social, &ctx.key, &who.person_id, who.is_agent, now) {
                     batch.speak = true;
+                    if addressed && !who.is_agent && (env.mentions_me || group_key.as_ref().is_some_and(|g| self.lexicon.called_by(g, &env.authored_text).is_some())) {
+                        batch.inputs.include(&env);
+                    }
                 } else {
                     info!("reply cap reached for {} in {}", who.person_id, ctx.key);
                 }
@@ -1151,7 +1176,7 @@ impl Agli {
             _ => return Ok(None),
         };
         let env = Envelope {
-            notice: false, attachments: Vec::new(),
+            authored_text: String::new(), notice: false, attachments: Vec::new(),
             platform, chat_id: chat.chat_id.clone(), sender_id: chat.sender_id.clone(), sender_name: String::new(),
             sender_is_bot: chat.is_agent, is_group: false, mentions_me: false, text: String::new(), message_id: None, arrived: None,
         };
@@ -1373,7 +1398,7 @@ impl Agli {
     /// reply back while formatting it.
     async fn converse_with_claim(&mut self, ctx: &ChatCtx, mut body: String, current: usize, unsolicited: bool, may_quit: bool, claim: Option<&str>) -> Result<()> {
         // Addressed turns only: chiming in never spends a look, and the images keep waiting.
-        let look = match self.pending_media.remove(&ctx.key) {
+        let mut look = match self.pending_media.remove(&ctx.key) {
             Some(pending) if !unsolicited => crate::mind::vision::look(&self.outlets, &self.media, pending).await,
             Some(pending) => {
                 self.pending_media.insert(ctx.key.clone(), pending);
@@ -1381,7 +1406,7 @@ impl Agli {
             }
             None => Default::default(),
         };
-        let without_parts = format!("{}{}", self.media.render(&body, &[]), look.note_without_parts);
+        let mut without_parts = format!("{}{}", self.media.render(&body, &[]), look.note_without_parts);
         body = self.media.render(&body, &look.with_pixels);
         body.push_str(&look.note);
         let now = Utc::now();
@@ -1392,7 +1417,6 @@ impl Agli {
         // Slang goes in the tail, never L1/L2, so the cached prefix is unchanged.
         notes.extend(self.slang_note(ctx, &body, now));
         let turn_tail = tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref(), &notes);
-        let text = user_turn(&turn_tail, &body);
         // Recall runs on every turn (cheap at this volume) so the policy is known before routing.
         let tasks = ctx.task_cards(&self.board());
         let embedded = match self.models.embed(&ProcessingPolicy::default_for(&ctx.scope), &body).await {
@@ -1403,6 +1427,26 @@ impl Agli {
             Some(vector) => self.frame_with_embedding(ctx, current, &tasks, Some(&vector))?,
             None => self.frame(ctx, current, &tasks)?,
         };
+        let inputs = self.turn_inputs.take().filter(|(key, _)| key == &ctx.key && !unsolicited && claim.is_none())
+            .map(|(_, inputs)| inputs).unwrap_or_default();
+        let mut task_images = inputs.images();
+        let mut read = self.read_inputs(ctx, &policy, inputs, reading::Purpose::Chat).await;
+        if !look.undecoded.is_empty() && policy.allows_executor("deepseek") {
+            let unread = task_images.take_undecoded(&look.undecoded);
+            let ocr = self.read_inputs(ctx, &policy, unread, reading::Purpose::OcrFallback).await;
+            read.note.push_str(&ocr.note);
+            read.evidence.extend(ocr.evidence);
+            read.errors.extend(ocr.errors);
+        }
+        let mut readable_text = !read.evidence.is_empty();
+        let mut read_errors = read.errors;
+        let mut evidence = self.task_sources(ctx, &policy, &body, read.evidence);
+        body.push_str(&read.note);
+        without_parts.push_str(&read.note);
+        without_parts.push_str(&read.fallback);
+        look.parts.extend(read.parts);
+        let mut readable_pixels = !look.parts.is_empty();
+        let text = user_turn(&turn_tail, &body);
         self.speaker.refresh_tasks(&ctx.key, &tasks);
         #[cfg(test)]
         let response = if let Some(test) = &mut self.test_chat {
@@ -1422,6 +1466,16 @@ impl Agli {
                 match first {
                     Err(e) if had_images => {
                         warn!("reply with images failed, retrying without them: {e:#}");
+                        readable_pixels = false;
+                        if !task_images.is_empty() && policy.allows_executor("deepseek") {
+                            let transcription = self.read_inputs(ctx, &policy, std::mem::take(&mut task_images), reading::Purpose::OcrFallback).await;
+                            without_parts.push_str(&transcription.note);
+                            readable_text |= !transcription.evidence.is_empty();
+                            read_errors.extend(transcription.errors);
+                            evidence.extend(transcription.evidence);
+                        } else if !read.fallback.trim().is_empty() {
+                            read_errors.push(read.fallback.trim().into());
+                        }
                         let text = user_turn(&turn_tail, &without_parts);
                         self.speaker.say(&self.models, &ctx.key, &policy, now, text, Vec::new(), Vec::new(), || Ok(l2)).await
                     }
@@ -1429,8 +1483,12 @@ impl Agli {
                 }
             }
         };
+        // A failed generation has already popped its user turn. The last draft then belongs to an earlier reply.
+        let draft_at = if response.is_ok() { self.speaker.draft_at(&ctx.key) } else { None };
         let raw = match response {
+            _ if !read_errors.is_empty() && !readable_text && !readable_pixels => String::new(),
             Ok(r) => r,
+            Err(_) if !read_errors.is_empty() => String::new(),
             Err(e) => {
                 error!("reply failed: {e:#}");
                 if !ctx.is_group {
@@ -1440,8 +1498,14 @@ impl Agli {
             }
         };
         let raw = watchlist::accept_reply(self.store.as_ref(), &self.cfg.mind_dir(), &raw, ctx.owner_private(), &ctx.key, now)?;
-        let draft_at = self.speaker.draft_at(&ctx.key);
         let mut intent = parse_intent(&raw);
+        if ctx.owner_private() && policy == ProcessingPolicy::Any && (!intent.tasks.is_empty() || !intent.followups.is_empty()) && !task_images.is_empty() {
+            let transcription = self.read_inputs(ctx, &policy, task_images, reading::Purpose::Task).await;
+            evidence.extend(transcription.evidence);
+            if !transcription.errors.is_empty() {
+                read_errors.push(format!("任务图片材料未完整保存：{}", transcription.errors.join(" ")));
+            }
+        }
         if let Some(id) = intent.sticker.take() {
             warn!("ignored sticker `{id}` in a draft in {}: candidates come only after a request", ctx.key);
         }
@@ -1455,9 +1519,8 @@ impl Agli {
         let from_owner = ctx.partner.as_ref().is_some_and(|w| w.is_owner);
         for (kind, title) in &intent.tasks {
             if from_owner {
-                let t = self.board().add(title, *kind, &self.cfg.acl.owner.person_id, TaskStatus::Inbox, Some(ctx.thread_ref()))?;
-                info!("owner asked for a task: {} ({})", t.title, t.id);
-                self.wake_decide = true;
+                let id = self.add_chat_task(ctx, *kind, title, &evidence)?;
+                info!("owner asked for a task: {title} ({id})");
             } else {
                 warn!("ignored a task marker outside an owner chat in {}: {title}", ctx.key);
                 // His transcript still holds the marker; tell him next turn so he does not act as if it runs.
@@ -1469,8 +1532,8 @@ impl Agli {
             self.relay_request(&requester, req)?;
             self.push_urgent().await?;
         }
-        attach_followups(&mut self.board(), ctx, &mut intent);
-        if intent.silent {
+        attach_followups_with_sources(&mut self.board(), ctx, &mut intent, &evidence);
+        if intent.silent && read_errors.is_empty() {
             anyhow::ensure!(claim.is_none(), "focus catch-up produced no reply; keeping held messages");
             if ctx.is_group && !unsolicited {
                 warn!("stayed silent though addressed in {}", ctx.key);
@@ -1482,8 +1545,13 @@ impl Agli {
         if !intent.pieces.is_empty() {
             match self.format_reply(ctx, unsolicited, may_quit, &policy, intent.pieces).await {
                 Some(pieces) => intent.pieces = pieces,
+                None if !read_errors.is_empty() => intent.pieces = Vec::new(),
                 None => return Ok(()),
             }
+        }
+        if !read_errors.is_empty() {
+            let prefix = if intent.pieces.is_empty() { "" } else { "\n" };
+            intent.pieces.push(ReplyPiece::Text(format!("{prefix}{}", read_errors.join("\n"))));
         }
         intent.text = reply_text(&intent.pieces);
         if intent.text.is_empty() && sticker.is_none() && intent.reaction.is_none() { return Ok(()) }
@@ -1775,12 +1843,40 @@ impl Agli {
 
     // ---------------------------------------------------------------- owner console
 
-    async fn command(&mut self, line: &str, ctx: &ChatCtx) -> String {
+    async fn command(&mut self, line: &str, ctx: &ChatCtx, env: &Envelope) -> String {
         let (cmd, arg) = line.split_once(char::is_whitespace).map(|(c, a)| (c, a.trim())).unwrap_or((line, ""));
+        if matches!(cmd, "/task" | "/code") && !arg.is_empty() {
+            let mut inputs = reading::Inputs::default();
+            inputs.include(env);
+            let has_inputs = !inputs.is_empty();
+            let result: Result<String> = async {
+                let (_, policy) = self.frame(ctx, 1, &ctx.task_cards(&self.board()))?;
+                let read = self.read_inputs(ctx, &policy, inputs, reading::Purpose::Task).await;
+                if !read.errors.is_empty() { return Ok(format!("任务未建立：{}", read.errors.join(" "))); }
+                anyhow::ensure!(!has_inputs || policy == ProcessingPolicy::Any, "当前处理策略不允许把材料交给任务执行器");
+                let evidence = self.task_sources(ctx, &policy, arg, read.evidence);
+                let kind = if cmd == "/code" { TaskKind::Code } else { TaskKind::Research };
+                let id = self.add_chat_task(ctx, kind, arg, &evidence)?;
+                Ok(if evidence.is_empty() { format!("记下了：{id}") } else { format!("记下了：{id}（附 {} 份材料）", evidence.len()) })
+            }.await;
+            return result.unwrap_or_else(|e| format!("出错了：{e:#}"));
+        }
         match self.run_command(cmd, arg, ctx).await {
             Ok(s) => s,
             Err(e) => format!("出错了：{e:#}"),
         }
+    }
+
+    fn add_chat_task(&mut self, ctx: &ChatCtx, kind: TaskKind, title: &str, evidence: &[reading::Evidence]) -> Result<String> {
+        let mut board = self.board();
+        let task = board.add(title, kind, &self.cfg.acl.owner.person_id, TaskStatus::Inbox, Some(ctx.thread_ref()))?;
+        if let Err(e) = reading::save(&board, &task.id, ctx, evidence) {
+            board.set_status(&task.id, TaskStatus::Waiting, "任务材料未保存完整")?;
+            return Err(e);
+        }
+        drop(board);
+        self.wake_decide = true;
+        Ok(task.id)
     }
 
     async fn run_command(&mut self, cmd: &str, arg: &str, ctx: &ChatCtx) -> Result<String> {
@@ -1808,9 +1904,7 @@ impl Agli {
             "/board" => self.board().summary(),
             "/task" | "/code" if !arg.is_empty() => {
                 let kind = if cmd == "/code" { TaskKind::Code } else { TaskKind::Research };
-                let t = self.board().add(arg, kind, &self.cfg.acl.owner.person_id, TaskStatus::Inbox, Some(ctx.thread_ref()))?;
-                self.wake_decide = true;
-                format!("记下了：{}", t.id)
+                format!("记下了：{}", self.add_chat_task(ctx, kind, arg, &[])?)
             }
             "/run" if !arg.is_empty() => self.start_job_with_owner_slot(arg, ctx.owner_private())?,
             "/evolve" => self.start_evolution(arg, ctx)?,
@@ -1981,7 +2075,7 @@ impl Agli {
         self.flow.exit(now)
     }
 
-    async fn on_job_done(&mut self, o: research::Outcome) -> Result<()> {
+    async fn on_job_done(&mut self, mut o: research::Outcome) -> Result<()> {
         let job = self.jobs.remove(&o.task_id);
         let exit = if self.cfg.runtime.hands.max_jobs == 1 || self.flow.task_id.as_deref() == Some(&o.task_id) {
             self.exit_flow()
@@ -1991,16 +2085,36 @@ impl Agli {
                 pending: BTreeMap::new(),
             }
         };
+        let mut status = o.status();
+        if status == TaskStatus::Done
+            && let Some(review_id) = o.verdict.as_deref().and_then(|s| s.split_whitespace().next()).and_then(|s| s.strip_prefix('#')).and_then(|s| s.parse::<u64>().ok())
+            && let Some(review) = self.store.reviews()?.into_iter().find(|r| r.id == review_id && r.payload["task_id"].as_str() == Some(o.task_id.as_str()))
+            && let Some(reviewed) = review.payload["reviewed_followups_bytes"].as_u64()
+        {
+            let path = self.board().task_dir(&o.task_id).join("followups.md");
+            let length = match std::fs::metadata(path) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(e) => return Err(e.into()),
+            };
+            if length != reviewed {
+                status = TaskStatus::Inbox;
+                o.paused = Some("审查后收到了新的补充，已排入下一轮。".into());
+                o.summary = o.paused.clone().unwrap_or_default();
+            } else {
+                judge::settle_work_revisions(self.store.as_ref(), &o.task_id, &review)?;
+            }
+        }
         let note = if let Some(reason) = &o.paused {
             reason.as_str()
         } else if o.clarification.is_some() { "等待主人澄清" } else if o.ok { "" } else { "出错，等主人看" };
-        self.board().set_status(&o.task_id, o.status(), note)?;
+        self.board().set_status(&o.task_id, status, note)?;
         self.audit("owner", "delegate_result", true, &o.task_id, if o.ok { Outcome::Sent } else { Outcome::Failed })?;
         self.state.finished_work();
         reflect::note_today(self.store.as_ref(), &format!("专心做了 {} 分钟：{}（{}）", exit.minutes, o.title, if o.status() == TaskStatus::Done { "完成" } else { "没做完" }))?;
         self.push_urgent().await?;
         // A watchdog pause has its own persisted review alert, including the reason and id.
-        if o.paused.is_none() || o.verdict.is_none() {
+        if o.ok || o.paused.is_none() || o.verdict.is_none() {
             if self.state.energy.asleep {
                 self.deliveries.push(o);
             } else {
@@ -2456,7 +2570,7 @@ mod tests {
 
     fn inbound(chat: &str, text: &str, id: &str) -> Event {
         Event::Inbound(Envelope {
-            notice: false, attachments: Vec::new(),
+            authored_text: text.into(), notice: false, attachments: Vec::new(),
             platform: "telegram", chat_id: chat.into(), message_id: Some(id.into()),
             sender_id: "42".into(), sender_name: "主人".into(), sender_is_bot: false,
             is_group: false, mentions_me: false, text: text.into(), arrived: None,
@@ -3626,6 +3740,112 @@ mod tests {
         task
     }
 
+    #[tokio::test]
+    async fn work_review_verdicts_and_late_followups_survive_completion_and_reload() {
+        use crate::store::{ReviewStatus, jsonl::JsonlStore};
+        let mut test = TestAgli::new("review-completion").await;
+        let a = &mut test.agli;
+        a.state.energy.asleep = true;
+        for kind in [TaskKind::Research, TaskKind::Code] {
+            for case in ["pass", "revise", "defer", "owner", "late-followup"] {
+                let title = format!("{kind:?}-{case}");
+                let task = a.board().add(&title, kind, "owner", TaskStatus::Active, None).unwrap();
+                let verdict = if case == "late-followup" { "pass" } else { case };
+                let rounds = if case == "revise" { 3 } else { 1 };
+                let decision = json!({"verdict":verdict, "reasons":"验收依据", "fixes":"具体修改意见"}).to_string();
+                let mut replies = Vec::new();
+                if kind == TaskKind::Research { replies.push("计划\n澄清：无".into()); }
+                for _ in 0..rounds {
+                    if kind == TaskKind::Research { replies.push("报告".into()); }
+                    replies.push(decision.clone());
+                }
+                let mut hands = a.cfg.runtime.hands.clone();
+                hands.research = crate::config::DelegateTool::Off;
+                let job = Job { task: task.clone(), board: a.board.clone(), store: a.store.clone(),
+                    models: Arc::new(Models::stub(a.store.clone(), replies)), hands, l1: "zh".into() };
+                let outcome = match kind {
+                    TaskKind::Research => research::run(job).await,
+                    TaskKind::Code => research::code_rounds(&job, |_, _| std::future::ready(Ok("执行记录".into()))).await.unwrap(),
+                };
+                if case == "late-followup" {
+                    assert_eq!(outcome.status(), TaskStatus::Done);
+                    a.board().follow_up(&task.id, "还有一份资料", ThreadRef {
+                        platform: "telegram".into(), chat_id: "42".into(), message_id: Some("11".into()),
+                    }).unwrap();
+                }
+                a.on_job_done(outcome).await.unwrap();
+                let board = Board::load(&a.cfg.work_dir()).unwrap();
+                let saved = board.get(&task.id).unwrap();
+                let store = JsonlStore::open(&a.cfg.data_dir()).unwrap();
+                let reviews: Vec<_> = store.reviews().unwrap().into_iter().filter(|r| r.payload["task_id"] == task.id).collect();
+                assert_eq!(reviews.len(), rounds);
+                let last = reviews.last().unwrap();
+                let expected = match case { "pass" => TaskStatus::Done, "late-followup" => TaskStatus::Inbox, _ => TaskStatus::Waiting };
+                assert_eq!(saved.status, expected);
+                let notes = store.kv_get(&format!("daylog:{}", reflect::diary_day(Local::now()))).unwrap().unwrap();
+                let line = notes.as_array().unwrap().last().unwrap().as_str().unwrap();
+                assert!(line.contains(&title));
+                assert_eq!(line.contains("（完成）"), expected == TaskStatus::Done);
+                if expected == TaskStatus::Waiting {
+                    assert_eq!(last.status, ReviewStatus::Open);
+                    assert!(saved.note.contains("/run") && saved.note.contains("具体修改意见"));
+                    assert!(judge::digest(&store).unwrap().unwrap().contains(&title));
+                } else {
+                    assert_eq!(last.status, ReviewStatus::Closed);
+                }
+                if expected == TaskStatus::Inbox {
+                    assert!(saved.note.contains("排入下一轮") && a.wake_decide);
+                    assert_eq!(last.payload["reviewed_followups_bytes"], 0);
+                    assert!(std::fs::read_to_string(board.task_dir(&task.id).join("followups.md")).unwrap().contains("还有一份资料"));
+                }
+                assert_eq!(a.deliveries.last().unwrap().task_id, task.id);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resumed_passing_work_settles_only_its_automatic_revision_requests() {
+        use crate::store::{ReviewStatus, jsonl::JsonlStore};
+        let mut test = TestAgli::new("superseded-work-review").await;
+        let a = &mut test.agli;
+        a.state.energy.asleep = true;
+        Arc::get_mut(&mut a.cfg).unwrap().runtime.hands.research = crate::config::DelegateTool::Off;
+        let task = a.board().add("revised report", TaskKind::Research, "owner", TaskStatus::Waiting, None).unwrap();
+        let mut old = Vec::new();
+        for (task_id, verdict) in [(&task.id[..], judge::Verdict::Revise), (&task.id, judge::Verdict::Defer),
+            (&task.id, judge::Verdict::Owner), ("another-task", judge::Verdict::Revise)] {
+            let j = judge::Judgement { verdict, reasons: "original reason".into(), fixes: "original fixes".into(), urgent: false };
+            old.push(judge::file(a.store.as_ref(), ReviewCategory::Verify, &task.title, "previous work", &j, true,
+                json!({"task_id":task_id,"work_round":1})).unwrap());
+        }
+        a.models = Arc::new(Models::stub(a.store.clone(), vec!["plan\n澄清：无".into(), "revised report".into(),
+            r#"{"verdict":"pass","reasons":"addressed"}"#.into()]));
+        let (tx, mut rx) = mpsc::channel(2);
+        a.events = tx;
+        let ctx = a.focus_ctx("telegram", "42", "42").unwrap();
+        assert!(a.run_command("/run", &task.id, &ctx).await.unwrap().contains("开始做"));
+        let Some(Event::JobDone(outcome)) = rx.recv().await else { panic!("missing resumed completion") };
+        a.on_job_done(outcome).await.unwrap();
+        assert_eq!(Board::load(&a.cfg.work_dir()).unwrap().get(&task.id).unwrap().status, TaskStatus::Done);
+        let store = JsonlStore::open(&a.cfg.data_dir()).unwrap();
+        let reviews = store.reviews().unwrap();
+        let passed = reviews.last().unwrap();
+        assert!(passed.verdict.starts_with("通过"));
+        for (i, expected) in old.iter().enumerate() {
+            let saved = reviews.iter().find(|r| r.id == expected.id).unwrap();
+            assert_eq!(saved.verdict, expected.verdict);
+            if i < 2 {
+                assert_eq!(saved.status, ReviewStatus::Closed);
+                assert_eq!(saved.payload["superseded_by"], passed.id);
+            } else {
+                assert_eq!(saved.status, ReviewStatus::Open);
+            }
+        }
+        let digest = judge::digest(&store).unwrap().unwrap();
+        assert!(!digest.contains(&format!("#{} [", old[0].id)) && !digest.contains(&format!("#{} [", old[1].id)));
+        assert!(digest.contains(&format!("#{} [", old[2].id)) && digest.contains(&format!("#{} [", old[3].id)));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn watchdog_tick_stalls_waits_for_cancellation_and_delivers_once() {
         let mut test = TestAgli::new("watchdog-stall").await;
@@ -4295,6 +4515,123 @@ mod tests {
             quoted_from: None,
         }];
         env
+    }
+
+    #[tokio::test]
+    async fn readable_sources_are_limited_to_the_addressed_authors_input() {
+        let mut t = TestAgli::new("read-input-scope").await;
+        let a = &mut t.agli;
+        a.test_chat = Some(TestChat::new(&["我看完文件了，里面全是水果。"], &[Outcome::Sent]));
+        let mut group = group_messages(&["看附件", "我的消息"], true);
+        for (env, file) in group.iter_mut().zip(["addressed.zzz", "ambient.zzz"]) {
+            env.attachments.push(crate::channels::Attachment { kind: crate::channels::AttachmentKind::File,
+                url: None, file_id: None, name: Some(file.into()), size: None, quoted_from: None, media_id: None });
+        }
+        a.on_messages(group).await.unwrap();
+        let turn = &a.test_chat.as_ref().unwrap().turns[0].1;
+        assert!(turn.contains("addressed.zzz") && turn.contains("未读到内容"), "{turn}");
+        assert!(!turn.contains("ambient.zzz"));
+        let sent = a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap();
+        assert!(sent[0].contains("addressed.zzz") && sent[0].contains("未读到内容") && !sent[0].contains("水果"));
+        assert!(!a.store.recent_in_ns(&Namespace::Group("telegram:-7".into()), 8).unwrap()
+            .iter().any(|m| !m.outgoing && m.text.contains("addressed.zzz")));
+    }
+
+    #[tokio::test]
+    async fn bounded_source_reaches_same_chat_followup_and_matching_task_only() -> Result<()> {
+        use axum::{Json, Router, routing::{get, post}};
+        use crate::channels::{Attachment, AttachmentKind};
+        use crate::hands::reader::Reader;
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let capture = prompts.clone();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(4, 4).write_to(&mut png, image::ImageFormat::Png)?;
+        let bytes = png.into_inner();
+        let mock = Router::new()
+            .route("/bot-fixture/getFile", get(|| async { Json(json!({"result":{"file_path":"drawing.png"}})) }))
+            .route("/bot-fixture/sendMessage", post(|| async { Json(json!({"ok":true})) }))
+            .route("/file/bot-fixture/drawing.png", get(move || async move { bytes }))
+            .route("/v1/tools/fetch", post(|| async { Json(json!({"title":"Sample","content":"unused-detail=7291"})) }))
+            .route("/chat/completions", post(move |Json(body): Json<Value>| {
+                let capture = capture.clone();
+                async move {
+                    if body.to_string().contains("模拟本轮生成失败") { return Json(json!({"choices":[]})); }
+                    let answer = if body.to_string().contains("data:image/jpeg;base64,") { "黑色方块位于画布中央" } else { "收到" };
+                    capture.lock().unwrap().push(body);
+                    Json(json!({"choices":[{"message":{"content":answer}}]}))
+                }
+            }));
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", socket.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(socket, mock).await.unwrap(); });
+        let mut test = TestAgli::new("reader-session").await;
+        let a = &mut test.agli;
+        let cfg = Arc::make_mut(&mut a.cfg);
+        cfg.models.providers.get_mut("test").unwrap().base_url = Some(origin.clone());
+        cfg.models.models[0].stream = false;
+        a.models = Arc::new(Models::new(cfg, a.store.clone()).await?);
+        a.outlets.telegram = Some(crate::channels::telegram::Telegram::fixture(format!("{origin}/bot-fixture")));
+        let mut env = private_message("42", "读这个网页");
+        env.attachments.push(Attachment {kind: AttachmentKind::Link, url: Some("https://8.8.8.8/wiki?title=First#details".into()), name: None, file_id: None, size: None, media_id: None, quoted_from: None});
+        let batch = a.prepare_messages(vec![env]).await;
+        assert!(batch.speak);
+        let ctx = batch.ctx.unwrap();
+        let policy = ProcessingPolicy::Any;
+        let disallowed = a.read_inputs_with(&ctx, &ProcessingPolicy::LocalOnly, batch.inputs.clone(), reading::Purpose::Chat, Ok(Reader::at(origin.clone()))).await;
+        assert!(disallowed.evidence.is_empty() && disallowed.note.contains("处理策略"));
+        let read = a.read_inputs_with(&ctx, &policy, batch.inputs, reading::Purpose::Chat, Ok(Reader::at(origin.clone()))).await;
+        let task_id = a.add_chat_task(&ctx, TaskKind::Research, "任务", &read.evidence)?;
+        reading::save(&a.board(), &task_id, &ctx, &read.evidence)?;
+        let input_dir = a.board().task_dir(&task_id).join("inputs");
+        let entries = std::fs::read_dir(input_dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        let saved: Value = serde_json::from_slice(&std::fs::read(entry.path())?)?;
+        assert!(saved["body"].as_str().unwrap().contains("unused-detail=7291"));
+        assert_eq!(saved["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(saved["source_url"], "https://8.8.8.8/wiki?title=First");
+        assert!(read.note.contains("https://8.8.8.8/wiki?title=First"));
+        let other_ctx = a.focus_ctx("telegram", "other", "42").unwrap();
+        assert!(reading::save(&a.board(), &task_id, &other_ctx, &read.evidence).is_err());
+        for (key, body) in [(&*ctx.key, read.note.as_str()), (&*ctx.key, "补充一个没提过的细节？"), ("telegram:other", "另一个对话")] {
+            a.speaker.say(&a.models, key, &policy, Utc::now(), body.into(), vec![], vec![], || Ok(String::new())).await?;
+        }
+        {
+            let calls = prompts.lock().unwrap();
+            assert_eq!(calls.len(), 3);
+            assert_eq!(calls[1]["messages"].as_array().unwrap().iter().find(|m| m["role"]=="assistant").unwrap()["content"], "收到");
+            assert!(calls[1]["messages"].to_string().contains("unused-detail=7291"));
+            assert!(!calls[2]["messages"].to_string().contains("unused-detail=7291"));
+        }
+        let mut env = private_message("42", "分析色块");
+        env.authored_text = env.text.clone();
+        env.attachments.push(Attachment {kind:AttachmentKind::File, url:None, name:Some("drawing.png".into()), file_id:Some("f".into()), size:None, media_id:None, quoted_from:None});
+        let batch = a.prepare_messages(vec![env.clone()]).await;
+        let visual = a.read_inputs_with(&ctx, &policy, batch.inputs.clone(), reading::Purpose::Task, Ok(Reader::at(origin.clone()))).await;
+        assert!(visual.note.contains("模型视觉描述") && visual.note.contains("黑色方块"), "{}",visual.note);
+        let denied = a.read_inputs_with(&ctx, &ProcessingPolicy::LocalOnly, batch.inputs, reading::Purpose::Task, Ok(Reader::at(origin))).await;
+        assert!(denied.evidence.is_empty());
+        assert_eq!(prompts.lock().unwrap().len(), 4);
+        env.attachments.push(Attachment {kind: AttachmentKind::File, url:None, file_id:None, name:Some("other.xyz".into()), size:None, quoted_from:None, media_id:None});
+        a.test_chat = Some(TestChat::new(&["这个方块是黑色的。"], &[Outcome::Sent]));
+        a.on_messages(vec![env]).await?;
+        {
+            let sent = a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap();
+            assert!(sent[0].contains("黑色") && sent[0].contains("other.xyz") && sent[0].contains("未读到内容"), "{sent:?}");
+        }
+        a.test_chat = None;
+        a.speaker.say(&a.models, &ctx.key, &policy, Utc::now(), "保留这轮回答".into(), vec![], vec![], || Ok(String::new())).await?;
+        let mut broken = private_message("42", "模拟本轮生成失败");
+        broken.attachments.push(Attachment {kind: AttachmentKind::File, url:None, file_id:None, name:Some("broken.xyz".into()), size:None, quoted_from:None, media_id:None});
+        a.on_messages(vec![broken]).await?;
+        assert!(a.store.recent_in_ns(&ctx.ns, 1)?.last().is_some_and(|m| m.outgoing && m.text.contains("broken.xyz") && m.text.contains("未读到内容")));
+        a.speaker.say(&a.models, &ctx.key, &policy, Utc::now(), "继续".into(), vec![], vec![], || Ok(String::new())).await?;
+        let calls = prompts.lock().unwrap();
+        let turns = calls.last().unwrap()["messages"].as_array().unwrap();
+        let previous = turns.iter().position(|turn| turn["content"] == "保留这轮回答").unwrap();
+        assert_eq!(turns[previous + 1]["content"], "收到");
+        server.abort();
+        Ok(())
     }
 
     #[tokio::test]

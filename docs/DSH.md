@@ -1,6 +1,8 @@
 # DSH hand: ticket 25 owner handoff
 
-The code is opt-in. Research defaults to Codex; code tasks still use Codex.
+The deserialization default for a missing `hands.research` is Codex; the checked-in
+`config/runtime.yaml` explicitly selects DSH for research. Code tasks use Codex.
+This describes repository configuration, not verification of a running deployment.
 Set `AGLI_DSH_BIN` in the bot's environment to
 `C:/dev/DSH/resources/runtime/cli/bin/dsh.cmd` (or an owner-provided isolated
 launcher). Without it the hand resolves `dsh.cmd` on Windows, `dsh` elsewhere.

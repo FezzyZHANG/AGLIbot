@@ -8,6 +8,8 @@
 `AGENTS.md`，以及整个 `src/evolution/` 和 `src/agli/evolution.rs` 闸门实现。
 worktree 提供版本和工作目录隔离，并不提供 OS 权限隔离。
 
+2026-11-15 [审查](reviews/2026-11-15/REVIEW.md)确认：闸门尚未检查候选是否包含当前在线 release，过期基线可隐含回滚已上线改动；成功进化也未更新手动启动脚本使用的 PID 记录。下面描述的候选自身校验仍存在，但不能推导出上线基线和运维交接已受保护。
+
 ## 提交候选
 
 1. 在 Moldloft 建立无未完成前置依赖的工单，或先由主人接受一项 Moldloft proposal。

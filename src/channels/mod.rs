@@ -2,6 +2,8 @@
 
 pub mod qq;
 pub mod telegram;
+mod urls;
+pub(crate) use urls::public_url;
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -50,7 +52,6 @@ pub fn reply_prefix(pieces: &[ReplyPiece], mut end: usize) -> Vec<ReplyPiece> {
 /// A platform media reference; QQ URLs expire within hours.
 /// NapCat can refetch via `get_image {file}`, `get_record {file, out_format}`,
 /// or `get_file {file_id}`. References are not persisted to the store.
-#[allow(dead_code)] // `name` waits for later media work.
 #[derive(Debug, Clone)]
 pub struct Attachment {
     pub kind: AttachmentKind,
@@ -71,6 +72,7 @@ pub enum AttachmentKind {
     Voice,
     Video,
     File,
+    Link,
 }
 
 /// A media download passed its size limit.
@@ -121,6 +123,8 @@ async fn fetch_url(url: &str, max: usize) -> Result<Vec<u8>> {
 
 #[derive(Debug, Clone)]
 pub struct Envelope {
+    /// Only text written by the sender, excluding forwarded messages and reply previews.
+    pub authored_text: String,
     /// Platform notice rendered as a transcript line, not a chat message.
     pub notice: bool,
     /// `telegram` or `qq`.
@@ -207,6 +211,27 @@ mod tests {
 }
 
 impl Outlets {
+    /// Channel file references can expire. Resolve QQ ids using the originating chat.
+    pub(crate) async fn download_file(&self, platform: &str, chat_id: &str, a: &Attachment, max: usize) -> Result<Vec<u8>> {
+        if a.size.is_some_and(|n| n > max as u64) { return Err(TooLarge.into()); }
+        if platform == "telegram" { return self.fetch_media(platform, a, max).await; }
+        anyhow::ensure!(platform == "qq", "unknown file platform");
+        if let Some(url) = &a.url {
+            match urls::download(url, max).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) if e.is::<TooLarge>() => return Err(e),
+                Err(_) => {}
+            }
+        }
+        let qq = self.qq.as_ref().ok_or_else(|| anyhow::anyhow!("QQ 未连接"))?;
+        let file = a.file_id.as_deref().ok_or_else(|| anyhow::anyhow!("附件缺少文件编号"))?;
+        let url = if matches!(a.kind, AttachmentKind::Image | AttachmentKind::Sticker) {
+            qq.image_url(file).await?
+        } else {
+            qq.file_url(chat_id, file).await?
+        };
+        urls::download(&url, max).await
+    }
     pub async fn send(&self, platform: &str, chat_id: &str, text: &str) -> Result<()> {
         if let ("qq", Some(qq)) = (platform, &self.qq) {
             return qq.send(chat_id, text).await;

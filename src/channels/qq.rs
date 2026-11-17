@@ -327,6 +327,15 @@ impl QqHandle {
             .ok_or_else(|| anyhow!("get_image returned no url"))
     }
 
+    pub async fn file_url(&self, chat_id: &str, file: &str) -> Result<String> {
+        let data = if let Some(id) = chat_id.strip_prefix("group:") {
+            self.call("get_group_file_url", json!({"group_id": id.parse::<i64>()?, "file_id": file})).await?
+        } else {
+            self.call("get_private_file_url", json!({"file_id": file})).await?
+        };
+        data.get("url").and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("平台未返回文件下载链接"))
+    }
+
     /// Groups the bot account is in.
     pub async fn group_ids(&self) -> Result<Vec<i64>> {
         let data = self.call("get_group_list", json!({})).await?;
@@ -540,6 +549,8 @@ fn parse_event(v: &Value, shared: &Shared) -> Option<Pending> {
     let name = sender_name(v.get("sender").unwrap_or(&Value::Null)).unwrap_or_default();
     Some(Pending {
         env: Envelope {
+            authored_text: message.iter().filter(|s| s["type"] == "text")
+                .filter_map(|s| s.pointer("/data/text").and_then(Value::as_str)).collect::<Vec<_>>().join(" "),
             notice: false, arrived: Some(tokio::time::Instant::now()),
             platform: "qq",
             chat_id,
@@ -550,7 +561,13 @@ fn parse_event(v: &Value, shared: &Shared) -> Option<Pending> {
             is_group,
             mentions_me: !is_group,
             text: String::new(),
-            attachments: attachments(&message),
+            attachments: {
+                let mut result = attachments(&message);
+                result.extend(message.iter().filter(|s| s["type"] == "text")
+                    .filter_map(|s| s.pointer("/data/text").and_then(Value::as_str))
+                    .flat_map(super::urls::authored_links).take(4));
+                result
+            },
         },
         message,
         recalled_id: None,
@@ -614,7 +631,7 @@ fn parse_notice(v: &Value, shared: &Shared) -> Option<Pending> {
     };
     Some(Pending {
         env: Envelope {
-            notice: true, platform: "qq", chat_id, message_id: None,
+            authored_text: String::new(), notice: true, platform: "qq", chat_id, message_id: None,
             // No name: people.observe would rename the person to their id.
             sender_id: sender.to_string(), sender_name: String::new(), sender_is_bot: false,
             is_group, mentions_me, text: text.into(), attachments: Vec::new(),
@@ -1563,6 +1580,26 @@ mod tests {
         s.cache("0".into(), Quoted { name: "我".into(), text: "updated".into(), images: Vec::new() });
         assert_eq!(s.cached("0").unwrap().text, "updated");
         assert_eq!(s.recent.lock().unwrap().len(), RECENT_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn id_only_files_request_their_platform_url_and_check_its_destination() {
+        for (chat, expected) in [("group:34", "get_group_file_url"), ("private:72", "get_private_file_url")] {
+            let (tx, mut rx) = mpsc::channel::<Request>(2);
+            let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+            let outlets = super::super::Outlets { qq: Some(qq), telegram: None };
+            let file = Attachment { kind: AttachmentKind::File, file_id: Some("opaque-id".into()), name: Some("sample.pdf".into()),
+                url: None, size: None, quoted_from: None, media_id: None };
+            let respond = async {
+                let req = rx.recv().await.unwrap();
+                assert_eq!(req.action, expected);
+                assert_eq!(req.params["file_id"], "opaque-id");
+                if chat.starts_with("group:") { assert_eq!(req.params["group_id"], 34); }
+                req.reply.send(Ok(json!({"url":"http://127.0.0.1/blocked"}))).unwrap();
+            };
+            let (result, ()) = tokio::join!(outlets.download_file("qq", chat, &file, 64), respond);
+            assert!(result.unwrap_err().to_string().contains("公网"));
+        }
     }
 
     #[tokio::test]
