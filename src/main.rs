@@ -60,8 +60,8 @@ async fn main() -> Result<()> {
         dotenvy::from_path(PathBuf::from(root).join(".env")).ok();
     }
     dotenvy::dotenv().ok();
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("import-jsonl")) {
-        return store::import::run(std::env::args_os().skip(2));
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("migrate-bson")) {
+        return store::migrate::run(std::env::args_os().skip(2)).await;
     }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("stickers-web")) {
         return stickers_web::run(std::env::args_os().skip(2)).await;
@@ -117,7 +117,7 @@ async fn run(cfg: Arc<Config>, telegram: Result<Telegram>) -> Result<()> {
     if owner.telegram_user_id == 0 && owner.qq_user_id == 0 {
         warn!("没有设置主人的 ID（OWNER_TELEGRAM_ID / OWNER_QQ_ID）：没人能使用主人权限，日志会打印发信人的 ID");
     }
-    let store = store::open(&cfg.runtime.mongo, &cfg.data_dir())
+    let store = store::open(&cfg.runtime.mongo).await
         .inspect_err(|_| report(Fault::StartupStore))?;
     let models = Arc::new(Models::new(&cfg, store.clone()).await
         .inspect_err(|_| report(Fault::StartupModels))?);
@@ -152,9 +152,9 @@ async fn run(cfg: Arc<Config>, telegram: Result<Telegram>) -> Result<()> {
         anyhow::bail!("没有可用的聊天渠道：请配置 TELEGRAM_BOT_TOKEN 或 ONEBOT_URL");
     }
 
-    let control = control::ControlPlane::load(store.as_ref());
+    let control = control::ControlPlane::load(&store).await;
     let (cfg_tx, cfg_rx) = tokio::sync::watch::channel(cfg.clone());
-    let mut bot = Bot::new(cfg.clone(), control.clone(), store.clone(), models, outlets.clone(), events_tx.clone())
+    let mut bot = Bot::new(cfg.clone(), control.clone(), store.clone(), models, outlets.clone(), events_tx.clone()).await
         .inspect_err(|_| report(Fault::StartupRuntime))?;
     let watchdog_handle = control::spawn_watchdog(control.clone(), cfg_rx.clone(), events_tx.clone(), Duration::from_secs(15));
 
@@ -181,7 +181,7 @@ async fn run(cfg: Arc<Config>, telegram: Result<Telegram>) -> Result<()> {
                 };
                 let Some(env) = env else { break };
                 let cfg = cfg_rx.borrow().clone();
-                if try_handle_fast_control(&cfg, store.as_ref(), &outlets, &control, &dispatch, &env).await {
+                if try_handle_fast_control(&cfg, &store, &outlets, &control, &dispatch, &env).await {
                     continue;
                 }
                 if dispatch.send(Event::Inbound(env)).is_err() { break }
@@ -226,7 +226,7 @@ async fn run(cfg: Arc<Config>, telegram: Result<Telegram>) -> Result<()> {
             },
         }
     }
-    control.shutdown();
+    control.shutdown().await;
     relay.abort();
     control.jobs().stop_all().await;
     let _ = watchdog_handle.await;

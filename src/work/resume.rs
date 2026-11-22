@@ -41,9 +41,9 @@ fn task_audit(task: &Task, audit: &[AuditRecord]) -> Vec<AuditRecord> {
         .collect()
 }
 
-pub(super) async fn inspect(dir: &Path, task: &Task, store: &dyn Store) -> Result<Snapshot> {
+pub(super) async fn inspect(dir: &Path, task: &Task, store: &Store) -> Result<Snapshot> {
     let mut snapshot =
-        Snapshot { log: read_optional(&dir.join("log.md"))?, audit: task_audit(task, &store.audits()?), ..Snapshot::default() };
+        Snapshot { log: read_optional(&dir.join("log.md"))?, audit: task_audit(task, &store.audits().await?), ..Snapshot::default() };
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -144,7 +144,6 @@ pub(super) fn check_reply(text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::jsonl::JsonlStore;
     use crate::work::board::{Board, TaskKind, TaskStatus};
 
     fn audit(tool: &str, reason: &str, outcome: Outcome) -> AuditRecord {
@@ -241,23 +240,21 @@ mod tests {
         let mut board = Board::load(&root).unwrap();
         let task = board.add("resume", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
         let dir = board.task_dir(&task.id);
-        let store = JsonlStore::open(&root.join("data")).unwrap();
+        let store = Store::memory();
         assert!(inspect(&dir, &task, &store).await.unwrap().brief().is_empty());
         assert_eq!(board.recover().unwrap(), 1);
         std::fs::write(dir.join("plan.md"), "existing plan").unwrap();
         std::fs::write(dir.join("sources/01.md"), "saved evidence").unwrap();
         std::fs::write(dir.join("dsh-session-id"), "prior session").unwrap();
-        store.append_audit(&audit("publish", &task.id, Outcome::Sent)).unwrap();
-        store.append_audit(&audit("send", &task.id, Outcome::Unknown)).unwrap();
-        let store = JsonlStore::open(&root.join("data")).unwrap();
-        let snapshot = inspect(&dir, &task, &store).await.unwrap();
+        store.append_audit(&audit("publish", &task.id, Outcome::Sent)).await.unwrap();
+        store.append_audit(&audit("send", &task.id, Outcome::Unknown)).await.unwrap();
+        let reopened = store.clone();
+        let snapshot = inspect(&dir, &task, &reopened).await.unwrap();
         let brief = snapshot.brief();
         for expected in ["中断标记：有", "plan.md", "sources/ (1 entries)", "dsh-session-id", "publish | sent", "send | unknown"] {
             assert!(brief.contains(expected), "{brief}");
         }
         assert_eq!(read_optional(&dir.join("plan.md")).unwrap(), "existing plan");
-        std::fs::write(root.join("data/audit.jsonl"), "{partial audit").unwrap();
-        assert!(inspect(&dir, &task, &store).await.is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

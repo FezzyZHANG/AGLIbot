@@ -46,19 +46,19 @@ pub(super) fn attach_followups(board: &mut Board, ctx: &ChatCtx, intent: &mut In
 
 impl Bot {
     /// File a request that needs the owner's decision.
-    pub(super) fn relay_request(&self, requester: &str, request: &str) -> Result<()> {
-        self.audit(requester, "relay_to_owner", false, "requester is not the owner", Outcome::Denied)?;
+    pub(super) async fn relay_request(&self, requester: &str, request: &str) -> Result<()> {
+        self.audit(requester, "relay_to_owner", false, "requester is not the owner", Outcome::Denied).await?;
         let j = judge::Judgement { verdict: judge::Verdict::Owner, reasons: "请求者不是主人，按权限规则转交".into(), fixes: String::new(),
             urgent: judge::deadline_today(request, Local::now().date_naive()) };
         judge::file(
-            self.store.as_ref(),
+            &self.store,
             ReviewCategory::Act,
             &format!("{} 的请求", self.people.name_of(requester)),
             request,
             &j,
             true,
             json!({"request_from": requester, "text": request}),
-        )?;
+        ).await?;
         Ok(())
     }
 
@@ -69,7 +69,8 @@ impl Bot {
             inputs.include(env);
             let has_inputs = !inputs.is_empty();
             let result: Result<String> = async {
-                let (_, policy) = self.frame(ctx, 1, &ctx.task_cards(&self.board()))?;
+                let cards = ctx.task_cards(&self.board());
+                let (_, policy) = self.frame(ctx, 1, &cards).await?;
                 let read = self.read_inputs(ctx, &policy, inputs, reading::Purpose::Task).await;
                 if !read.errors.is_empty() { return Ok(format!("任务未建立：{}", read.errors.join(" "))); }
                 anyhow::ensure!(!has_inputs || policy == ProcessingPolicy::Any, "当前处理策略不允许把材料交给任务执行器");
@@ -125,7 +126,7 @@ impl Bot {
                 let kind = if cmd == "/code" { TaskKind::Code } else { TaskKind::Research };
                 format!("记下了：{}", self.add_chat_task(ctx, kind, arg, &[])?)
             }
-            "/run" if !arg.is_empty() => self.start_job_with_owner_slot(arg, ctx.owner_private())?,
+            "/run" if !arg.is_empty() => self.start_job_with_owner_slot(arg, ctx.owner_private()).await?,
             "/evolve" | "/evolve-status" => {
                 if ctx.owner_private() {
                     crate::evolution::PLACEHOLDER_REPLY.into()
@@ -143,7 +144,7 @@ impl Bot {
             "/freeze" | "/unfreeze" => {
                 anyhow::ensure!(ctx.owner_private(), "仅主人私聊可以更改冻结状态");
                 let freeze = cmd == "/freeze";
-                let state = ingress::set_freeze(&self.control, self.store.as_ref(), ctx.platform, freeze)?;
+                let state = ingress::set_freeze(&self.control, &self.store, ctx.platform, freeze).await?;
                 if freeze && let Err(e) = self.stop_for_freeze().await {
                     report_error(&e, Fault::Background);
                     warn!("freeze cleanup failed: {e:#}");
@@ -151,11 +152,11 @@ impl Bot {
                 }
                 state.message().into()
             }
-            "/digest" => judge::digest(self.store.as_ref())?.unwrap_or_else(|| "没有待你决定的事。".into()),
+            "/digest" => judge::digest(&self.store).await?.unwrap_or_else(|| "没有待你决定的事。".into()),
             "/approve" | "/reject" => {
                 let (id, reason) = arg.split_once(char::is_whitespace).map(|(i, r)| (i, r.trim())).unwrap_or((arg, ""));
                 let id = id.trim_start_matches('#').parse()?;
-                self.settle_review(id, cmd == "/approve", reason, ctx)?
+                self.settle_review(id, cmd == "/approve", reason, ctx).await?
             }
             "/reflect" => {
                 let n = self.extract_all(chrono::Duration::days(2)).await?;
@@ -165,10 +166,10 @@ impl Bot {
         })
     }
 
-    pub(super) fn settle_review(&mut self, id: u64, approve: bool, reason: &str, ctx: &ChatCtx) -> Result<String> {
+    pub(super) async fn settle_review(&mut self, id: u64, approve: bool, reason: &str, ctx: &ChatCtx) -> Result<String> {
         let mut item = self
             .store
-            .reviews()?
+            .reviews().await?
             .into_iter()
             .find(|r| r.id == id)
             .ok_or_else(|| anyhow::anyhow!("没有 #{id}"))?;
@@ -176,13 +177,13 @@ impl Bot {
             return Ok(format!("#{id} 已经处理过了。"));
         }
         if let Some(sender) = item.payload.get("agent_candidate").and_then(Value::as_str) {
-            bot_flags::settle(self.store.as_ref(), sender, approve)?;
+            bot_flags::settle(&self.store, sender, approve).await?;
         }
         item.status = if approve { ReviewStatus::Approved } else { ReviewStatus::Rejected };
         if !reason.is_empty() {
             item.verdict.push_str(&format!("；主人：{reason}"));
         }
-        self.store.save_review(&item)?;
+        self.store.save_review(&item).await?;
         if !approve {
             return Ok(format!("#{id} 驳回了。"));
         }

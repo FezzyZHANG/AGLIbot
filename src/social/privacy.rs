@@ -46,11 +46,11 @@ pub struct Query<'a> {
     pub half_life_days: f64,
 }
 
-pub fn recall(store: &dyn Store, q: &Query<'_>) -> Result<Recall> {
-    recall_at(store, q, Utc::now())
+pub async fn recall(store: &Store, q: &Query<'_>) -> Result<Recall> {
+    recall_at(store, q, Utc::now()).await
 }
 
-fn recall_at(store: &dyn Store, q: &Query<'_>, now: DateTime<Utc>) -> Result<Recall> {
+async fn recall_at(store: &Store, q: &Query<'_>, now: DateTime<Utc>) -> Result<Recall> {
     let mut out = Recall::default();
 
     for p in q.partners {
@@ -62,7 +62,7 @@ fn recall_at(store: &dyn Store, q: &Query<'_>, now: DateTime<Utc>) -> Result<Rec
 
     let partner_ids: Vec<&str> = q.partners.iter().map(|p| p.person_id.as_str()).collect();
     let mut relevant: Vec<Episode> = Vec::new();
-    for e in store.episodes()? {
+    for e in store.episodes().await? {
         let related = &e.ns == q.ns || e.participants.iter().any(|p| partner_ids.contains(&p.as_str()));
         if !related {
             continue;
@@ -111,7 +111,6 @@ pub fn render(r: &Recall) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::jsonl::JsonlStore;
     use crate::store::{PersonKind, Tier};
     use chrono::Utc;
 
@@ -125,46 +124,35 @@ mod tests {
             salience: 0.5,
             ns: ns.parse().unwrap(),
             scope,
-            sources: vec![],
         }
     }
 
-    #[test]
-    fn recall_ranks_by_decayed_salience_with_configured_half_life() {
-        let dir = std::env::temp_dir().join(format!("aglibot-test-decay-recall-{}", std::process::id()));
-        let store = JsonlStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn recall_ranks_by_decayed_salience_with_configured_half_life() {
+        let store = Store::memory();
         let now: DateTime<Utc> = "2026-11-01T00:00:00Z".parse().unwrap();
         let mut old = episode("old", "person/owner", Scope::Public, "owner", "old");
         old.ts = now - chrono::Duration::days(60);
         old.salience = 0.8;
-        let mut recent = Episode { id: "recent".into(), ts: now, salience: 0.3, ..old.clone() };
-        store.append_episode(&old).unwrap();
-        store.append_episode(&recent).unwrap();
+        let recent = Episode { id: "recent".into(), ts: now, salience: 0.3, ..old.clone() };
+        store.append_episode(&old).await.unwrap();
+        store.append_episode(&recent).await.unwrap();
         let ns = old.ns.clone();
         let audience = Audience::private("owner");
         let mut q = Query { audience: &audience, ns: &ns, partners: &[], max_episodes: 1,
             max_facts: 0, half_life_days: 30.0 };
-        assert_eq!(recall_at(&store, &q, now).unwrap().episodes[0].id, "recent");
+        assert_eq!(recall_at(&store, &q, now).await.unwrap().episodes[0].id, "recent");
         q.half_life_days = 300.0;
-        assert_eq!(recall_at(&store, &q, now).unwrap().episodes[0].id, "old");
-        // An archived original no longer competes with its replacement in recall.
-        recent.id = "summary".into();
-        recent.sources = vec![old.id.clone(), "recent".into()];
-        store.archive_episode(&recent).unwrap();
-        assert_eq!(recall_at(&store, &q, now).unwrap().episodes[0].id, "summary");
-        assert_eq!(store.all_episodes().unwrap()[0].salience, 0.8);
-        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(recall_at(&store, &q, now).await.unwrap().episodes[0].id, "old");
     }
 
     /// DESIGN 9: a secret told in private must not reach a group context, filtered at retrieval.
-    #[test]
-    fn private_secret_is_withheld_from_groups() {
-        let dir = std::env::temp_dir().join(format!("aglibot-test-privacy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = JsonlStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn private_secret_is_withheld_from_groups() {
+        let store = Store::memory();
         let private = Scope::Persons { ids: vec!["owner".into()] };
-        store.append_episode(&episode("e1", "person/owner", private.clone(), "owner", "主人说他下个月要辞职")).unwrap();
-        store.append_episode(&episode("e2", "group/qq:1", Scope::Group { id: "qq:1".into() }, "owner", "群里在聊 Rust 异步")).unwrap();
+        store.append_episode(&episode("e1", "person/owner", private.clone(), "owner", "主人说他下个月要辞职")).await.unwrap();
+        store.append_episode(&episode("e2", "group/qq:1", Scope::Group { id: "qq:1".into() }, "owner", "群里在聊 Rust 异步")).await.unwrap();
         let owner = Person {
             person_id: "owner".into(),
             platform_ids: vec![],
@@ -184,7 +172,7 @@ mod tests {
         let group_ns: Namespace = "group/qq:1".parse().unwrap();
         let group = Audience::group("qq:1", ["owner".to_string(), "qq:5".to_string()]);
         let q = Query { audience: &group, ns: &group_ns, partners: &partners, max_episodes: 10, max_facts: 10, half_life_days: 30.0 };
-        let r = recall(&store, &q).unwrap();
+        let r = recall(&store, &q).await.unwrap();
         let text = render(&r);
         assert!(!text.contains("辞职") && !text.contains("换工作"), "{text}");
         assert!(text.contains("Rust"));
@@ -193,7 +181,7 @@ mod tests {
         let owner_ns: Namespace = "person/owner".parse().unwrap();
         let outsider = Audience::private("owner");
         let q = Query { audience: &outsider, ns: &owner_ns, partners: &partners, max_episodes: 10, max_facts: 10, half_life_days: 30.0 };
-        let text = render(&recall(&store, &q).unwrap());
+        let text = render(&recall(&store, &q).await.unwrap());
         assert!(text.contains("辞职") && text.contains("换工作"));
         // Without membership the group episode stays out of the DM, even though he took part.
         assert!(!text.contains("Rust"));
@@ -201,15 +189,14 @@ mod tests {
         // A member may hear the group's talk in private.
         let member = Audience::private_member_of("owner", owner.groups.clone());
         let q = Query { audience: &member, ..q };
-        let text = render(&recall(&store, &q).unwrap());
+        let text = render(&recall(&store, &q).await.unwrap());
         assert!(text.contains("辞职") && text.contains("Rust"), "{text}");
 
         // Someone who was never in the group does not, even when talking about a member.
         let stranger_ns: Namespace = "person/qq:6".parse().unwrap();
         let stranger = Audience::private_member_of("qq:6", ["qq:2".to_string()]);
         let q = Query { audience: &stranger, ns: &stranger_ns, ..q };
-        let r = recall(&store, &q).unwrap();
+        let r = recall(&store, &q).await.unwrap();
         assert!(r.facts.is_empty() && r.episodes.is_empty(), "{}", render(&r));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

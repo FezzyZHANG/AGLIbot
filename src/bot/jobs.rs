@@ -19,17 +19,17 @@ pub(super) fn delivery_preview(text: &str) -> String {
 }
 
 impl Bot {
-    pub(super) fn start_job(&mut self, task_id: &str) -> Result<String> {
-        self.start_job_with_owner_slot(task_id, false)
+    pub(super) async fn start_job(&mut self, task_id: &str) -> Result<String> {
+        self.start_job_with_owner_slot(task_id, false).await
     }
 
-    pub(super) fn start_job_with_owner_slot(&mut self, task_id: &str, owner_run: bool) -> Result<String> {
+    pub(super) async fn start_job_with_owner_slot(&mut self, task_id: &str, owner_run: bool) -> Result<String> {
         let control = self.control.clone();
-        control.admit_job(|| self.start_admitted_job(task_id, owner_run))
+        control.admit_job(async || self.start_admitted_job(task_id, owner_run).await).await
             .unwrap_or_else(|| Ok("冻结中，不开始任务。".into()))
     }
 
-    fn start_admitted_job(&mut self, task_id: &str, owner_run: bool) -> Result<String> {
+    async fn start_admitted_job(&mut self, task_id: &str, owner_run: bool) -> Result<String> {
         let jobs = self.control.jobs();
         let max = self.cfg.runtime.hands.max_jobs;
         // Keep the default single-worker command behavior exactly as before.
@@ -48,7 +48,7 @@ impl Bot {
             return Ok(format!("{task_id} 的状态是 {:?}，不能开始。", task.status));
         }
         self.board().set_status(&task.id, TaskStatus::Active, "")?;
-        self.audit(&task.requester, &format!("delegate:{:?}", task.kind), true, &task.title, Outcome::Unknown)?;
+        self.audit(&task.requester, &format!("delegate:{:?}", task.kind), true, &task.title, Outcome::Unknown).await?;
         let job = Job {
             models: self.models.clone(),
             store: self.store.clone(),
@@ -72,7 +72,7 @@ impl Bot {
         let mut status = o.status();
         if status == TaskStatus::Done
             && let Some(review_id) = o.verdict.as_deref().and_then(|s| s.split_whitespace().next()).and_then(|s| s.strip_prefix('#')).and_then(|s| s.parse::<u64>().ok())
-            && let Some(review) = self.store.reviews()?.into_iter().find(|r| r.id == review_id && r.payload["task_id"].as_str() == Some(o.task_id.as_str()))
+            && let Some(review) = self.store.reviews().await?.into_iter().find(|r| r.id == review_id && r.payload["task_id"].as_str() == Some(o.task_id.as_str()))
             && let Some(reviewed) = review.payload["reviewed_followups_bytes"].as_u64()
         {
             let path = self.board().task_dir(&o.task_id).join("followups.md");
@@ -86,16 +86,16 @@ impl Bot {
                 o.paused = Some("审查后收到了新的补充，已排入下一轮。".into());
                 o.summary = o.paused.clone().unwrap_or_default();
             } else {
-                judge::settle_work_revisions(self.store.as_ref(), &o.task_id, &review)?;
+                judge::settle_work_revisions(&self.store, &o.task_id, &review).await?;
             }
         }
         let note = if let Some(reason) = &o.paused {
             reason.as_str()
         } else if o.clarification.is_some() { "等待主人澄清" } else if o.ok { "" } else { "出错，等主人看" };
         self.board().set_status(&o.task_id, status, note)?;
-        self.audit("owner", "delegate_result", true, &o.task_id, if o.ok { Outcome::Sent } else { Outcome::Failed })?;
+        self.audit("owner", "delegate_result", true, &o.task_id, if o.ok { Outcome::Sent } else { Outcome::Failed }).await?;
         self.state.finished_work();
-        reflect::note_today(self.store.as_ref(), &format!("做了 {elapsed_minutes} 分钟：{}（{}）", o.title, if o.status() == TaskStatus::Done { "完成" } else { "没做完" }))?;
+        reflect::note_today(&self.store, &format!("做了 {elapsed_minutes} 分钟：{}（{}）", o.title, if o.status() == TaskStatus::Done { "完成" } else { "没做完" })).await?;
         self.push_urgent().await?;
         // A watchdog pause has its own persisted review alert, including the reason and id.
         if o.ok || o.paused.is_none() || o.verdict.is_none() {
@@ -149,8 +149,8 @@ impl Bot {
         let task = self.board().get(&id).cloned().ok_or_else(|| anyhow::anyhow!("没有任务 {id}"))?;
         let j = judge::Judgement { verdict: judge::Verdict::Owner, reasons: reason.clone(), fixes: String::new(), urgent: true };
         let detail = format!("{reason}。已保存断点，任务尚未完成；可用 /run {id} 继续。");
-        let item = match judge::file(self.store.as_ref(), ReviewCategory::Act, &task.title, &detail, &j, false,
-            json!({"task_id": id, "watchdog": true})) {
+        let item = match judge::file(&self.store, ReviewCategory::Act, &task.title, &detail, &j, false,
+            json!({"task_id": id, "watchdog": true})).await {
             Ok(item) => item,
             Err(e) => {
                 self.board().set_status(&id, TaskStatus::Waiting, &reason).context(Fault::StateSave)?;
@@ -172,7 +172,7 @@ impl Bot {
     }
 
     pub(super) async fn deliver(&mut self, o: research::Outcome) -> Result<()> {
-        let Some(ctx) = self.owner_ctx() else {
+        let Some(ctx) = self.owner_ctx().await else {
             warn!("task {} finished but the owner has never messaged; nowhere to report", o.task_id);
             return Ok(());
         };

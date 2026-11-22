@@ -189,42 +189,45 @@ pub struct ControlPlane {
     frozen: AtomicBool,
     jobs: Arc<JobRegistry>,
     shutdown: CancelSource,
-    admission: Mutex<()>,
+    admission: tokio::sync::Mutex<()>,
 }
 
 impl ControlPlane {
-    pub fn load(store: &dyn Store) -> Arc<Self> {
-        Self::new(store.kv_get("frozen").ok().flatten().and_then(|v| v.as_bool()).unwrap_or(false))
+    pub async fn load(store: &Store) -> Arc<Self> {
+        Self::new(store.kv_get("frozen").await.ok().flatten().and_then(|v| v.as_bool()).unwrap_or(false))
     }
 
     pub fn new(frozen: bool) -> Arc<Self> {
         Arc::new(Self {
             frozen: AtomicBool::new(frozen), jobs: Arc::default(),
-            shutdown: CancelSource::new().0, admission: Mutex::new(()),
+            shutdown: CancelSource::new().0, admission: tokio::sync::Mutex::new(()),
         })
     }
 
     pub fn is_frozen(&self) -> bool { self.frozen.load(Ordering::Acquire) }
 
-    pub fn set_frozen(&self, store: &dyn Store, freeze: bool) -> Result<bool> {
-        let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+    pub async fn set_frozen(&self, store: &Store, freeze: bool) -> Result<bool> {
+        let _guard = self.admission.lock().await;
         let before = self.is_frozen();
         if before != freeze {
-            store.kv_set("frozen", freeze.into())?;
+            store.kv_set("frozen", freeze.into()).await?;
             self.frozen.store(freeze, Ordering::Release);
         }
         Ok(before)
     }
 
     /// Serialize the board transition and registration with a freeze or shutdown.
-    pub fn admit_job<T>(&self, start: impl FnOnce() -> T) -> Option<T> {
-        let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
-        (!self.is_frozen() && !self.shutdown.token.is_cancelled()).then(start)
+    pub async fn admit_job<T>(&self, start: impl AsyncFnOnce() -> T) -> Option<T> {
+        let _guard = self.admission.lock().await;
+        if self.is_frozen() || self.shutdown.token.is_cancelled() {
+            return None;
+        }
+        Some(start().await)
     }
 
     pub fn jobs(&self) -> &Arc<JobRegistry> { &self.jobs }
-    pub fn shutdown(&self) {
-        let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+    pub async fn shutdown(&self) {
+        let _guard = self.admission.lock().await;
         self.shutdown.cancel();
     }
     pub fn shutdown_token(&self) -> CancelToken { self.shutdown.token() }
@@ -330,7 +333,7 @@ mod tests {
             assert!(reason.contains("log.md"));
         }
         assert!(rx.try_recv().is_err());
-        control.shutdown();
+        control.shutdown().await;
         handle.await.unwrap();
     }
 

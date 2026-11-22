@@ -1,29 +1,21 @@
-//! Storage behind a synchronous trait: MongoDB when configured, JSONL otherwise (DESIGN 2b).
+//! Async storage shared by the runtime and in-memory tests.
 
-mod cache;
-pub mod import;
-pub mod jsonl;
-pub mod mongo;
+mod mem;
+pub mod migrate;
+mod mongo;
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::ns::{Namespace, Scope};
-
-pub fn open(cfg: &crate::config::MongoCfg, data_dir: &std::path::Path) -> Result<std::sync::Arc<dyn Store>> {
-    match &cfg.url {
-        Some(url) => Ok(std::sync::Arc::new(mongo::MongoStore::open(url, &cfg.database)?)),
-        None => Ok(std::sync::Arc::new(jsonl::JsonlStore::open(data_dir)?)),
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageRecord {
@@ -59,15 +51,6 @@ pub struct ModelCallRecord {
     pub escalated_from: Option<String>,
 }
 
-/// Derived cache, kept separate from the source episode and replaceable after a model change.
-/// Offline migration omits this cache; the target lazily rebuilds it from active episodes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpisodeEmbedding {
-    pub episode_id: String,
-    pub model_id: String,
-    pub vector: Vec<f32>,
-}
-
 /// Something that happened, distilled from messages. ns/scope come from the source chat, never the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {
@@ -80,9 +63,6 @@ pub struct Episode {
     pub salience: f64,
     pub ns: Namespace,
     pub scope: Scope,
-    /// A summary archives these originals in place; they remain in `all_episodes`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sources: Vec<String>,
 }
 
 impl Episode {
@@ -95,77 +75,12 @@ impl Episode {
     }
 }
 
-fn active_episodes(all: Vec<Episode>) -> Vec<Episode> {
-    let archived: BTreeSet<String> = all.iter().flat_map(|e| e.sources.iter().cloned()).collect();
-    all.into_iter().filter(|e| !archived.contains(&e.id)).collect()
-}
-
-/// Checked under the backend's write lock. One appended summary is the archive commit.
-#[allow(dead_code)] // Phase 2/3 cleanup
-fn archive_needed(all: &[Episode], archive: &Episode) -> Result<bool> {
-    anyhow::ensure!(!archive.sources.is_empty() && !archive.summary.trim().is_empty(), "empty archive");
-    if let Some(existing) = all.iter().find(|e| e.id == archive.id) {
-        anyhow::ensure!(serde_json::to_value(existing)? == serde_json::to_value(archive)?, "archive id conflict");
-        return Ok(false);
-    }
-    let archived: BTreeSet<&String> = all.iter().flat_map(|e| &e.sources).collect();
-    for id in &archive.sources {
-        anyhow::ensure!(id != &archive.id && !archived.contains(id), "source already archived: {id}");
-        let originals: Vec<_> = all.iter().filter(|e| &e.id == id).collect();
-        anyhow::ensure!(!originals.is_empty(), "missing archive source: {id}");
-        anyhow::ensure!(originals.iter().all(|e| e.ns == archive.ns && e.scope == archive.scope),
-            "archive crosses namespace or scope");
-    }
-    Ok(true)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fact {
     pub text: String,
     pub ns: Namespace,
     pub scope: Scope,
     pub ts: DateTime<Utc>,
-}
-
-/// An observed edge, kept separately for every source group (including its evidence).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Relation {
-    pub a: String,
-    pub b: String,
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub evidence: Vec<DateTime<Utc>>,
-    pub strength: f64,
-    pub ns: Namespace,
-    pub scope: Scope,
-}
-
-impl Relation {
-    pub fn key(&self) -> String {
-        let key = serde_json::json!([self.ns, self.a, self.b, self.kind]).to_string();
-        format!("{:x}", Sha256::digest(key.as_bytes()))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActivityStats {
-    /// Messages observed by reflection, not the group's full history or membership.
-    pub messages: u64,
-    pub first_seen: DateTime<Utc>,
-    pub last_seen: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Group {
-    /// Platform-qualified chat id, matching Namespace::Group (e.g. telegram:-42).
-    pub chat_id: String,
-    pub members: Vec<String>,
-    pub norms: Vec<String>,
-    pub topics: Vec<String>,
-    pub my_role: String,
-    pub activity_stats: ActivityStats,
-    pub ns: Namespace,
-    pub scope: Scope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,17 +122,6 @@ pub struct Person {
     /// Groups (`platform:group_id`) they were seen in; append-only, see `Scope::permits`.
     #[serde(default)]
     pub groups: Vec<String>,
-}
-
-/// A generalised, de-identified lesson from reflection. Always created with scope `self`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Lesson {
-    pub id: String,
-    pub ts: DateTime<Utc>,
-    pub text: String,
-    pub scope: Scope,
-    /// Episode ids it was derived from: references only, never the restricted text.
-    pub sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,79 +245,173 @@ pub struct StickerVector {
     pub vector: Vec<f32>,
 }
 
-pub trait Store: Send + Sync {
-    fn append_message(&self, m: &MessageRecord) -> Result<()>;
-    /// The last `n` messages in a namespace, oldest first.
-    fn recent_in_ns(&self, ns: &Namespace, n: usize) -> Result<Vec<MessageRecord>>;
-    /// Messages in a namespace strictly after `after`, oldest first.
-    fn messages_after(&self, ns: &Namespace, after: DateTime<Utc>) -> Result<Vec<MessageRecord>>;
-    /// Every namespace that has messages after `after`.
-    fn active_namespaces(&self, after: DateTime<Utc>) -> Result<Vec<Namespace>>;
-
-    fn append_model_call(&self, c: &ModelCallRecord) -> Result<()>;
-    /// Calls in the half-open focus window [since, until).
-    #[allow(dead_code)] // Phase 2/3 cleanup
-    fn model_calls_between(&self, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Vec<ModelCallRecord>>;
-    fn spent_since(&self, since: DateTime<Utc>) -> Result<f64>;
-
-    fn append_episode(&self, e: &Episode) -> Result<()>;
-    #[allow(dead_code)] // Phase 2/3 cleanup
-    fn save_embedding(&self, embedding: &EpisodeEmbedding) -> Result<()>;
-    /// Only vectors from this embedder; a model change makes old cache entries missing.
-    #[allow(dead_code)] // Phase 2/3 cleanup
-    fn load_embeddings(&self, model_id: &str) -> Result<BTreeMap<String, Vec<f32>>>;
-    /// Active memories, with archived originals excluded from normal recall.
-    fn episodes(&self) -> Result<Vec<Episode>> { Ok(active_episodes(self.all_episodes()?)) }
-    /// Includes unchanged originals, retrievable by the summary's `sources` ids.
-    fn all_episodes(&self) -> Result<Vec<Episode>>;
-    /// Append a summary and hide its sources atomically; an exact retry is a no-op.
-    #[allow(dead_code)] // Phase 2/3 cleanup
-    fn archive_episode(&self, archive: &Episode) -> Result<()>;
-
-    fn persons(&self) -> Result<BTreeMap<String, Person>>;
-    fn save_person(&self, p: &Person) -> Result<()>;
-
-    #[allow(dead_code)] // Phase 2/3 cleanup
-    fn group(&self, chat_id: &str) -> Result<Option<Group>>;
-    fn save_group(&self, g: &Group) -> Result<()>;
-    #[allow(dead_code)] // Phase 2/3 cleanup
-    fn relations(&self, ns: &Namespace) -> Result<Vec<Relation>>;
-    /// Insert or replace by (source namespace, a, b, type).
-    fn save_relation(&self, r: &Relation) -> Result<()>;
-
-    fn append_lesson(&self, l: &Lesson) -> Result<()>;
-    fn lessons(&self) -> Result<Vec<Lesson>>;
-
-    fn append_audit(&self, a: &AuditRecord) -> Result<()>;
-    fn audits(&self) -> Result<Vec<AuditRecord>>;
-
-    fn reviews(&self) -> Result<Vec<ReviewItem>>;
-    /// Insert or replace by id. Callers allocate ids via `next_review_id`.
-    fn save_review(&self, r: &ReviewItem) -> Result<()>;
-    fn next_review_id(&self) -> Result<u64>;
-
-    /// Small key/value facts: extraction watermarks, owner's last chat, freeze flag.
-    fn kv_get(&self, key: &str) -> Result<Option<Value>>;
-    fn kv_set(&self, key: &str, value: Value) -> Result<()>;
-
-    /// The owner-managed lexicon (#80) as raw documents; `social::lexicon` validates them.
-    fn lexicon(&self) -> Result<Vec<Value>>;
-    /// Insert lexicon documents; a duplicate (term, scope), null and missing scope alike, is an error.
-    fn insert_lexicon(&self, docs: &[Value]) -> Result<()>;
-
-    fn media(&self, hash: &str) -> Result<Option<MediaRecord>>;
-    /// Insert or replace by hash.
-    fn save_media(&self, record: &MediaRecord) -> Result<()>;
-    fn all_media(&self) -> Result<Vec<MediaRecord>>;
-    /// Removes the record and its vectors.
-    fn delete_media(&self, hash: &str) -> Result<()>;
-    /// By hash; only vectors from this embedder.
-    fn sticker_vectors(&self, model_id: &str) -> Result<BTreeMap<String, StickerVector>>;
-    fn save_sticker_vector(&self, vector: &StickerVector) -> Result<()>;
+pub struct MediaCaptionPatch {
+    pub description: String,
+    pub text: String,
+    pub use_when: String,
+    pub avoid: String,
+    pub tags: Vec<String>,
 }
 
-/// The (term, scope) key that must be unique in the lexicon; missing scope is global.
-fn lexicon_key(doc: &Value) -> (String, Option<String>) {
-    let s = |k: &str| doc.get(k).and_then(Value::as_str).map(String::from);
-    (s("term").unwrap_or_default(), s("scope"))
+#[derive(Default)]
+pub struct MediaEditPatch {
+    pub description: Option<String>,
+    pub use_when: Option<String>,
+    pub avoid: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub scope: Option<StickerScope>,
+    pub status: Option<MediaStatus>,
+}
+
+pub struct NewReview {
+    pub ts: DateTime<Utc>,
+    pub category: ReviewCategory,
+    pub subject: String,
+    pub detail: String,
+    pub verdict: String,
+    pub status: ReviewStatus,
+    pub payload: Value,
+    pub notified: bool,
+    pub urgent: bool,
+    pub pushed: bool,
+}
+
+impl NewReview {
+    fn with_id(self, id: u64) -> ReviewItem {
+        ReviewItem {
+            id,
+            ts: truncate_ms(self.ts),
+            category: self.category,
+            subject: self.subject,
+            detail: self.detail,
+            verdict: self.verdict,
+            status: self.status,
+            payload: self.payload,
+            notified: self.notified,
+            urgent: self.urgent,
+            pushed: self.pushed,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Store(Arc<StoreBackend>);
+
+enum StoreBackend {
+    Mongo(mongo::MongoStore),
+    Mem(mem::MemStore),
+}
+
+pub async fn open(cfg: &crate::config::MongoCfg) -> Result<Store> {
+    Store::open(cfg).await
+}
+
+fn truncate_ms(dt: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(dt.timestamp_millis())
+        .expect("timestamp originated from chrono")
+}
+
+macro_rules! store_methods {
+    ($($(#[$attr:meta])* fn $name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
+        $($(#[$attr])*
+        pub async fn $name(&self, $($arg: $ty),*) -> Result<$ret> {
+            match self.0.as_ref() {
+                StoreBackend::Mongo(store) => store.$name($($arg),*).await,
+                StoreBackend::Mem(store) => store.$name($($arg),*),
+            }
+        })*
+    };
+}
+
+impl Store {
+    pub async fn open(cfg: &crate::config::MongoCfg) -> Result<Self> {
+        let store = mongo::MongoStore::connect(cfg).await?;
+        let legacy = migrate::has_legacy_schema(&store)
+            .await
+            .map_err(|_| anyhow::anyhow!("MongoDB startup: could not inspect database schema"))?;
+        anyhow::ensure!(
+            !legacy,
+            "MongoDB startup: legacy storage detected; run migrate-bson --apply while AGLIbot is stopped"
+        );
+        store.init().await.map_err(|_| anyhow::anyhow!(
+            "MongoDB startup: index setup failed; check permissions and run migrate-bson for legacy data"
+        ))?;
+        Ok(Self(Arc::new(StoreBackend::Mongo(store))))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn memory() -> Self {
+        Self(Arc::new(StoreBackend::Mem(mem::MemStore::default())))
+    }
+
+    pub fn append_model_call_best_effort(&self, record: ModelCallRecord) {
+        match self.0.as_ref() {
+            StoreBackend::Mem(store) => {
+                if let Err(error) = store.append_model_call(&record) {
+                    tracing::warn!("could not record model call: {error}");
+                }
+            }
+            StoreBackend::Mongo(store) => match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    let store = store.clone();
+                    runtime.spawn(async move {
+                        if let Err(error) = store.append_model_call(&record).await {
+                            tracing::warn!("could not record model call: {error}");
+                        }
+                    });
+                }
+                Err(_) => tracing::warn!("could not record model call outside the Tokio runtime"),
+            },
+        }
+    }
+
+    store_methods! {
+        fn append_message(m: &MessageRecord) -> ();
+        fn recent_in_ns(ns: &Namespace, n: usize) -> Vec<MessageRecord>;
+        fn messages_after(ns: &Namespace, after: DateTime<Utc>) -> Vec<MessageRecord>;
+        fn active_namespaces(after: DateTime<Utc>) -> Vec<Namespace>;
+        fn append_model_call(c: &ModelCallRecord) -> ();
+        fn spent_since(since: DateTime<Utc>) -> f64;
+        #[cfg(test)]
+        fn model_calls() -> Vec<ModelCallRecord>;
+        fn append_episode(e: &Episode) -> ();
+        fn episodes() -> Vec<Episode>;
+        fn persons() -> BTreeMap<String, Person>;
+        fn save_person(p: &Person) -> ();
+        fn append_audit(a: &AuditRecord) -> ();
+        fn audits() -> Vec<AuditRecord>;
+        fn reviews() -> Vec<ReviewItem>;
+        fn create_review(new: NewReview) -> ReviewItem;
+        fn save_review(r: &ReviewItem) -> ();
+        fn kv_get(key: &str) -> Option<Value>;
+        fn kv_set(key: &str, value: Value) -> ();
+        fn lexicon() -> Vec<Value>;
+        fn insert_lexicon(docs: &[Value]) -> ();
+        fn media(hash: &str) -> Option<MediaRecord>;
+        fn save_media(record: &MediaRecord) -> ();
+        fn touch_media_sighting(hash: &str, now: DateTime<Utc>, promote: Option<(MediaStatus, String)>) -> Option<MediaRecord>;
+        fn record_media_sent(hash: &str, now: DateTime<Utc>) -> ();
+        fn update_media_caption(hash: &str, patch: &MediaCaptionPatch) -> bool;
+        fn patch_media(hash: &str, patch: &MediaEditPatch) -> Option<MediaRecord>;
+        fn all_media() -> Vec<MediaRecord>;
+        fn delete_media(hash: &str) -> ();
+        fn sticker_vectors(model_id: &str) -> BTreeMap<String, StickerVector>;
+        fn save_sticker_vector(vector: &StickerVector) -> ();
+    }
+}
+
+fn lexicon_key(doc: &Value) -> Result<(&str, Option<&str>)> {
+    let term = doc
+        .get("term")
+        .and_then(Value::as_str)
+        .context("lexicon term must be a string")?;
+    let scope = match doc.get("scope") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .context("lexicon scope must be a string or null")?,
+        ),
+    };
+    Ok((term, scope))
 }

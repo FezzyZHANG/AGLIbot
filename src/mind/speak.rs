@@ -205,12 +205,6 @@ mod tests {
         assert!(matches!(s.turns.last(), Some(Turn::User(text)) if text == "看"));
     }
 
-    fn test_store(name: &str) -> (std::path::PathBuf, std::sync::Arc<dyn crate::store::Store>) {
-        let path = std::env::temp_dir().join(format!("agli-speaker-{name}-{}", std::process::id()));
-        let store = std::sync::Arc::new(crate::store::jsonl::JsonlStore::open(&path).unwrap());
-        (path, store)
-    }
-
     fn cached_speaker() -> (Speaker, serde_json::Value) {
         let mut speaker = Speaker::new("persona".into(), SessionCfg {
             max_turns: 20, idle_minutes: 30, recap_messages: 10, debounce: Default::default(),
@@ -228,7 +222,7 @@ mod tests {
     #[tokio::test]
     async fn later_turns_keep_the_cached_assistant_blocks() {
         let (mut speaker, raw) = cached_speaker();
-        let (path, store) = test_store("cache-append");
+        let store = crate::store::Store::memory();
         let cfg = crate::config::Config::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
         let mut model = cfg.models.models[0].clone();
         model.id = "test".into();
@@ -245,13 +239,12 @@ mod tests {
         assert_eq!(turns.len(), 4);
         assert!(matches!(&turns[1], Turn::Assistant { text, raw: Some(blocks) } if text == "draft" && *blocks == raw));
         drop(models);
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[tokio::test]
     async fn ephemeral_followup_leaves_cached_turns_intact() {
         let (speaker, raw) = cached_speaker();
-        let (path, store) = test_store("cache-follow");
+        let store = crate::store::Store::memory();
         let models = Models::stub(store, vec!["picked".into()]);
         let reply = speaker.follow_ephemeral(&models, "group", &ProcessingPolicy::Any, "choose".into(),
             vec![Part::Jpeg("QQ==".into())]).await.unwrap();
@@ -261,7 +254,6 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert!(matches!(&turns[1], Turn::Assistant { raw: Some(blocks), .. } if *blocks == raw));
         drop(models);
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

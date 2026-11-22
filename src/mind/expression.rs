@@ -40,12 +40,12 @@ fn rank(query: &[f32], vectors: &BTreeMap<String, StickerVector>, media: Vec<Med
 }
 
 /// `line` is the turn's text; only its end is embedded.
-pub async fn offers(store: &dyn Store, models: &Models, chat: &str, line: &str, sendable: impl Fn(&MediaRecord) -> bool) -> Result<Vec<Offer>> {
+pub async fn offers(store: &Store, models: &Models, chat: &str, line: &str, sendable: impl Fn(&MediaRecord) -> bool) -> Result<Vec<Offer>> {
     let Some(model_id) = models.sticker_embedding_id() else { return Ok(Vec::new()) };
     let skip = line.chars().count().saturating_sub(QUERY_CHARS);
     let tail: String = line.chars().skip(skip).collect();
     let Some(query) = models.embed_sticker(&tail).await? else { return Ok(Vec::new()) };
-    Ok(rank(&query, &store.sticker_vectors(&model_id)?, store.all_media()?, chat, sendable))
+    Ok(rank(&query, &store.sticker_vectors(&model_id).await?, store.all_media().await?, chat, sendable))
 }
 
 /// Read the offered stickers so he sees the images themselves, each after its id. One that cannot

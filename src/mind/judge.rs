@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::models::{Models, SpendLimit};
 use crate::ns::ProcessingPolicy;
-use crate::store::{ReviewCategory, ReviewItem, ReviewStatus, Store};
+use crate::store::{NewReview, ReviewCategory, ReviewItem, ReviewStatus, Store};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -120,8 +120,8 @@ async fn review_scenario(models: &Models, scenario: &str, category: ReviewCatego
 }
 
 /// Record a judgement. Forwarded items stay open for the owner; everything else is closed.
-pub fn file(
-    store: &dyn Store,
+pub async fn file(
+    store: &Store,
     category: ReviewCategory,
     subject: &str,
     detail: &str,
@@ -129,12 +129,7 @@ pub fn file(
     forward: bool,
     payload: Value,
 ) -> Result<ReviewItem> {
-    // next_review_id observes the store but does not reserve an id. Serialize the allocation
-    // and insert for concurrent background workers and the runtime's other review producers.
-    static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _create = CREATE.lock().unwrap_or_else(|e| e.into_inner());
-    let item = ReviewItem {
-        id: store.next_review_id()?,
+    store.create_review(NewReview {
         ts: Utc::now(),
         category,
         subject: subject.into(),
@@ -145,25 +140,23 @@ pub fn file(
         notified: false,
         urgent: j.urgent,
         pushed: false,
-    };
-    store.save_review(&item)?;
-    Ok(item)
+    }).await
 }
 
 /// A later passing work round settles the task's earlier automatic revision requests.
 /// Explicit owner decisions, including their approval/rejection history, stay independent.
-pub fn settle_work_revisions(store: &dyn Store, task_id: &str, passed: &ReviewItem) -> Result<()> {
+pub async fn settle_work_revisions(store: &Store, task_id: &str, passed: &ReviewItem) -> Result<()> {
     if !passed.payload["work_round"].is_number() || passed.verdict.split('：').next() != Some(Verdict::Pass.zh()) {
         return Ok(());
     }
-    for mut old in store.reviews()? {
+    for mut old in store.reviews().await? {
         if old.id < passed.id && old.status == ReviewStatus::Open && old.payload["work_round"].is_number()
             && old.payload["task_id"].as_str() == Some(task_id)
             && matches!(old.verdict.split('：').next(), Some("修改后再审" | "暂缓"))
         {
             old.status = ReviewStatus::Closed;
             old.payload["superseded_by"] = passed.id.into();
-            store.save_review(&old)?;
+            store.save_review(&old).await?;
         }
     }
     Ok(())
@@ -171,13 +164,13 @@ pub fn settle_work_revisions(store: &dyn Store, task_id: &str, passed: &ReviewIt
 
 /// Claim before sending: an uncertain send must not be repeated after a restart.
 /// `pushed` is saved separately only after delivery succeeds; failures remain in the digest.
-pub fn claim_urgent(store: &dyn Store, asleep: bool) -> Result<Option<ReviewItem>> {
+pub async fn claim_urgent(store: &Store, asleep: bool) -> Result<Option<ReviewItem>> {
     if asleep { return Ok(None) }
-    for item in store.reviews()? {
+    for item in store.reviews().await? {
         if item.status != ReviewStatus::Open || !item.urgent || item.pushed { continue }
         let key = format!("review_push_attempt:{}", item.id);
-        if store.kv_get(&key)?.is_some() { continue }
-        store.kv_set(&key, serde_json::json!(true))?;
+        if store.kv_get(&key).await?.is_some() { continue }
+        store.kv_set(&key, serde_json::json!(true)).await?;
         return Ok(Some(item));
     }
     Ok(None)
@@ -199,9 +192,9 @@ pub fn deadline_today(text: &str, today: chrono::NaiveDate) -> bool {
 }
 
 /// Pending items plus urgent alerts (even if already resolved); marks them digest-notified.
-pub fn digest(store: &dyn Store) -> Result<Option<String>> {
+pub async fn digest(store: &Store) -> Result<Option<String>> {
     let mut fresh: Vec<ReviewItem> =
-        store.reviews()?.into_iter().filter(|r| !r.notified && (r.status == ReviewStatus::Open || r.pushed)).collect();
+        store.reviews().await?.into_iter().filter(|r| !r.notified && (r.status == ReviewStatus::Open || r.pushed)).collect();
     if fresh.is_empty() {
         return Ok(None);
     }
@@ -216,7 +209,7 @@ pub fn digest(store: &dyn Store) -> Result<Option<String>> {
         };
         out.push_str(&format!("\n#{} [{:?}] {}{}{}\n  {}\n  审查：{}\n", r.id, r.category, r.subject, sent, status, r.detail, r.verdict));
         r.notified = true;
-        store.save_review(r)?;
+        store.save_review(r).await?;
     }
     out.push_str("\n未决事项回复 /approve 编号 或 /reject 编号 理由。");
     Ok(Some(out))
@@ -247,56 +240,50 @@ mod tests {
     #[tokio::test]
     async fn work_review_alerts_only_for_reviewer_failure() {
         use crate::error_report::{Fault, capture};
-        let dir = std::env::temp_dir().join(format!("agli-work-review-alert-{}", std::process::id()));
-        let store = std::sync::Arc::new(crate::store::jsonl::JsonlStore::open(&dir).unwrap());
-        let models = Models::stub(store, vec![r#"{"verdict":"转交主人"}"#.into(), "unusable".into()]);
+        let store = Store::memory();
+        let models = Models::stub(store.clone(), vec![r#"{"verdict":"转交主人"}"#.into(), "unusable".into()]);
         for expected in [vec![], vec![Fault::ReviewModel]] {
             let (j, faults) = capture(review_work(&models, ReviewCategory::Verify, "subject", "evidence")).await;
             assert_eq!(j.unwrap().verdict, Verdict::Owner);
             assert_eq!(faults, expected);
         }
-        let limit = SpendLimit { since: Utc::now(), max_usd: 0.0 };
+        let limit = SpendLimit::start(&store, 0.0).await.unwrap();
         let (j, faults) = capture(review_with_limit(&models, ReviewCategory::Verify, "subject", "evidence", Some(limit))).await;
         assert_eq!(j.unwrap().verdict, Verdict::Owner);
         assert!(faults.is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
     async fn judge_urgency_persists_and_push_claims_survive_restart() {
-        use std::sync::Arc;
-        use crate::store::jsonl::JsonlStore;
-        let dir = std::env::temp_dir().join(format!("agli-urgent-judge-{}", std::process::id()));
-        let store = Arc::new(JsonlStore::open(&dir).unwrap());
+        let store = Store::memory();
         let models = Models::stub(store.clone(), vec![
             r#"{"verdict":"转交主人","urgent":true}"#.into(),
             r#"{"verdict":"转交主人"}"#.into(),
         ]);
         for expected in [true, false] {
             let j = review(&models, ReviewCategory::Act, "subject", "evidence").await.unwrap();
-            let item = file(store.as_ref(), ReviewCategory::Act, "subject", "detail", &j, false, Value::Null).unwrap();
+            let item = file(&store, ReviewCategory::Act, "subject", "detail", &j, false, Value::Null).await.unwrap();
             assert_eq!(item.urgent, expected);
             assert!(!item.pushed && !item.notified);
         }
         assert_eq!(models.stub_prompts().len(), 2); // No separate urgency call.
-        assert!(claim_urgent(store.as_ref(), true).unwrap().is_none());
-        let mut item = claim_urgent(store.as_ref(), false).unwrap().unwrap();
-        assert!(claim_urgent(store.as_ref(), false).unwrap().is_none());
-        let reopened = JsonlStore::open(&dir).unwrap();
-        assert!(claim_urgent(&reopened, false).unwrap().is_none());
+        assert!(claim_urgent(&store, true).await.unwrap().is_none());
+        let mut item = claim_urgent(&store, false).await.unwrap().unwrap();
+        assert!(claim_urgent(&store, false).await.unwrap().is_none());
+        let reopened = store.clone();
+        assert!(claim_urgent(&reopened, false).await.unwrap().is_none());
         item.pushed = true;
         item.status = ReviewStatus::Approved;
-        reopened.save_review(&item).unwrap();
-        let digest = digest(&reopened).unwrap().unwrap();
+        reopened.save_review(&item).await.unwrap();
+        let digest = digest(&reopened).await.unwrap().unwrap();
         assert!(digest.contains("#1 [Act] subject（已单独推送）"));
         assert!(digest.contains("（已批准）"));
         assert!(digest.contains("#2 [Act] subject\n"));
-        assert!(super::digest(&reopened).unwrap().is_none());
+        assert!(super::digest(&reopened).await.unwrap().is_none());
         let mut legacy = serde_json::to_value(&item).unwrap();
         legacy.as_object_mut().unwrap().remove("urgent");
         legacy.as_object_mut().unwrap().remove("pushed");
         let legacy: ReviewItem = serde_json::from_value(legacy).unwrap();
         assert!(!legacy.urgent && !legacy.pushed);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

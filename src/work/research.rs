@@ -25,7 +25,7 @@ use crate::store::{ReviewCategory, ReviewItem, ReviewStatus, Store};
 
 pub struct Job {
     pub models: Arc<Models>,
-    pub store: Arc<dyn Store>,
+    pub store: Store,
     pub board: Arc<Mutex<Board>>,
     pub l1: String,
     pub hands: HandsCfg,
@@ -79,7 +79,7 @@ pub async fn run(job: Job) -> Outcome {
         Err(e) => {
             if let Some(reason) = e.downcast_ref::<Uncertain>() {
                 job.log(&reason.to_string());
-                match waiting_for_owner(job.store.as_ref(), &job.task, &reason.0) {
+                match waiting_for_owner(&job.store, &job.task, &reason.0).await {
                     Ok(outcome) => return outcome,
                     Err(error) => job.log(&format!("恢复核实审查项保存失败：{error:#}")),
                 }
@@ -99,9 +99,9 @@ pub async fn run(job: Job) -> Outcome {
     }
 }
 
-fn waiting_for_owner(store: &dyn Store, task: &Task, reason: &str) -> Result<Outcome> {
+async fn waiting_for_owner(store: &Store, task: &Task, reason: &str) -> Result<Outcome> {
     let j = judge::Judgement { verdict: Verdict::Owner, reasons: reason.into(), fixes: String::new(), urgent: true };
-    let item = judge::file(store, ReviewCategory::Act, &task.title, reason, &j, false, json!({"task_id": task.id}))?;
+    let item = judge::file(store, ReviewCategory::Act, &task.title, reason, &j, false, json!({"task_id": task.id})).await?;
     // Approving this review does not replay anything.
     Ok(Outcome {
         task_id: task.id.clone(),
@@ -422,8 +422,8 @@ fn another_round(verdict: Verdict, pending: bool, rounds: usize) -> bool {
 async fn review_round(job: &Job, category: ReviewCategory, subject: &str, evidence: &str, round: usize, reviewed_followups_bytes: usize) -> Result<(judge::Judgement, ReviewItem)> {
     let j = judge::review_work(&job.models, category, subject, evidence).await?;
     let detail = format!("任务 {} 第 {round} 轮，产物目录 {}。\n{}", job.task.id, job.dir().display(), revision_notes(&j));
-    let item = judge::file(job.store.as_ref(), category, &job.task.title, &detail, &j, false,
-        json!({"task_id": job.task.id, "work_round": round, "fixes": j.fixes, "evidence": evidence, "reviewed_followups_bytes": reviewed_followups_bytes}))?;
+    let item = judge::file(&job.store, category, &job.task.title, &detail, &j, false,
+        json!({"task_id": job.task.id, "work_round": round, "fixes": j.fixes, "evidence": evidence, "reviewed_followups_bytes": reviewed_followups_bytes})).await?;
     job.log(&format!("第 {round} 轮审查 #{}：{}，{}；修改意见：{}", item.id, j.verdict.zh(), j.reasons, j.fixes));
     Ok((j, item))
 }
@@ -432,11 +432,11 @@ fn revision_notes(j: &judge::Judgement) -> String {
     format!("{}\n{}", j.reasons, j.fixes).trim().to_owned()
 }
 
-fn reviewed_outcome(job: &Job, summary: String, j: &judge::Judgement, mut item: ReviewItem, pending: &str) -> Result<Outcome> {
+async fn reviewed_outcome(job: &Job, summary: String, j: &judge::Judgement, mut item: ReviewItem, pending: &str) -> Result<Outcome> {
     let task = &job.task;
     if matches!(j.verdict, Verdict::Revise | Verdict::Defer) {
         item.status = ReviewStatus::Open;
-        job.store.save_review(&item)?;
+        job.store.save_review(&item).await?;
     }
     let reason = if j.verdict != Verdict::Pass {
         Some(format!("{}：{}。可补充材料后用 /run {} 继续。", j.verdict.zh(), revision_notes(j), task.id))
@@ -594,20 +594,20 @@ async fn gather(
     instructions: &str,
     session: &mut Option<String>,
 ) -> Result<String> {
-    let snapshot = resume::inspect(dir, &job.task, job.store.as_ref()).await?;
+    let snapshot = resume::inspect(dir, &job.task, &job.store).await?;
     let brief = format!("{}{}", snapshot.brief(), supplied_material(dir)?);
     let prompt = format!("{brief}{}", with_followups(&gather_prompt(&job.task, plan, fixes), instructions));
     match job.hands.research {
         DelegateTool::Dsh => {
             let prompt = format!("{brief}{}", with_followups(&dsh_gather_prompt(&job.task, plan, fixes), instructions));
-            let result = delegate::dsh(dir, &prompt, &job.hands, job.timeout(), session.as_deref(), job.store.as_ref(), "research").await;
+            let result = delegate::dsh(dir, &prompt, &job.hands, job.timeout(), session.as_deref(), &job.store, "research").await;
             // Gathering has no external effects and the brief makes a fresh session inspect first.
             let output = match result {
                 Ok(output) => output,
                 Err(e) if session.is_some() => {
                     job.log(&format!("DSH resume 失败，回退到新会话：{e:#}"));
                     *session = None;
-                    delegate::dsh(dir, &prompt, &job.hands, job.timeout(), None, job.store.as_ref(), "research").await?
+                    delegate::dsh(dir, &prompt, &job.hands, job.timeout(), None, &job.store, "research").await?
                 }
                 Err(e) => return Err(e),
             };
@@ -747,7 +747,7 @@ fn plan_prompt(title: &str, brief: &str, existing_plan: &str, instructions: &str
 async fn research(job: &Job) -> Result<Outcome> {
     let progress = RunProgress { started: Instant::now(), spent_at_start: job.models.spent_today().0 };
     let dir = job.dir();
-    let snapshot = resume::inspect(&dir, &job.task, job.store.as_ref()).await?;
+    let snapshot = resume::inspect(&dir, &job.task, &job.store).await?;
     let brief = snapshot.brief();
     let mut followups = Followups::default();
     let initial_followups = followup_snapshot(job)?;
@@ -786,7 +786,7 @@ async fn research(job: &Job) -> Result<Outcome> {
     }
 
     let mut session = None;
-    let mut fixes = previous_revision(job)?;
+    let mut fixes = previous_revision(job).await?;
     let mut gathers = 0;
     let mut exit_reason = None;
     let (gist, j, review) = loop {
@@ -821,7 +821,7 @@ async fn research(job: &Job) -> Result<Outcome> {
     let snapshot = followup_snapshot(job)?;
     let unprocessed = format!("{}{}", followups.pending_instructions, followups.unread(&snapshot)?);
     let caveat = exit_reason.map(|r| format!("\n即时反思决定结束本轮：{r}")).unwrap_or_default();
-    reviewed_outcome(job, format!("{}\n完整报告：{}{caveat}", gist.trim(), dir.join("report.md").display()), &j, review, &unprocessed)
+    reviewed_outcome(job, format!("{}\n完整报告：{}{caveat}", gist.trim(), dir.join("report.md").display()), &j, review, &unprocessed).await
 }
 
 async fn code(job: &Job) -> Result<Outcome> {
@@ -834,8 +834,8 @@ async fn code(job: &Job) -> Result<Outcome> {
     }
 }
 
-fn previous_revision(job: &Job) -> Result<Option<String>> {
-    let previous = job.store.reviews()?.into_iter().filter(|item| {
+async fn previous_revision(job: &Job) -> Result<Option<String>> {
+    let previous = job.store.reviews().await?.into_iter().filter(|item| {
         item.payload["task_id"].as_str() == Some(&job.task.id) && item.payload["work_round"].is_number()
     }).max_by_key(|item| item.id);
     Ok(previous.filter(|item| !item.verdict.starts_with(Verdict::Pass.zh())).map(|item| {
@@ -883,9 +883,9 @@ pub(crate) async fn code_rounds<F: std::future::Future<Output = Result<String>>>
     let dir = task_dir.join("scratch");
     std::fs::create_dir_all(&dir)?;
     anyhow::ensure!(!linked(&dir.symlink_metadata()?), "invalid linked task scratch directory");
-    let mut fixes = previous_revision(job)?.unwrap_or_default();
+    let mut fixes = previous_revision(job).await?.unwrap_or_default();
     for round in 1..=MAX_GATHERS {
-        let snapshot = resume::inspect(&task_dir, &job.task, job.store.as_ref()).await?;
+        let snapshot = resume::inspect(&task_dir, &job.task, &job.store).await?;
         let instructions = followup_snapshot(job)?;
         let subject = with_followups(&job.task.title, &instructions);
         let materials = supplied_material(&task_dir)?;
@@ -899,7 +899,7 @@ pub(crate) async fn code_rounds<F: std::future::Future<Output = Result<String>>>
         let pending = latest.strip_prefix(&instructions).context("followups.md changed during code round")?;
         if !another_round(j.verdict, !pending.trim().is_empty(), round) {
             let summary = format!("{}\n产出在：{}", text.trim(), dir.display());
-            return reviewed_outcome(job, summary, &j, review, pending);
+            return reviewed_outcome(job, summary, &j, review, pending).await;
         }
         fixes = revision_notes(&j);
     }
@@ -914,7 +914,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("agli-{name}-{}", std::process::id()));
         let mut board = Board::load(&root.join("work")).unwrap();
         let task = board.add(name, kind, "owner", TaskStatus::Active, None).unwrap();
-        let store: Arc<dyn Store> = Arc::new(crate::store::jsonl::JsonlStore::open(&root.join("data")).unwrap());
+        let store: Store = Store::memory();
         let models = Arc::new(Models::stub(store.clone(), replies.iter().map(|s| s.to_string()).collect()));
         let hands = serde_yaml::from_str("code: off\nresearch: off\ncodex_model: test\ntimeout_min: 1").unwrap();
         (root, Job { models, store, board: Arc::new(Mutex::new(board)), l1: "zh".into(), hands, task })
@@ -939,7 +939,7 @@ mod tests {
             ["research_plan", "synthesize", "work_review", "synthesize", "work_review"]);
         assert!(prompts.iter().all(|p| p.2.contains("第 4 页原文")));
         assert!(prompts[3].2.contains("草稿一") && prompts[3].2.contains("注明材料页码"));
-        let reviews = store.reviews().unwrap();
+        let reviews = store.reviews().await.unwrap();
         assert_eq!(reviews.len(), 2);
         assert!(reviews[0].payload["evidence"].as_str().unwrap().contains("草稿一")
             && reviews[1].payload["evidence"].as_str().unwrap().contains("已注明出处的报告"));
@@ -968,11 +968,11 @@ mod tests {
         assert_eq!(count, 3);
         assert_eq!(result.status(), TaskStatus::Waiting);
         assert!(result.summary.contains("fix the remaining case"));
-        let reviews = job.store.reviews().unwrap();
+        let reviews = job.store.reviews().await.unwrap();
         assert_eq!(reviews.len(), 3);
         assert!(reviews[2].payload["evidence"].as_str().unwrap().contains("artifact 3"));
         assert_eq!(reviews[2].payload["reviewed_followups_bytes"], "new requirement".len());
-        assert!(previous_revision(&job).unwrap().unwrap().contains("fix the remaining case"));
+        assert!(previous_revision(&job).await.unwrap().unwrap().contains("fix the remaining case"));
         for verdict in [Verdict::Owner, Verdict::Defer] {
             assert!(!another_round(verdict, true, 1));
         }
@@ -1164,20 +1164,20 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn uncertain_resume_files_owner_review_and_returns_waiting_outcome() {
-        use crate::store::{ReviewStatus, jsonl::JsonlStore};
+    #[tokio::test]
+    async fn uncertain_resume_files_owner_review_and_returns_waiting_outcome() {
+        use crate::store::ReviewStatus;
         use super::super::board::TaskStatus;
         let root = std::env::temp_dir().join(format!("agli-resume-wait-{}", std::process::id()));
         let mut board = Board::load(&root).unwrap();
         let task = board.add("publish", TaskKind::Code, "owner", TaskStatus::Active, None).unwrap();
-        let store = JsonlStore::open(&root.join("data")).unwrap();
+        let store = Store::memory();
         let error = resume::check_reply("RESUME_WAIT: remote result unknown; owner must check receipt").unwrap_err();
         let reason = error.downcast_ref::<Uncertain>().unwrap();
-        let outcome = waiting_for_owner(&store, &task, &reason.0).unwrap();
+        let outcome = waiting_for_owner(&store, &task, &reason.0).await.unwrap();
         assert!(!outcome.ok);
         assert!(outcome.summary.contains("remote result unknown"));
-        let reviews = store.reviews().unwrap();
+        let reviews = store.reviews().await.unwrap();
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].status, ReviewStatus::Open);
         assert!(reviews[0].urgent);
@@ -1421,7 +1421,7 @@ mod tests {
         let cfg = crate::config::Config::load(root).unwrap();
         assert_eq!(cfg.runtime.hands.research, DelegateTool::Dsh, "hands.research must be dsh");
         let base = std::env::temp_dir().join(format!("aglibot-live-research-{}", std::process::id()));
-        let store: Arc<dyn Store> = Arc::new(crate::store::jsonl::JsonlStore::open(&base.join("data")).unwrap());
+        let store: Store = Store::memory();
         let models = Arc::new(Models::new(&cfg, store.clone()).await.unwrap());
         let mut board = Board::load(&base.join("work")).unwrap();
         let task = board.add("Rust 2024 edition 正式发布于哪个 Rust 版本、哪一天？给出官方来源", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
@@ -1446,7 +1446,7 @@ summary: {}", dir.display(), outcome.ok, outcome.verdict, outcome.summary);
         let cfg = crate::config::Config::load(root)?;
         let start = chrono::Utc::now();
         let base = root.join("target/work-review-smoke").join(format!("{}-{}", start.timestamp_millis(), std::process::id()));
-        let store: Arc<dyn Store> = Arc::new(crate::store::jsonl::JsonlStore::open(&base.join("data"))?);
+        let store: Store = Store::memory();
         let models = Arc::new(Models::new(&cfg, store.clone()).await?);
         let selected = models.pick("work_review", &ProcessingPolicy::Any)?;
         anyhow::ensure!(selected.id == "bailian-deepseek-flash" && selected.provider == "bailian" && selected.model == "deepseek-v4.1-flash",
@@ -1458,7 +1458,8 @@ summary: {}", dir.display(), outcome.ok, outcome.verdict, outcome.summary);
         std::fs::write(dir.join("result.txt"), "4\n")?;
         let job = Job { models, store: store.clone(), board: Arc::new(Mutex::new(board)), l1: String::new(), hands: cfg.runtime.hands, task };
         let (judgement, _) = review_round(&job, ReviewCategory::Act, &job.task.title, &artifact_evidence(&dir)?, 1, 0).await?;
-        let calls = store.model_calls_between(start, chrono::Utc::now() + chrono::TimeDelta::seconds(1))?;
+        let calls: Vec<_> = store.model_calls().await?.into_iter()
+            .filter(|call| call.ts.timestamp_millis() >= start.timestamp_millis()).collect();
         anyhow::ensure!(calls.len() == 1 && calls[0].ok && calls[0].scenario == "work_review" && calls[0].model_id == selected.id,
             "missing successful work_review DSF receipt");
         println!("scenario=work_review provider={} model={} verdict={}", selected.provider, selected.model, judgement.verdict.zh());

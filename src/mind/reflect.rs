@@ -52,22 +52,22 @@ fn watermark_key(ns: &Namespace) -> String {
     format!("extract:{ns}")
 }
 
-pub fn watermark(store: &dyn Store, ns: &Namespace) -> Result<DateTime<Utc>> {
+pub async fn watermark(store: &Store, ns: &Namespace) -> Result<DateTime<Utc>> {
     Ok(store
-        .kv_get(&watermark_key(ns))?
+        .kv_get(&watermark_key(ns)).await?
         .and_then(|v| v.as_str().and_then(|s| s.parse().ok()))
         .unwrap_or(DateTime::<Utc>::MIN_UTC))
 }
 
 /// Distil everything in `ns` since the last extraction.
-pub async fn extract_ns(models: &Models, store: &dyn Store, people: &mut People, ns: &Namespace) -> Result<ExtractOutcome> {
-    let since = watermark(store, ns)?;
-    let msgs = store.messages_after(ns, since)?;
+pub async fn extract_ns(models: &Models, store: &Store, people: &mut People, ns: &Namespace) -> Result<ExtractOutcome> {
+    let since = watermark(store, ns).await?;
+    let msgs = store.messages_after(ns, since).await?;
     extract_messages(models, store, people, ns, &msgs, None, None).await
 }
 
 async fn extract_messages(
-    models: &Models, store: &dyn Store, people: &mut People, ns: &Namespace,
+    models: &Models, store: &Store, people: &mut People, ns: &Namespace,
     msgs: &[MessageRecord], through: Option<DateTime<Utc>>, limit: Option<SpendLimit>,
 ) -> Result<ExtractOutcome> {
     let Some(last) = msgs.last() else { return Ok(ExtractOutcome::default()) };
@@ -115,19 +115,18 @@ async fn extract_messages(
             salience: e.salience.clamp(0.0, 1.0),
             ns: ns.clone(),
             scope: scope.clone(),
-            sources: vec![],
         };
-        store.append_episode(&episode)?;
+        store.append_episode(&episode).await?;
         out.episodes += 1;
     }
     for f in raw.facts {
         if f.person == "me" || !ids.contains(&f.person) || f.text.trim().is_empty() {
             continue;
         }
-        people.add_fact(store, &f.person, Fact { text: f.text, ns: ns.clone(), scope: scope.clone(), ts: now })?;
+        people.add_fact(store, &f.person, Fact { text: f.text, ns: ns.clone(), scope: scope.clone(), ts: now }).await?;
         out.facts += 1;
     }
-    store.kv_set(&watermark_key(ns), json!(through.unwrap_or(last.ts).to_rfc3339()))?;
+    store.kv_set(&watermark_key(ns), json!(through.unwrap_or(last.ts).to_rfc3339())).await?;
     info!(
         "reflect: {ns}: {} messages → {} episodes, {} facts",
         out.messages, out.episodes, out.facts
@@ -140,13 +139,16 @@ struct ReadOnlyUsage {
     messages: usize,
     cost_usd: f64,
     pending_since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pending_baseline_usd: f64,
 }
 
 impl ReadOnlyUsage {
-    fn settle(&mut self, store: &dyn Store) -> Result<()> {
+    async fn settle(&mut self, store: &Store) -> Result<()> {
         if let Some(since) = self.pending_since {
-            self.cost_usd += store.spent_since(since)?;
+            self.cost_usd += (store.spent_since(since).await? - self.pending_baseline_usd).max(0.0);
             self.pending_since = None;
+            self.pending_baseline_usd = 0.0;
         }
         Ok(())
     }
@@ -164,26 +166,26 @@ fn sample(msgs: &[MessageRecord], count: usize) -> Vec<MessageRecord> {
 
 /// Run only after priority chats. Budget state survives retries/restarts in the same diary night.
 pub async fn read_only_nightly(
-    models: &Models, store: &dyn Store, people: &mut People, social: &SocialCfg,
+    models: &Models, store: &Store, people: &mut People, social: &SocialCfg,
     date: NaiveDate, after: DateTime<Utc>,
 ) -> Result<()> {
     let key = format!("read_only_reflect:{date}");
-    let mut used: ReadOnlyUsage = store.kv_get(&key)?.map(serde_json::from_value).transpose()?.unwrap_or_default();
+    let mut used: ReadOnlyUsage = store.kv_get(&key).await?.map(serde_json::from_value).transpose()?.unwrap_or_default();
     // After an interrupted call, conservatively charge all recorded spend since its start.
-    used.settle(store)?;
-    store.kv_set(&key, json!(used))?;
+    used.settle(store).await?;
+    store.kv_set(&key, json!(used)).await?;
     let mut groups = Vec::new();
-    for ns in store.active_namespaces(after)? {
+    for ns in store.active_namespaces(after).await? {
         if let Namespace::Group(id) = &ns && social.read_only_group(id) {
-            let msgs = store.messages_after(&ns, watermark(store, &ns)?.max(after))?;
+            let msgs = store.messages_after(&ns, watermark(store, &ns).await?.max(after)).await?;
             if !msgs.is_empty() { groups.push((ns, msgs)); }
         }
     }
     groups.sort_by(|(a, am), (b, bm)| bm.len().cmp(&am.len()).then_with(|| a.to_string().cmp(&b.to_string())));
     for (ns, msgs) in groups {
         let remaining = social.read_only_reflect.max_messages_per_night.saturating_sub(used.messages);
-        let limit = SpendLimit { since: Utc::now(), max_usd: social.read_only_reflect.max_cost_usd - used.cost_usd };
-        let count = if limit.exhausted(store)? { 0 } else { remaining.min(msgs.len()) };
+        let limit = SpendLimit::start(store, social.read_only_reflect.max_cost_usd - used.cost_usd).await?;
+        let count = if limit.exhausted(store).await? { 0 } else { remaining.min(msgs.len()) };
         if count < msgs.len() {
             info!(%ns, sampled = count, total = msgs.len(), ratio = count as f64 / msgs.len() as f64,
                 cost_usd = used.cost_usd, "read-only reflect: budget sampling");
@@ -192,10 +194,11 @@ pub async fn read_only_nightly(
         let selected = sample(&msgs, count);
         used.messages += count;
         used.pending_since = Some(limit.since);
-        store.kv_set(&key, json!(used))?;
+        used.pending_baseline_usd = limit.baseline_usd;
+        store.kv_set(&key, json!(used)).await?;
         let result = extract_messages(models, store, people, &ns, &selected, msgs.last().map(|m| m.ts), Some(limit)).await;
-        used.settle(store)?;
-        store.kv_set(&key, json!(used))?;
+        used.settle(store).await?;
+        store.kv_set(&key, json!(used)).await?;
         if let Err(e) = result {
             warn!(%ns, "read-only reflect failed: {e:#}");
         }
@@ -210,20 +213,20 @@ pub fn diary_day(t: DateTime<Local>) -> NaiveDate {
 }
 
 /// Record a note for today's diary, such as a finished task.
-pub fn note_today(store: &dyn Store, line: &str) -> Result<()> {
+pub async fn note_today(store: &Store, line: &str) -> Result<()> {
     let key = format!("daylog:{}", diary_day(Local::now()));
     let mut lines: Vec<String> =
-        store.kv_get(&key)?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        store.kv_get(&key).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     lines.push(line.to_string());
-    store.kv_set(&key, json!(lines))
+    store.kv_set(&key, json!(lines)).await
 }
 
 /// Write the day's journal, keeping self-only episodes on eligible local models.
-pub async fn write_journal(models: &Models, store: &dyn Store, l1: &str, journal_dir: PathBuf, date: NaiveDate) -> Result<Option<PathBuf>> {
+pub async fn write_journal(models: &Models, store: &Store, l1: &str, journal_dir: PathBuf, date: NaiveDate) -> Result<Option<PathBuf>> {
     let mut episodes: Vec<Episode> =
-        store.episodes()?.into_iter().filter(|e| diary_day(e.ts.with_timezone(&Local)) == date).collect();
+        store.episodes().await?.into_iter().filter(|e| diary_day(e.ts.with_timezone(&Local)) == date).collect();
     let notes: Vec<String> =
-        store.kv_get(&format!("daylog:{date}"))?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        store.kv_get(&format!("daylog:{date}")).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     if episodes.is_empty() && notes.is_empty() {
         return Ok(None);
     }
@@ -267,7 +270,7 @@ mod tests {
     fn old_episode(id: &str, ns: &str, scope: Scope) -> Episode {
         Episode { id: id.into(), ts: now() - chrono::Duration::days(60), participants: vec![id.into()],
             summary: format!("event {id}"), emotion: String::new(), salience: 0.1,
-            ns: ns.parse().unwrap(), scope, sources: vec![] }
+            ns: ns.parse().unwrap(), scope }
     }
 
     #[test]
@@ -279,9 +282,6 @@ mod tests {
         assert!((e.effective_salience(e.ts + chrono::Duration::hours(360), 30.0) - 0.1 * 0.5_f64.sqrt()).abs() < 1e-12);
         assert_eq!(e.effective_salience(e.ts - chrono::Duration::days(1), 30.0), 0.1);
         assert_eq!(e.salience, 0.1);
-        let mut old_json = serde_json::to_value(&e).unwrap();
-        old_json.as_object_mut().unwrap().remove("sources");
-        assert!(serde_json::from_value::<Episode>(old_json).unwrap().sources.is_empty());
     }
 
     #[test]
@@ -317,18 +317,18 @@ mod tests {
     #[tokio::test]
     async fn journal_omits_self_only_episodes_when_no_local_model_qualifies() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("aglibot-journal-test-{}", std::process::id()));
-        let store = std::sync::Arc::new(crate::store::jsonl::JsonlStore::open(&dir)?);
+        let store = Store::memory();
         let private = old_episode("private", "self", Scope::SelfOnly);
         let date = diary_day(private.ts.with_timezone(&Local));
         let journal = dir.join("journal");
-        store.append_episode(&private)?;
+        store.append_episode(&private).await?;
         let models = Models::stub(store.clone(), vec!["journal entry".into()]);
 
-        assert_eq!(write_journal(&models, store.as_ref(), "", journal.clone(), date).await?, None);
+        assert_eq!(write_journal(&models, &store, "", journal.clone(), date).await?, None);
         assert!(models.stub_prompts().is_empty());
 
-        store.append_episode(&old_episode("shared", "self", Scope::Public))?;
-        let path = write_journal(&models, store.as_ref(), "", journal, date).await?.unwrap();
+        store.append_episode(&old_episode("shared", "self", Scope::Public)).await?;
+        let path = write_journal(&models, &store, "", journal, date).await?.unwrap();
         let prompts = models.stub_prompts();
         assert_eq!(prompts[0].0, "consolidate");
         assert_eq!(prompts[0].1, ProcessingPolicy::Any);

@@ -1,586 +1,697 @@
-//! MongoDB storage with indexed BSON fields and a lossless JSON record. Keeping the record as
-//! JSON preserves nanosecond timestamps, u64s and arbitrary KV/review payloads (including `$` keys).
-
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
-use mongodb::IndexModel;
-use mongodb::bson::{self, Document, doc};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use mongodb::bson::{self, Bson, Document, doc, raw::RawDocumentBuf};
 use mongodb::options::{ClientOptions, IndexOptions, ReturnDocument};
-use mongodb::sync::{Client, Collection, Database};
-use serde::Serialize;
+use mongodb::{Client, Collection, Cursor, Database, IndexModel};
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 
-use super::{MediaRecord, StickerVector, AuditRecord, Episode, EpisodeEmbedding, Group, Lesson, MessageRecord, ModelCallRecord, Person, Relation, ReviewItem, Store};
-use crate::ns::Namespace;
+use super::*;
+use crate::config::MongoCfg;
 
-const COLLECTIONS: &[&str] =
-    &["messages", "model_calls", "episodes", "persons", "lessons", "audit", "reviews", "kv", "relations", "groups", "media", "sticker_vectors", "lexicon"];
-
-pub struct MongoStore {
-    cache: super::cache::Cache,
-    db: Database,
-    writes: Mutex<()>,
+#[derive(Clone)]
+pub(super) struct MongoStore {
+    pub(super) db: Database,
 }
 
-// The driver's sync API runs its own Tokio runtime. Leave the caller's runtime before using it.
-fn blocking<T: Send>(f: impl FnOnce() -> Result<T> + Send) -> Result<T> {
-    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
-        Ok(_) => std::thread::scope(|s| s.spawn(f).join().map_err(|_| anyhow!("MongoDB worker panicked"))?),
-        Err(_) => f(),
-    }
-}
-
-fn timestamp(ts: DateTime<Utc>) -> bson::DateTime {
+pub(super) fn bson_dt(ts: DateTime<Utc>) -> bson::DateTime {
     bson::DateTime::from_millis(ts.timestamp_millis())
 }
 
-// BSON dates have millisecond precision. Fetch the boundary millisecond too, then compare the
-// original timestamps in Rust, for both strictly-after and inclusive-since queries.
-fn time_filter(ts: DateTime<Utc>) -> Document {
-    doc! { "ts": { "$gte": timestamp(ts) } }
-}
-
-fn record<T: Serialize>(value: &T, mut fields: Document) -> Result<Document> {
-    fields.insert("record", serde_json::to_string(value)?);
-    Ok(fields)
-}
-
-fn decode<T: DeserializeOwned>(doc: Document) -> Result<T> {
-    Ok(serde_json::from_str(doc.get_str("record").context("MongoDB record is missing JSON data")?)?)
-}
-
-fn message_fields(m: &MessageRecord) -> Document {
-    doc! { "chat_id": &m.chat_id, "ns": m.ns.to_string(), "ts": timestamp(m.ts) }
-}
-
-fn model_call_fields(c: &ModelCallRecord) -> Document {
-    doc! { "scenario": &c.scenario, "model": &c.model_id, "ts": timestamp(c.ts) }
-}
-
-fn indexes() -> Vec<(&'static str, IndexModel)> {
-    let mut indexes = vec![
-        ("messages", IndexModel::builder().keys(doc! { "chat_id": 1, "ts": 1 }).build()),
-        ("messages", IndexModel::builder().keys(doc! { "ns": 1, "ts": 1 }).build()),
-        ("episodes", IndexModel::builder().keys(doc! { "ns": 1, "ts": 1 }).build()),
-        ("model_calls", IndexModel::builder().keys(doc! { "scenario": 1, "model": 1, "ts": 1 }).build()),
-        ("model_calls", IndexModel::builder().keys(doc! { "ts": 1 }).build()),
-        // Plain BSON fields, not a JSON record, so the owner edits entries in Compass.
-        ("lexicon", IndexModel::builder()
-            .keys(doc! { "term": 1, "scope": 1 })
-            .options(IndexOptions::builder().unique(true).build())
-            .build()),
-    ];
-    for collection in ["messages", "model_calls", "episodes", "lessons", "audit", "reviews"] {
-        indexes.push((
-            collection,
-            IndexModel::builder()
-                .keys(doc! { "_order": 1 })
-                .options(IndexOptions::builder().unique(true).build())
-                .build(),
-        ));
+fn map_dates(doc: &mut Document, convert: fn(&Bson) -> Result<Option<Bson>>) -> Result<()> {
+    for field in ["ts", "first_seen", "last_seen", "last_sent", "last_update"] {
+        if let Some(value) = doc.get_mut(field)
+            && let Some(converted) = convert(value)?
+        {
+            *value = converted;
+        }
     }
-    indexes
+    if let Ok(facts) = doc.get_array_mut("facts") {
+        for fact in facts.iter_mut().filter_map(Bson::as_document_mut) {
+            map_dates(fact, convert)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn to_bson_doc(value: &impl Serialize, id: Option<Bson>) -> Result<Document> {
+    let mut doc = bson::to_document(value)?;
+    map_dates(&mut doc, |value| {
+        value
+            .as_str()
+            .map(|ts| Ok(Bson::DateTime(bson_dt(ts.parse()?))))
+            .transpose()
+    })?;
+    if let Some(id) = id {
+        doc.insert("_id", id);
+    }
+    Ok(doc)
+}
+
+pub(super) fn from_bson_doc<T: DeserializeOwned>(mut doc: Document) -> Result<T> {
+    doc.remove("_id");
+    map_dates(&mut doc, |value| {
+        value
+            .as_datetime()
+            .map(|ts| {
+                let ts = DateTime::<Utc>::from_timestamp_millis(ts.timestamp_millis())
+                    .context("BSON datetime is outside chrono's range")?;
+                Ok(Bson::String(ts.to_rfc3339()))
+            })
+            .transpose()
+    })?;
+    Ok(bson::from_document(doc)?)
+}
+
+// Treat JSON object keys literally, including objects that resemble Extended JSON.
+// Decimal128 preserves unsigned JSON integers that exceed BSON's signed Int64 range.
+pub(super) fn json_to_bson(value: &Value) -> Result<Bson> {
+    Ok(match value {
+        Value::Null => Bson::Null,
+        Value::Bool(value) => Bson::Boolean(*value),
+        Value::String(value) => Bson::String(value.clone()),
+        Value::Number(value) => {
+            if let Some(n) = value.as_i64() {
+                Bson::Int64(n)
+            } else if value.is_u64() {
+                Bson::Decimal128(value.to_string().parse()?)
+            } else {
+                Bson::Double(value.as_f64().context("invalid JSON number")?)
+            }
+        }
+        Value::Array(values) => {
+            Bson::Array(values.iter().map(json_to_bson).collect::<Result<_>>()?)
+        }
+        Value::Object(fields) => Bson::Document(
+            fields
+                .iter()
+                .map(|(key, value)| {
+                    ensure!(!key.contains('\0'), "BSON document keys cannot contain NUL");
+                    Ok((key.clone(), json_to_bson(value)?))
+                })
+                .collect::<Result<_>>()?,
+        ),
+    })
+}
+
+fn bson_to_json(value: Bson) -> Result<Value> {
+    Ok(match value {
+        Bson::Decimal128(n) => match n.to_string().parse::<u64>() {
+            Ok(value) => Value::from(value),
+            Err(_) => Bson::Decimal128(n).into_relaxed_extjson(),
+        },
+        Bson::Document(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| Ok((key, bson_to_json(value)?)))
+                .collect::<Result<_>>()?,
+        ),
+        Bson::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(bson_to_json)
+                .collect::<Result<_>>()?,
+        ),
+        other => other.into_relaxed_extjson(),
+    })
+}
+
+pub(super) fn review_doc(review: &ReviewItem) -> Result<Document> {
+    let mut fields = serde_json::to_value(review)?;
+    fields
+        .as_object_mut()
+        .context("expected review object")?
+        .remove("payload");
+    let mut doc = to_bson_doc(&fields, Some(Bson::Int64(i64::try_from(review.id)?)))?;
+    doc.insert("payload", json_to_bson(&review.payload)?);
+    Ok(doc)
+}
+
+fn decode_review(mut doc: Document) -> Result<ReviewItem> {
+    let payload = doc.remove("payload").map(bson_to_json).transpose()?;
+    let mut review: ReviewItem = from_bson_doc(doc)?;
+    review.payload = payload.unwrap_or_default();
+    Ok(review)
+}
+
+pub(super) fn kv_doc(key: &str, value: &Value) -> Result<Document> {
+    Ok(doc! { "_id": key, "value": json_to_bson(value)? })
+}
+
+fn decode_kv(mut doc: Document) -> Result<Value> {
+    bson_to_json(
+        doc.remove("value")
+            .context("KV document is missing value")?,
+    )
 }
 
 impl MongoStore {
-    pub fn open(url: &str, database: &str) -> Result<Self> {
-        Self::open_for_import(url, database, false)
-    }
-
-    pub(super) fn open_for_import(url: &str, database: &str, read_only: bool) -> Result<Self> {
-        blocking(|| {
-            // Driver errors can quote connection-string input. Do not attach their source here.
-            let mut options = ClientOptions::parse(url).run().map_err(|_| {
-                anyhow!("MongoDB startup: invalid or unresolvable MONGO_URL (value redacted); no JSONL fallback")
-            })?;
-            options.server_selection_timeout.get_or_insert(Duration::from_secs(5));
-            options.connect_timeout.get_or_insert(Duration::from_secs(5));
-            let client = Client::with_options(options)
-                .map_err(|_| anyhow!("MongoDB startup: invalid client options (URL redacted); no JSONL fallback"))?;
-            let store = Self { db: client.database(database), writes: Mutex::new(()), cache: Default::default() };
-            store.db.run_command(doc! { "ping": 1 }).run()
-                .map_err(|_| anyhow!("MongoDB startup: connection/authentication failed; check MONGO_URL, MONGO_DATABASE and server availability; no JSONL fallback"))?;
-            if !read_only {
-                store.init().map_err(|_| anyhow!("MongoDB startup: creating collections/indexes failed; check database permissions and existing indexes; no JSONL fallback"))?;
-            }
-            Ok(store)
-        })
-    }
-
-    fn collection(&self, name: &str) -> Collection<Document> {
-        self.db.collection(name)
-    }
-
-    fn keyed_snapshot<T: DeserializeOwned + Send>(&self, name: &str) -> Result<BTreeMap<String, T>> {
-        blocking(|| {
-            self.collection(name)
-                .find(doc! {})
-                .run()?
-                .map(|doc| {
-                    let doc = doc?;
-                    Ok((doc.get_str("_id")?.to_owned(), decode(doc)?))
-                })
-                .collect()
-        })
-    }
-
-    pub(super) fn snapshot(&self) -> Result<super::import::Snapshot> {
-        let snapshot = super::import::Snapshot {
-            messages: self.scan("messages", doc! {})?,
-            model_calls: self.scan("model_calls", doc! {})?,
-            episodes: self.all_episodes()?,
-            persons: self.keyed_snapshot("persons")?,
-            groups: self.keyed_snapshot("groups")?,
-            relations: self.keyed_snapshot("relations")?,
-            lessons: self.lessons()?,
-            audit: self.scan("audit", doc! {})?,
-            reviews: self.reviews()?,
-            kv: self.keyed_snapshot("kv")?,
+    pub async fn connect(cfg: &MongoCfg) -> Result<Self> {
+        let url = cfg
+            .url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .context("MongoDB startup: MONGO_URL is required")?;
+        // Driver errors can quote connection-string input, so omit their sources here.
+        let mut options = ClientOptions::parse(url).await.map_err(|_| {
+            anyhow!("MongoDB startup: invalid or unresolvable MONGO_URL (value redacted)")
+        })?;
+        options
+            .server_selection_timeout
+            .get_or_insert(Duration::from_secs(5));
+        options
+            .connect_timeout
+            .get_or_insert(Duration::from_secs(5));
+        let client = Client::with_options(options)
+            .map_err(|_| anyhow!("MongoDB startup: invalid client options (URL redacted)"))?;
+        let store = Self {
+            db: client.database(&cfg.database),
         };
-        snapshot.validate()?;
-        Ok(snapshot)
+        store.db.run_command(doc! { "ping": 1 }).await.map_err(|_| {
+            anyhow!("MongoDB startup: connection/authentication failed; check MONGO_URL, MONGO_DATABASE and server availability")
+        })?;
+        Ok(store)
     }
 
-    #[cfg(test)]
-    pub(super) fn drop_import_test_database(&self) -> Result<()> {
-        anyhow::ensure!(self.db.name().starts_with("aglibot_test_"), "test database required");
-        blocking(|| Ok(self.db.drop().run()?))
-    }
-
-    fn init(&self) -> Result<()> {
-        for name in COLLECTIONS {
-            match self.db.create_collection(*name).run() {
-                Ok(()) => {}
-                Err(e) if matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == 48) => {}
-                Err(e) => return Err(e.into()),
-            }
+    pub async fn init(&self) -> Result<()> {
+        let indexes = [
+            ("messages", doc! { "ns": 1, "ts": 1, "_id": 1 }),
+            ("messages", doc! { "chat_id": 1, "ts": 1 }),
+            ("messages", doc! { "ts": 1 }),
+            ("model_calls", doc! { "ts": 1 }),
+            (
+                "model_calls",
+                doc! { "scenario": 1, "model_id": 1, "ts": 1 },
+            ),
+            ("episodes", doc! { "ns": 1, "ts": 1 }),
+            ("audit", doc! { "ts": 1 }),
+            ("reviews", doc! { "status": 1, "id": 1 }),
+            ("media", doc! { "status": 1, "first_seen": -1 }),
+            ("sticker_vectors", doc! { "model_id": 1 }),
+        ];
+        for (name, keys) in indexes {
+            self.collection(name)
+                .create_index(IndexModel::builder().keys(keys).build())
+                .await?;
         }
-        for (name, index) in indexes() {
-            self.collection(name).create_index(index).run()?;
-        }
-        // persons, reviews and kv use their logical key as _id (MongoDB's unique primary key).
+        self.collection("lexicon")
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { "term": 1, "scope": 1 })
+                    .options(IndexOptions::builder().unique(true).build())
+                    .build(),
+            )
+            .await?;
         Ok(())
     }
 
-    fn next_order(&self) -> Result<i64> {
-        let counter = self
-            .collection("_store_counters")
-            .find_one_and_update(doc! { "_id": "order" }, doc! { "$inc": { "value": 1_i64 } })
+    pub(super) fn collection(&self, name: &str) -> Collection<Document> {
+        self.db.collection(name)
+    }
+
+    pub(super) fn raw(&self, name: &str) -> Collection<RawDocumentBuf> {
+        self.db.collection(name)
+    }
+
+    async fn scan<T: DeserializeOwned>(&self, name: &str) -> Result<Vec<T>> {
+        collect(
+            self.raw(name).find(doc! {}).sort(doc! { "_id": 1 }).await?,
+            from_bson_doc,
+        )
+        .await
+    }
+
+    async fn append(&self, name: &str, value: &impl Serialize) -> Result<()> {
+        self.collection(name)
+            .insert_one(to_bson_doc(value, None)?)
+            .await?;
+        Ok(())
+    }
+
+    async fn save(&self, name: &str, id: &str, value: &impl Serialize) -> Result<()> {
+        self.collection(name)
+            .replace_one(doc! { "_id": id }, to_bson_doc(value, Some(id.into()))?)
             .upsert(true)
-            .return_document(ReturnDocument::After)
-            .run()?
-            .context("MongoDB order counter is missing")?;
-        Ok(counter.get_i64("value")?)
+            .await?;
+        Ok(())
     }
 
-    fn append<T: Serialize>(&self, name: &str, value: &T, fields: Document) -> Result<()> {
-        let mut doc = record(value, fields)?;
-        blocking(|| {
-            let _guard = self.writes.lock().unwrap_or_else(|e| e.into_inner());
-            doc.insert("_order", self.next_order()?);
-            self.collection(name).insert_one(doc).run()?;
-            Ok(())
-        })
+    async fn find<T: DeserializeOwned>(&self, name: &str, id: &str) -> Result<Option<T>> {
+        self.raw(name)
+            .find_one(doc! { "_id": id })
+            .await?
+            .map(|doc| from_bson_doc(doc.to_document()?))
+            .transpose()
     }
 
-    fn scan<T: DeserializeOwned + Send>(&self, name: &str, filter: Document) -> Result<Vec<T>> {
-        blocking(|| {
-            self.collection(name).find(filter).sort(doc! { "_order": 1 }).run()?.map(|doc| decode(doc?)).collect()
-        })
+    pub async fn append_message(&self, m: &MessageRecord) -> Result<()> {
+        self.append("messages", m).await
     }
 
-    fn save<T: Serialize>(&self, name: &str, key: &str, value: &T, ordered: bool) -> Result<()> {
-        let doc = record(value, doc! {})?;
-        blocking(|| {
-            let _guard = self.writes.lock().unwrap_or_else(|e| e.into_inner());
-            let mut update = doc! { "$set": doc };
-            if ordered {
-                update.insert("$setOnInsert", doc! { "_order": self.next_order()? });
-            }
-            self.collection(name).update_one(doc! { "_id": key }, update).upsert(true).run()?;
-            Ok(())
-        })
-    }
-}
-
-impl Store for MongoStore {
-    fn append_message(&self, m: &MessageRecord) -> Result<()> {
-        self.append("messages", m, message_fields(m))
-    }
-
-    fn recent_in_ns(&self, ns: &Namespace, n: usize) -> Result<Vec<MessageRecord>> {
+    pub async fn recent_in_ns(&self, ns: &Namespace, n: usize) -> Result<Vec<MessageRecord>> {
         if n == 0 {
             return Ok(Vec::new());
         }
-        blocking(|| {
-            let mut records: Vec<MessageRecord> = self
-                .collection("messages")
-                .find(doc! { "ns": ns.to_string() })
-                .sort(doc! { "_order": -1 })
-                .limit(i64::try_from(n).unwrap_or(i64::MAX))
-                .run()?
-                .map(|doc| decode(doc?))
-                .collect::<Result<_>>()?;
-            records.reverse();
-            Ok(records)
-        })
-    }
-
-    fn messages_after(&self, ns: &Namespace, after: DateTime<Utc>) -> Result<Vec<MessageRecord>> {
-        let mut filter = time_filter(after);
-        filter.insert("ns", ns.to_string());
-        let mut records: Vec<MessageRecord> = self.scan("messages", filter)?;
-        records.retain(|m| m.ts > after);
+        let cursor = self
+            .raw("messages")
+            .find(doc! { "ns": ns.to_string() })
+            .sort(doc! { "ts": -1, "_id": -1 })
+            .limit(i64::try_from(n).unwrap_or(i64::MAX))
+            .await?;
+        let mut records = collect(cursor, from_bson_doc).await?;
+        records.reverse();
         Ok(records)
     }
 
-    fn active_namespaces(&self, after: DateTime<Utc>) -> Result<Vec<Namespace>> {
-        let records: Vec<MessageRecord> = self.scan("messages", time_filter(after))?;
-        let mut namespaces: Vec<_> = records.into_iter().filter(|m| m.ts > after).map(|m| m.ns).collect();
+    pub async fn messages_after(
+        &self,
+        ns: &Namespace,
+        after: DateTime<Utc>,
+    ) -> Result<Vec<MessageRecord>> {
+        let cursor = self
+            .raw("messages")
+            .find(doc! { "ns": ns.to_string(), "ts": { "$gt": bson_dt(after) } })
+            .sort(doc! { "ts": 1, "_id": 1 })
+            .await?;
+        collect(cursor, from_bson_doc).await
+    }
+
+    pub async fn active_namespaces(&self, after: DateTime<Utc>) -> Result<Vec<Namespace>> {
+        let values = self
+            .collection("messages")
+            .distinct("ns", doc! { "ts": { "$gt": bson_dt(after) } })
+            .await?;
+        let mut namespaces = values
+            .iter()
+            .map(|value| value.as_str().context("invalid BSON namespace")?.parse())
+            .collect::<Result<Vec<Namespace>>>()?;
         namespaces.sort();
         namespaces.dedup();
         Ok(namespaces)
     }
 
-    fn append_model_call(&self, c: &ModelCallRecord) -> Result<()> {
-        self.append("model_calls", c, model_call_fields(c))
+    pub async fn append_model_call(&self, c: &ModelCallRecord) -> Result<()> {
+        self.append("model_calls", c).await
     }
 
-    fn model_calls_between(&self, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Vec<ModelCallRecord>> {
-        let calls: Vec<ModelCallRecord> = self.scan("model_calls", time_filter(since))?;
-        Ok(calls.into_iter().filter(|c| c.ts >= since && c.ts < until).collect())
+    pub async fn spent_since(&self, since: DateTime<Utc>) -> Result<f64> {
+        let mut cursor = self
+            .collection("model_calls")
+            .aggregate([
+                doc! { "$match": { "ts": { "$gte": bson_dt(since) } } },
+                doc! { "$group": { "_id": Bson::Null, "total": { "$sum": "$cost_usd" } } },
+            ])
+            .await?;
+        if cursor.advance().await? {
+            return Ok(cursor.deserialize_current()?.get_f64("total")?);
+        }
+        Ok(0.0)
     }
 
-    fn spent_since(&self, since: DateTime<Utc>) -> Result<f64> {
-        let calls: Vec<ModelCallRecord> = self.scan("model_calls", time_filter(since))?;
-        Ok(calls.iter().filter(|c| c.ts >= since).map(|c| c.cost_usd).sum())
+    #[cfg(test)]
+    pub async fn model_calls(&self) -> Result<Vec<ModelCallRecord>> {
+        self.scan("model_calls").await
     }
 
-    fn append_episode(&self, e: &Episode) -> Result<()> {
-        self.cache.write(|| {
-            self.append("episodes", e, doc! { "ns": e.ns.to_string(), "ts": timestamp(e.ts) })
+    pub async fn append_episode(&self, e: &Episode) -> Result<()> {
+        self.append("episodes", e).await
+    }
+
+    pub async fn episodes(&self) -> Result<Vec<Episode>> {
+        self.scan("episodes").await
+    }
+
+    pub async fn persons(&self) -> Result<BTreeMap<String, Person>> {
+        Ok(self
+            .scan::<Person>("persons")
+            .await?
+            .into_iter()
+            .map(|p| (p.person_id.clone(), p))
+            .collect())
+    }
+
+    pub async fn save_person(&self, p: &Person) -> Result<()> {
+        self.save("persons", &p.person_id, p).await
+    }
+
+    pub async fn append_audit(&self, a: &AuditRecord) -> Result<()> {
+        self.append("audit", a).await
+    }
+
+    pub async fn audits(&self) -> Result<Vec<AuditRecord>> {
+        self.scan("audit").await
+    }
+
+    pub async fn reviews(&self) -> Result<Vec<ReviewItem>> {
+        let cursor = self
+            .raw("reviews")
+            .find(doc! {})
+            .sort(doc! { "_id": 1 })
+            .await?;
+        collect(cursor, decode_review).await
+    }
+
+    pub async fn create_review(&self, new: NewReview) -> Result<ReviewItem> {
+        let counter = self
+            .collection("_counters")
+            .find_one_and_update(
+                doc! { "_id": "review_id" },
+                doc! { "$inc": { "seq": 1_i64 } },
+            )
+            .upsert(true)
+            .return_document(ReturnDocument::After)
+            .await?
+            .context("MongoDB review counter is missing")?;
+        let item = new.with_id(u64::try_from(counter.get_i64("seq")?)?);
+        self.collection("reviews")
+            .insert_one(review_doc(&item)?)
+            .await?;
+        Ok(item)
+    }
+
+    pub async fn save_review(&self, r: &ReviewItem) -> Result<()> {
+        let document = review_doc(r)?;
+        let result = self
+            .collection("reviews")
+            .replace_one(doc! { "_id": document.get_i64("_id")? }, document)
+            .await?;
+        ensure!(result.matched_count == 1, "review does not exist");
+        Ok(())
+    }
+
+    pub async fn kv_get(&self, key: &str) -> Result<Option<Value>> {
+        self.raw("kv")
+            .find_one(doc! { "_id": key })
+            .await?
+            .map(|doc| decode_kv(doc.to_document()?))
+            .transpose()
+    }
+
+    pub async fn kv_set(&self, key: &str, value: Value) -> Result<()> {
+        self.collection("kv")
+            .replace_one(doc! { "_id": key }, kv_doc(key, &value)?)
+            .upsert(true)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn lexicon(&self) -> Result<Vec<Value>> {
+        let cursor = self
+            .raw("lexicon")
+            .find(doc! {})
+            .sort(doc! { "_id": 1 })
+            .await?;
+        collect(cursor, |mut doc| {
+            doc.remove("_id");
+            bson_to_json(Bson::Document(doc))
         })
+        .await
     }
 
-    fn save_embedding(&self, embedding: &EpisodeEmbedding) -> Result<()> {
-        self.cache.write(|| {
-            self.save("embeddings", &embedding.episode_id, embedding, false)
-        })
-    }
-
-    fn load_embeddings(&self, model_id: &str) -> Result<BTreeMap<String, Vec<f32>>> {
-        let all = self.cache.read("embeddings", |d| &mut d.embeddings, || self.keyed_snapshot("embeddings"))?;
-        Ok(all.into_iter().filter(|(_, e)| e.model_id == model_id).map(|(id, e)| (id, e.vector)).collect())
-    }
-
-    fn all_episodes(&self) -> Result<Vec<Episode>> {
-        self.cache.read("episodes", |d| &mut d.episodes, || {
-            self.scan("episodes", doc! {})
-        })
-    }
-
-    fn episodes(&self) -> Result<Vec<Episode>> {
-        self.cache.read("active_episodes", |d| &mut d.active_episodes, || {
-            Ok(super::active_episodes(self.scan("episodes", doc! {})?))
-        })
-    }
-
-    fn archive_episode(&self, archive: &Episode) -> Result<()> {
-        self.cache.write(|| {
-            blocking(|| {
-                let _guard = self.writes.lock().unwrap_or_else(|e| e.into_inner());
-                if super::archive_needed(&self.scan("episodes", doc! {})?, archive)? {
-                    let fields = doc! { "_id": &archive.id, "_order": self.next_order()?,
-                        "ns": archive.ns.to_string(), "ts": timestamp(archive.ts) };
-                    self.collection("episodes").insert_one(record(archive, fields)?).run()?;
-                }
-                Ok(())
-            })
-        })
-    }
-
-    fn persons(&self) -> Result<BTreeMap<String, Person>> {
-        self.cache.read("persons", |d| &mut d.persons, || {
-            Ok(self.scan::<Person>("persons", doc! {})?.into_iter().map(|p| (p.person_id.clone(), p)).collect())
-        })
-    }
-
-    fn save_person(&self, p: &Person) -> Result<()> {
-        self.cache.write(|| {
-            self.save("persons", &p.person_id, p, false)
-        })
-    }
-
-    fn append_lesson(&self, l: &Lesson) -> Result<()> {
-        self.cache.write(|| {
-            self.append("lessons", l, doc! { "ts": timestamp(l.ts) })
-        })
-    }
-
-    fn group(&self, chat_id: &str) -> Result<Option<Group>> {
-        blocking(|| self.collection("groups").find_one(doc! { "_id": chat_id }).run()?.map(decode).transpose())
-    }
-
-    fn save_group(&self, g: &Group) -> Result<()> {
-        self.save("groups", &g.chat_id, g, false)
-    }
-
-    fn relations(&self, ns: &Namespace) -> Result<Vec<Relation>> {
-        let relations: BTreeMap<String, Relation> = self.keyed_snapshot("relations")?;
-        Ok(relations.into_values().filter(|r| &r.ns == ns).collect())
-    }
-
-    fn save_relation(&self, r: &Relation) -> Result<()> {
-        self.save("relations", &r.key(), r, false)
-    }
-
-    fn lessons(&self) -> Result<Vec<Lesson>> {
-        self.cache.read("lessons", |d| &mut d.lessons, || {
-            self.scan("lessons", doc! {})
-        })
-    }
-
-    fn append_audit(&self, a: &AuditRecord) -> Result<()> {
-        self.append("audit", a, doc! { "ts": timestamp(a.ts) })
-    }
-
-    fn audits(&self) -> Result<Vec<AuditRecord>> {
-        self.scan("audit", doc! {})
-    }
-
-    fn reviews(&self) -> Result<Vec<ReviewItem>> {
-        self.scan("reviews", doc! {})
-    }
-
-    fn save_review(&self, r: &ReviewItem) -> Result<()> {
-        self.save("reviews", &r.id.to_string(), r, true)
-    }
-
-    fn next_review_id(&self) -> Result<u64> {
-        Ok(self.reviews()?.iter().map(|r| r.id).max().unwrap_or(0) + 1)
-    }
-
-    fn kv_get(&self, key: &str) -> Result<Option<Value>> {
-        blocking(|| self.collection("kv").find_one(doc! { "_id": key }).run()?.map(decode).transpose())
-    }
-
-    fn kv_set(&self, key: &str, value: Value) -> Result<()> {
-        self.save("kv", key, &value, false)
-    }
-
-    fn lexicon(&self) -> Result<Vec<Value>> {
-        blocking(|| {
-            self.collection("lexicon").find(doc! {}).run()?.map(|doc| {
-                let mut doc = doc?;
-                doc.remove("_id");
-                Ok(bson::Bson::Document(doc).into_relaxed_extjson())
-            }).collect()
-        })
-    }
-
-    fn insert_lexicon(&self, docs: &[Value]) -> Result<()> {
+    pub async fn insert_lexicon(&self, docs: &[Value]) -> Result<()> {
         if docs.is_empty() {
             return Ok(());
         }
-        let docs = docs.iter().map(bson::to_document).collect::<std::result::Result<Vec<_>, _>>()?;
-        blocking(|| Ok(self.collection("lexicon").insert_many(docs).run().map(|_| ())?))
+        let docs = docs
+            .iter()
+            .map(|value| {
+                lexicon_key(value)?;
+                let Bson::Document(mut doc) = json_to_bson(value)? else {
+                    bail!("expected lexicon object")
+                };
+                doc.remove("_id");
+                Ok(doc)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.collection("lexicon").insert_many(docs).await?;
+        Ok(())
     }
 
-    fn media(&self, hash: &str) -> Result<Option<MediaRecord>> {
-        blocking(|| self.collection("media").find_one(doc! { "_id": hash }).run()?.map(decode).transpose())
+    pub async fn media(&self, hash: &str) -> Result<Option<MediaRecord>> {
+        self.find("media", hash).await
     }
 
-    fn save_media(&self, record: &MediaRecord) -> Result<()> {
-        self.save("media", &record.hash, record, false)
+    pub async fn save_media(&self, record: &MediaRecord) -> Result<()> {
+        self.save("media", &record.hash, record).await
     }
 
-    fn all_media(&self) -> Result<Vec<MediaRecord>> {
-        Ok(self.keyed_snapshot::<MediaRecord>("media")?.into_values().collect())
+    pub async fn touch_media_sighting(
+        &self,
+        hash: &str,
+        now: DateTime<Utc>,
+        promote: Option<(MediaStatus, String)>,
+    ) -> Result<Option<MediaRecord>> {
+        let collection = self.raw("media");
+        let filter = doc! { "_id": hash };
+        let updated = if let Some((status, origin)) = promote {
+            let seen = doc! { "$eq": ["$status", bson::to_bson(&MediaStatus::Seen)?] };
+            // All expressions in this stage read the same pre-update document.
+            let update = vec![doc! { "$set": {
+                "sightings": { "$toLong": { "$add": ["$sightings", 1_i64] } },
+                "last_seen": bson_dt(now),
+                "status": { "$cond": [seen.clone(), bson::to_bson(&status)?, "$status"] },
+                "origin": { "$cond": [seen, doc! { "$literal": origin }, "$origin"] },
+            } }];
+            collection
+                .find_one_and_update(filter, update)
+                .return_document(ReturnDocument::After)
+                .await?
+        } else {
+            let update =
+                doc! { "$inc": { "sightings": 1_i64 }, "$set": { "last_seen": bson_dt(now) } };
+            collection
+                .find_one_and_update(filter, update)
+                .return_document(ReturnDocument::After)
+                .await?
+        };
+        updated
+            .map(|doc| from_bson_doc(doc.to_document()?))
+            .transpose()
     }
 
-    fn delete_media(&self, hash: &str) -> Result<()> {
-        blocking(|| {
-            self.collection("media").delete_one(doc! { "_id": hash }).run()?;
-            self.collection("sticker_vectors").delete_one(doc! { "_id": hash }).run()?;
-            Ok(())
-        })
+    pub async fn record_media_sent(&self, hash: &str, now: DateTime<Utc>) -> Result<()> {
+        self.collection("media")
+            .update_one(
+                doc! { "_id": hash },
+                doc! { "$inc": { "sent_count": 1_i64 }, "$set": { "last_sent": bson_dt(now) } },
+            )
+            .await?;
+        Ok(())
     }
 
-    fn sticker_vectors(&self, model_id: &str) -> Result<BTreeMap<String, StickerVector>> {
-        Ok(self.keyed_snapshot::<StickerVector>("sticker_vectors")?.into_values()
-            .filter(|v| v.model_id == model_id).map(|v| (v.hash.clone(), v)).collect())
+    pub async fn update_media_caption(
+        &self,
+        hash: &str,
+        patch: &MediaCaptionPatch,
+    ) -> Result<bool> {
+        let fields = doc! {
+            "description": &patch.description, "text": &patch.text, "use_when": &patch.use_when,
+            "avoid": &patch.avoid, "tags": &patch.tags,
+        };
+        let result = self
+            .collection("media")
+            .update_one(
+                doc! { "_id": hash, "status": bson::to_bson(&MediaStatus::Active)? },
+                doc! { "$set": fields },
+            )
+            .await?;
+        Ok(result.matched_count == 1)
     }
 
-    fn save_sticker_vector(&self, vector: &StickerVector) -> Result<()> {
-        self.save("sticker_vectors", &vector.hash, vector, false)
+    pub async fn patch_media(
+        &self,
+        hash: &str,
+        patch: &MediaEditPatch,
+    ) -> Result<Option<MediaRecord>> {
+        let mut fields = Document::new();
+        macro_rules! set_fields {
+            ($($field:ident),*) => {
+                $(if let Some(value) = &patch.$field {
+                    fields.insert(stringify!($field), bson::to_bson(value)?);
+                })*
+            };
+        }
+        set_fields!(description, use_when, avoid, tags, scope, status);
+        if fields.is_empty() {
+            return self.media(hash).await;
+        }
+        self.raw("media")
+            .find_one_and_update(doc! { "_id": hash }, doc! { "$set": fields })
+            .return_document(ReturnDocument::After)
+            .await?
+            .map(|doc| from_bson_doc(doc.to_document()?))
+            .transpose()
+    }
+
+    pub async fn all_media(&self) -> Result<Vec<MediaRecord>> {
+        self.scan("media").await
+    }
+
+    pub async fn delete_media(&self, hash: &str) -> Result<()> {
+        self.collection("media")
+            .delete_one(doc! { "_id": hash })
+            .await?;
+        self.collection("sticker_vectors")
+            .delete_one(doc! { "_id": hash })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn sticker_vectors(&self, model_id: &str) -> Result<BTreeMap<String, StickerVector>> {
+        let cursor = self
+            .raw("sticker_vectors")
+            .find(doc! { "model_id": model_id })
+            .await?;
+        let vectors: Vec<StickerVector> = collect(cursor, from_bson_doc).await?;
+        Ok(vectors.into_iter().map(|v| (v.hash.clone(), v)).collect())
+    }
+
+    pub async fn save_sticker_vector(&self, vector: &StickerVector) -> Result<()> {
+        self.save("sticker_vectors", &vector.hash, vector).await
     }
 }
 
+async fn collect<T>(
+    mut cursor: Cursor<RawDocumentBuf>,
+    decode: impl Fn(Document) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut records = Vec::new();
+    while cursor.advance().await? {
+        records.push(decode(cursor.deserialize_current()?.to_document()?)?);
+    }
+    Ok(records)
+}
+
 #[cfg(test)]
-mod tests {
-    use super::super::tests::{call, contract, message, persisted, time};
+mod test {
+    use super::super::tests::{
+        audit, call, contract, episode, json_payload, media, message, person, review, time, vector,
+    };
     use super::*;
-    use mongodb::bson::oid::ObjectId;
-    use serde_json::json;
 
-    fn round_trip<T: Serialize + DeserializeOwned>(value: &T, fields: Document) -> T {
-        let doc = record(value, fields).unwrap();
-        let bytes = bson::to_vec(&doc).unwrap();
-        decode(bson::from_slice(&bytes).unwrap()).unwrap()
+    fn wire(doc: &Document) -> Result<Document> {
+        Ok(RawDocumentBuf::from_document(doc)?.to_document()?)
+    }
+
+    fn round_trip<T: Serialize + DeserializeOwned>(value: &T) -> Result<(Document, T)> {
+        let doc = to_bson_doc(value, None)?;
+        let decoded = from_bson_doc(wire(&doc)?)?;
+        Ok((doc, decoded))
     }
 
     #[test]
-    #[ignore = "requires MONGO_URL pointing at a test server; creates and drops a unique test database"]
-    fn media_records_and_vectors_round_trip() {
-        let url = std::env::var("MONGO_URL").expect("MONGO_URL");
-        let store = MongoStore::open(&url, &format!("aglibot_test_{}", ObjectId::new().to_hex())).unwrap();
-        let record = MediaRecord {
-            hash: "h".into(), ext: "png".into(), status: super::super::MediaStatus::Active, keep: true, description: "猫".into(),
-            text: String::new(), use_when: String::new(), avoid: String::new(), tags: vec!["猫".into()],
-            scope: super::super::StickerScope::Origin, scope_reason: String::new(), origin: "qq:group:1".into(),
-            first_seen: time(), last_seen: time(), sightings: 1, sent_count: 0, last_sent: None,
+    fn native_records_keep_millisecond_dates_and_signed_counters() -> Result<()> {
+        let ms = truncate_ms(time());
+        let (doc, record) = round_trip(&message("self", "text", time()))?;
+        assert_eq!(
+            doc.get_datetime("ts")?.timestamp_millis(),
+            ms.timestamp_millis()
+        );
+        assert_eq!(doc.get_str("ns")?, "self");
+        assert_eq!(record.ts, ms);
+        assert_eq!(record.text, "text");
+
+        let (doc, record) = round_trip(&call(time(), 0.5))?;
+        assert_eq!(doc.get_i64("uncached_input")?, i64::MAX);
+        assert_eq!(record.uncached_input, i64::MAX as u64);
+        assert_eq!(record.ts, ms);
+        assert_eq!(record.cost_usd, 0.5);
+
+        let (doc, record) = round_trip(&episode())?;
+        assert!(doc.get_datetime("ts").is_ok());
+        assert_eq!(record.ts, ms);
+        assert_eq!(record.summary, "memory");
+        let (doc, record) = round_trip(&audit())?;
+        assert!(doc.get_datetime("ts").is_ok());
+        assert_eq!(record.ts, ms);
+        assert_eq!(record.outcome, Outcome::Sent);
+
+        let (doc, record) = round_trip(&person())?;
+        assert!(doc.get_datetime("last_seen").is_ok());
+        assert!(doc.get_datetime("last_update").is_ok());
+        assert!(
+            doc.get_array("facts")?[0]
+                .as_document()
+                .unwrap()
+                .get_datetime("ts")
+                .is_ok()
+        );
+        assert_eq!(record.last_update_day, Some(ms.date_naive()));
+        assert_eq!(record.last_update, Some(ms));
+        assert_eq!(record.facts[0].ts, ms);
+
+        let media = MediaRecord {
+            sent_count: i64::MAX as u64,
+            last_sent: Some(time()),
+            ..media()
         };
-        let result = (|| -> Result<()> {
-            assert!(store.media("h")?.is_none());
-            store.save_media(&record)?;
-            store.save_media(&MediaRecord { sightings: 2, ..record.clone() })?;
-            assert_eq!(store.media("h")?.unwrap().sightings, 2);
-            assert_eq!(store.all_media()?.len(), 1);
-            store.save_sticker_vector(&StickerVector { hash: "h".into(), model_id: "m".into(), text_hash: "t".into(), vector: vec![0.5, -1.0] })?;
-            assert_eq!(store.sticker_vectors("m")?["h"].vector, [0.5, -1.0]);
-            assert!(store.sticker_vectors("other")?.is_empty());
-            store.delete_media("h")?;
-            assert!(store.media("h")?.is_none());
-            assert!(store.sticker_vectors("m")?.is_empty());
-            Ok(())
-        })();
-        store.drop_import_test_database().unwrap();
-        result.unwrap();
+        let (doc, record) = round_trip(&media)?;
+        assert_eq!(doc.get_i64("sent_count")?, i64::MAX);
+        assert_eq!(doc.get_str("status")?, "seen");
+        assert!(doc.get_datetime("first_seen").is_ok());
+        assert!(doc.get_datetime("last_seen").is_ok());
+        assert!(doc.get_datetime("last_sent").is_ok());
+        assert_eq!(record.last_sent, Some(ms));
+        assert_eq!(record.last_seen, ms);
+        assert!(
+            round_trip(&MediaRecord {
+                last_sent: None,
+                ..media
+            })?
+            .1
+            .last_sent
+            .is_none()
+        );
+
+        let (_, record) = round_trip(&vector())?;
+        assert_eq!(record.vector, vector().vector);
+        assert_eq!(record.text_hash, vector().text_hash);
+        Ok(())
     }
 
     #[test]
-    fn bson_mapping_preserves_record_precision_and_json_values() {
-        let m = message("person/a", "消息", time());
-        let fields = message_fields(&m);
-        assert_eq!(fields.get_str("ns").unwrap(), "person/a");
-        assert_eq!(fields.get_str("chat_id").unwrap(), "1");
-        assert_eq!(fields.get_datetime("ts").unwrap().timestamp_millis(), m.ts.timestamp_millis());
-        let back: MessageRecord = round_trip(&m, fields);
-        assert_eq!(serde_json::to_value(back).unwrap(), serde_json::to_value(m).unwrap());
-        let c = call(time(), 0.25);
-        let fields = model_call_fields(&c);
-        assert_eq!(fields.get_str("scenario").unwrap(), "chat");
-        assert_eq!(fields.get_str("model").unwrap(), "model-a");
-        let back: ModelCallRecord = round_trip(&c, fields);
-        assert_eq!(back.uncached_input, u64::MAX);
-        assert_eq!(serde_json::to_value(back).unwrap(), serde_json::to_value(c).unwrap());
+    fn reviews_and_kv_preserve_literal_json_and_unsigned_numbers() -> Result<()> {
+        let mut review = review().with_id(i64::MAX as u64);
+        review.ts = time();
+        let doc = review_doc(&review)?;
+        assert_eq!(doc.get_i64("_id")?, i64::MAX);
+        assert_eq!(doc.get_i64("id")?, i64::MAX);
+        assert!(doc.get_datetime("ts").is_ok());
+        let record = decode_review(wire(&doc)?)?;
+        assert_eq!(record.ts, truncate_ms(time()));
+        assert_eq!(record.payload, json_payload());
+
         for value in [
+            json_payload(),
+            serde_json::json!({"$numberLong": "42"}),
             Value::Null,
-            json!(u64::MAX),
-            json!(-0.0),
-            json!({"$date": "literal", "a.b": [true, null], "nul\0key": "ok"}),
         ] {
-            assert_eq!(round_trip(&value, doc! {}), value);
+            let doc = kv_doc("key", &value)?;
+            assert_eq!(doc.get_str("_id")?, "key");
+            assert_eq!(decode_kv(wire(&doc)?)?, value);
         }
-        assert!(decode::<MessageRecord>(doc! {}).is_err());
-    }
-
-    #[test]
-    fn time_filter_includes_boundary_millisecond() {
-        for ts in [time(), "1960-01-01T00:00:00.999999999Z".parse().unwrap()] {
-            let filter = time_filter(ts);
-            let boundary = *filter.get_document("ts").unwrap().get_datetime("$gte").unwrap();
-            assert_eq!(boundary.timestamp_millis(), ts.timestamp_millis());
-        }
-        assert_eq!(time_filter(time()), time_filter(time() + chrono::Duration::nanoseconds(1)));
-    }
-
-    #[test]
-    fn index_definitions_cover_design_and_ordering() {
-        let indexes = indexes();
-        for (collection, keys) in [
-            ("messages", doc! { "chat_id": 1, "ts": 1 }),
-            ("messages", doc! { "ns": 1, "ts": 1 }),
-            ("episodes", doc! { "ns": 1, "ts": 1 }),
-            ("model_calls", doc! { "scenario": 1, "model": 1, "ts": 1 }),
-        ] {
-            assert!(indexes.iter().any(|(name, index)| *name == collection && index.keys == keys));
-        }
-        for collection in ["messages", "model_calls", "episodes", "lessons", "audit", "reviews"] {
-            assert!(indexes.iter().any(|(name, index)| *name == collection
-                && index.keys == doc! { "_order": 1 }
-                && index.options.as_ref().unwrap().unique == Some(true)));
-        }
-    }
-
-    fn nested_runtime() -> Result<u8> {
-        Ok(tokio::runtime::Runtime::new()?.block_on(async { 7 }))
-    }
-
-    #[test]
-    fn sync_bridge_outside_runtime() {
-        assert_eq!(blocking(nested_runtime).unwrap(), 7);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn sync_bridge_in_current_thread_runtime() {
-        assert_eq!(blocking(nested_runtime).unwrap(), 7);
-        assert!(MongoStore::open("invalid://secret", "test").is_err());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sync_bridge_in_multi_thread_runtime() {
-        assert_eq!(blocking(nested_runtime).unwrap(), 7);
-        assert!(MongoStore::open("invalid://secret", "test").is_err());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires MONGO_URL pointing at a test server; creates and drops a unique test database"]
-    async fn mongo_store_contract_and_reopen() -> Result<()> {
-        let url = std::env::var("MONGO_URL").context("set MONGO_URL to run MongoDB integration tests")?;
-        let database = format!("aglibot_test_{}", ObjectId::new().to_hex());
-        let store = MongoStore::open(&url, &database)?;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-            contract(&store);
-            let reopened = MongoStore::open(&url, &database)?; // Index creation must be idempotent.
-            persisted(&reopened);
-            blocking(|| {
-                let names = reopened.db.list_collection_names().run()?;
-                for collection in COLLECTIONS {
-                    assert!(names.iter().any(|name| name == collection));
-                }
-                for (collection, expected) in indexes() {
-                    let actual: Vec<_> =
-                        reopened.collection(collection).list_indexes().run()?.collect::<mongodb::error::Result<_>>()?;
-                    assert!(actual.iter().any(|index| index.keys == expected.keys));
-                }
-                for collection in ["persons", "reviews", "kv"] {
-                    let doc = reopened.collection(collection).find_one(doc! {}).run()?.unwrap();
-                    assert!(reopened.collection(collection).insert_one(doc).run().is_err());
-                }
-                let audits: Vec<AuditRecord> = reopened.scan("audit", doc! {})?;
-                assert_eq!(audits.len(), 1);
-                assert_eq!(audits[0].outcome, super::super::Outcome::Denied);
-                Ok(())
-            })
-        }));
-        let cleanup = blocking(|| Ok(store.db.drop().run()?));
-        match result {
-            Ok(result) => {
-                result?;
-                cleanup?;
-            }
-            Err(panic) => {
-                let _ = cleanup;
-                std::panic::resume_unwind(panic);
-            }
-        }
-        Ok(())
+    #[ignore = "requires AGLI_TEST_MONGO_URL and permission to create/drop a test database"]
+    async fn live_mongo_contract() -> Result<()> {
+        let url = std::env::var("AGLI_TEST_MONGO_URL").context("set AGLI_TEST_MONGO_URL")?;
+        let cfg = MongoCfg {
+            url: Some(url),
+            database: format!("aglibot_test_{}", bson::oid::ObjectId::new()),
+            ..Default::default()
+        };
+        let store = Store::open(&cfg).await?;
+        let StoreBackend::Mongo(mongo) = store.0.as_ref() else {
+            unreachable!()
+        };
+        let cleanup = mongo.clone();
+        let task = tokio::spawn(async move { contract(&store).await });
+        // Run cleanup even if a contract assertion panics.
+        let result = task.await;
+        cleanup.db.drop().await?;
+        result?
     }
 }

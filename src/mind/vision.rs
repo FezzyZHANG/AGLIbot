@@ -439,18 +439,15 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires relay credentials and network"]
     async fn live_chat_turn_reads_a_gif() {
-        use std::sync::Arc;
 
         use crate::config::SessionCfg;
         use crate::mind::models::Models;
         use crate::mind::speak::Speaker;
         use crate::ns::ProcessingPolicy;
-        use crate::store::jsonl::JsonlStore;
 
         dotenvy::dotenv().ok();
         let cfg = crate::config::Config::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
-        let dir = std::env::temp_dir().join(format!("aglibot-test-vision-live-{}", std::process::id()));
-        let models = Models::new(&cfg, Arc::new(JsonlStore::open(&dir).unwrap())).await.unwrap();
+        let models = Models::new(&cfg, crate::store::Store::memory()).await.unwrap();
         let policy = ProcessingPolicy::Any;
         let colours = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
         let seen = look(&Outlets::default(), &MediaHandle::disabled(std::env::temp_dir()), vec![pending("甲", Some(serve(gif(&colours), 1)))]).await;
@@ -461,7 +458,6 @@ mod tests {
         let now = chrono::Utc::now();
         let first = speaker.say(&models, "k", &policy, crate::mind::speak::SayTurn { now, text: "甲：这动图依次是什么颜色？".into(), images: seen.parts, ephemeral: Vec::new() }, || Ok(String::new())).await.unwrap();
         let second = speaker.say(&models, "k", &policy, crate::mind::speak::SayTurn { now, text: "甲：第一帧是什么颜色？".into(), images: Vec::new(), ephemeral: Vec::new() }, || Ok(String::new())).await.unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
         println!("model {chat}\nfirst: {first}\nsecond: {second}");
         assert!(first.contains('红') && first.contains('绿') && first.contains('蓝'), "{first}");
         assert!(second.contains('红'), "{second}");

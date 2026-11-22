@@ -300,7 +300,7 @@ impl Bot {
             return Ok(());
         }
         let joined = self.media.render(&render_unseen(&lines, false), &[]);
-        let slang = self.slang_note(ctx, &joined, Utc::now()).map(|n| format!("{n}\n\n")).unwrap_or_default();
+        let slang = self.slang_note(ctx, &joined, Utc::now()).await.map(|n| format!("{n}\n\n")).unwrap_or_default();
         let user = format!(
             "（这不是聊天回复，是你在想要不要在群里插话。）{joined}\n\n{slang}\
              大多数时候你只是看看。只有话题你真的有东西可说、气氛合适、不会打扰别人时才说。\
@@ -315,9 +315,9 @@ impl Bot {
     }
 
     /// The lexicon's slang line for a group chat's text; private chats get none.
-    pub(super) fn slang_note(&mut self, ctx: &ChatCtx, text: &str, now: DateTime<Utc>) -> Option<String> {
+    pub(super) async fn slang_note(&mut self, ctx: &ChatCtx, text: &str, now: DateTime<Utc>) -> Option<String> {
         let Namespace::Group(group) = &ctx.ns else { return None };
-        self.lexicon.refresh(self.store.as_ref(), now);
+        self.lexicon.refresh(&self.store, now).await;
         self.lexicon.slang_note(group, text)
     }
 

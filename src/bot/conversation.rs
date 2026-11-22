@@ -38,11 +38,11 @@ impl Bot {
             .map(|t| format!("系统：你之前回复里的任务“{t}”没有建立（只有主人私聊里的任务才算），现在没有人在做它，也不会有结果。"))
             .collect();
         // Slang goes in the tail, never L1/L2, so the cached prefix is unchanged.
-        notes.extend(self.slang_note(ctx, &body, now));
+        notes.extend(self.slang_note(ctx, &body, now).await);
         let turn_tail = tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref(), &notes);
         // Recall runs on every turn (cheap at this volume) so the policy is known before routing.
         let tasks = ctx.task_cards(&self.board());
-        let (l2, policy) = self.frame(ctx, current, &tasks)?;
+        let (l2, policy) = self.frame(ctx, current, &tasks).await?;
         let inputs = self.turn_inputs.take().filter(|(key, _)| key == &ctx.key && !unsolicited)
             .map(|(_, inputs)| inputs).unwrap_or_default();
         let mut task_images = inputs.images();
@@ -143,7 +143,7 @@ impl Bot {
         }
         if let Some(req) = &intent.relay {
             let requester = ctx.partner.as_ref().map(|w| w.person_id.clone()).unwrap_or_else(|| ctx.key.clone());
-            self.relay_request(&requester, req)?;
+            self.relay_request(&requester, req).await?;
             self.push_urgent().await?;
         }
         attach_followups_with_sources(&mut self.board(), ctx, &mut intent, &evidence);
@@ -185,7 +185,7 @@ impl Bot {
         }
         let outcome = if intent.text.is_empty() { Outcome::Sent } else { self.send_bubbles(ctx, &intent.pieces).await };
         if unsolicited {
-            self.audit("me", "group_chime_in", true, &ctx.key, outcome)?;
+            self.audit("me", "group_chime_in", true, &ctx.key, outcome).await?;
         }
         if outcome != Outcome::Sent {
             return Err(anyhow::anyhow!("reply delivery in {}: {outcome:?}", ctx.key).context(Fault::Delivery));
@@ -203,7 +203,7 @@ impl Bot {
         }
         if !intent.text.is_empty() { stored.insert(0, intent.text.clone()); }
         if current > 0 && self.cfg.social.reflects_normally(&ctx.ns) {
-            for message in self.store.recent_in_ns(&ctx.ns, current)? {
+            for message in self.store.recent_in_ns(&ctx.ns, current).await? {
                 if !message.outgoing && message.platform == ctx.platform && message.chat_id == ctx.chat_id
                     && message.scope.permits(&ctx.audience) {
                     self.appraisals.record(message.text, policy.clone());
@@ -220,7 +220,7 @@ impl Bot {
             text: stored.join(" "),
             ns: ctx.ns.clone(),
             scope: ctx.scope.clone(),
-        })?;
+        }).await?;
         Ok(())
     }
 
@@ -230,7 +230,7 @@ impl Bot {
         if ctx.platform != "qq" { return Vec::new() }
         let dir = crate::mind::media::media_dir(&self.cfg);
         let sendable = |r: &crate::store::MediaRecord| crate::mind::media::file_path(&dir, &r.hash, &r.ext).exists();
-        crate::mind::expression::offers(self.store.as_ref(), &self.models, &ctx.key, query, sendable).await
+        crate::mind::expression::offers(&self.store, &self.models, &ctx.key, query, sendable).await
             .unwrap_or_else(|e| { warn!("no stickers offered in {}: {e:#}", ctx.key); Vec::new() })
     }
 
@@ -267,11 +267,7 @@ impl Bot {
             self.outlets.send_sticker(ctx.platform, &ctx.chat_id, &bytes, reply_to).await?;
         }
         info!("sent sticker {} in {}", offer.id, ctx.key);
-        if let Some(mut fresh) = self.store.media(&record.hash)? {
-            fresh.sent_count += 1;
-            fresh.last_sent = Some(Utc::now());
-            self.store.save_media(&fresh)?;
-        }
+        self.store.record_media_sent(&record.hash, Utc::now()).await?;
         Ok(())
     }
 

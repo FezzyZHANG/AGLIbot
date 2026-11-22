@@ -79,30 +79,30 @@ pub struct Lexicon {
 
 impl Lexicon {
     /// Offer the yaml aliases as global aliases once, only into an empty lexicon.
-    pub fn seed(store: &dyn Store, aliases: &[String]) -> Result<()> {
-        if store.kv_get(SEEDED)?.is_some() {
+    pub async fn seed(store: &Store, aliases: &[String]) -> Result<()> {
+        if store.kv_get(SEEDED).await?.is_some() {
             return Ok(());
         }
-        if store.lexicon()?.is_empty() {
+        if store.lexicon().await?.is_empty() {
             let docs: Vec<Value> = aliases.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).collect::<BTreeSet<_>>()
                 .into_iter().map(|a| json!({"term": a, "kind": "alias", "scope": null, "enabled": true, "note": "seeded from social.yaml"}))
                 .collect();
             if !docs.is_empty() {
-                store.insert_lexicon(&docs)?;
+                store.insert_lexicon(&docs).await?;
                 info!("lexicon seeded with {} alias(es) from social.yaml", docs.len());
             }
         }
-        store.kv_set(SEEDED, json!(true))
+        store.kv_set(SEEDED, json!(true)).await
     }
 
     /// Re-read the store when the cache is older than the TTL. A failed read keeps the last good
     /// set and warns once until a read succeeds again.
-    pub fn refresh(&mut self, store: &dyn Store, now: DateTime<Utc>) {
+    pub async fn refresh(&mut self, store: &Store, now: DateTime<Utc>) {
         if self.loaded_at.is_some_and(|t| now - t < chrono::Duration::seconds(TTL_SECS)) {
             return;
         }
         self.loaded_at = Some(now);
-        let docs = match store.lexicon() {
+        let docs = match store.lexicon().await {
             Ok(docs) => docs,
             Err(e) => {
                 if !self.failing {
@@ -163,41 +163,29 @@ impl Lexicon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::jsonl::JsonlStore;
-
-    struct Dir(std::path::PathBuf);
-    impl Drop for Dir {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
-    }
-
-    fn store(name: &str) -> (Dir, JsonlStore) {
-        let dir = std::env::temp_dir().join(format!("aglibot-lexicon-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = JsonlStore::open(&dir).unwrap();
-        (Dir(dir), store)
-    }
 
     fn t0() -> DateTime<Utc> { "2026-11-03T04:00:00Z".parse().unwrap() }
 
-    #[test]
-    fn seed_runs_once_and_never_refills_an_emptied_lexicon() {
-        let (dir, s) = store("seed");
-        Lexicon::seed(&s, &["小庄".into(), " ".into(), "小庄".into()]).unwrap();
-        assert_eq!(s.lexicon().unwrap().len(), 1);
-        Lexicon::seed(&s, &["别的".into()]).unwrap();
-        assert_eq!(s.lexicon().unwrap().len(), 1);
-        std::fs::write(dir.0.join("lexicon.json"), "[]").unwrap();
-        Lexicon::seed(&s, &["小庄".into()]).unwrap();
-        assert!(s.lexicon().unwrap().is_empty());
-        let (_d, fresh) = store("seed-existing");
-        fresh.insert_lexicon(&[json!({"term": "庄", "kind": "alias"})]).unwrap();
-        Lexicon::seed(&fresh, &["小庄".into()]).unwrap();
-        assert_eq!(fresh.lexicon().unwrap().len(), 1, "a non-empty lexicon is never seeded");
+    #[tokio::test]
+    async fn seed_runs_once_and_never_refills_an_emptied_lexicon() {
+        let s = Store::memory();
+        Lexicon::seed(&s, &["小庄".into(), " ".into(), "小庄".into()]).await.unwrap();
+        assert_eq!(s.lexicon().await.unwrap().len(), 1);
+        Lexicon::seed(&s, &["别的".into()]).await.unwrap();
+        assert_eq!(s.lexicon().await.unwrap().len(), 1);
+        let emptied = Store::memory();
+        emptied.kv_set(SEEDED, json!(true)).await.unwrap();
+        Lexicon::seed(&emptied, &["小庄".into()]).await.unwrap();
+        assert!(emptied.lexicon().await.unwrap().is_empty());
+        let fresh = Store::memory();
+        fresh.insert_lexicon(&[json!({"term": "庄", "kind": "alias"})]).await.unwrap();
+        Lexicon::seed(&fresh, &["小庄".into()]).await.unwrap();
+        assert_eq!(fresh.lexicon().await.unwrap().len(), 1, "a non-empty lexicon is never seeded");
     }
 
-    #[test]
-    fn disabled_and_invalid_entries_are_skipped() {
-        let (_d, s) = store("invalid");
+    #[tokio::test]
+    async fn disabled_and_invalid_entries_are_skipped() {
+        let s = Store::memory();
         s.insert_lexicon(&[
             json!({"term": "小庄", "kind": "alias"}),
             json!({"term": "庄方宜", "kind": "alias", "enabled": false}),
@@ -205,9 +193,9 @@ mod tests {
             json!({"term": "空", "kind": "slang"}),
             json!({"term": "怪", "kind": "other"}),
             json!({"term": " ", "kind": "alias"}),
-        ]).unwrap();
+        ]).await.unwrap();
         let mut lx = Lexicon::default();
-        lx.refresh(&s, t0());
+        lx.refresh(&s, t0()).await;
         assert_eq!(lx.entries.len(), 2);
         assert_eq!(lx.skipped.len(), 3);
         assert_eq!(lx.called_by("qq:1", "小庄在吗"), Some("小庄"));
@@ -215,20 +203,17 @@ mod tests {
         assert_eq!(lx.slang_note("qq:1", "空 怪 肉编器").unwrap(), "群里的说法：肉编器＝手写汇编的人");
     }
 
-    #[test]
-    fn ttl_refresh_picks_up_inserts_and_a_failed_read_keeps_the_last_set() {
-        let (dir, s) = store("ttl");
-        s.insert_lexicon(&[json!({"term": "小庄", "kind": "alias"})]).unwrap();
+    #[tokio::test]
+    async fn ttl_refresh_picks_up_inserts() {
+        let s = Store::memory();
+        s.insert_lexicon(&[json!({"term": "小庄", "kind": "alias"})]).await.unwrap();
         let mut lx = Lexicon::default();
-        lx.refresh(&s, t0());
-        s.insert_lexicon(&[json!({"term": "zhuang", "kind": "alias"})]).unwrap();
-        lx.refresh(&s, t0() + chrono::Duration::seconds(TTL_SECS - 1));
+        lx.refresh(&s, t0()).await;
+        s.insert_lexicon(&[json!({"term": "zhuang", "kind": "alias"})]).await.unwrap();
+        lx.refresh(&s, t0() + chrono::Duration::seconds(TTL_SECS - 1)).await;
         assert_eq!(lx.called_by("qq:1", "hey Zhuang"), None, "cached inside the TTL");
-        lx.refresh(&s, t0() + chrono::Duration::seconds(TTL_SECS));
+        lx.refresh(&s, t0() + chrono::Duration::seconds(TTL_SECS)).await;
         assert_eq!(lx.called_by("qq:1", "hey Zhuang"), Some("zhuang"));
-        std::fs::write(dir.0.join("lexicon.json"), "{broken").unwrap();
-        lx.refresh(&s, t0() + chrono::Duration::seconds(3 * TTL_SECS));
-        assert!(lx.failing);
         assert_eq!(lx.called_by("qq:1", "小庄"), Some("小庄"));
         assert_eq!(lx.called_by("qq:1", "zhuang"), Some("zhuang"));
     }

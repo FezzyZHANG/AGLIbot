@@ -56,7 +56,7 @@ const MEMBERSHIP_LOOKUP: Duration = Duration::from_secs(10);
 
 pub struct Bot {
     cfg: Arc<Config>,
-    store: Arc<dyn Store>,
+    store: Store,
     models: Arc<Models>,
     outlets: Outlets,
     events: mpsc::Sender<Event>,
@@ -90,12 +90,12 @@ pub struct Bot {
 }
 
 impl Bot {
-    pub fn new(cfg: Arc<Config>, control: Arc<ControlPlane>, store: Arc<dyn Store>, models: Arc<Models>, outlets: Outlets, events: mpsc::Sender<Event>) -> Result<Self> {
+    pub async fn new(cfg: Arc<Config>, control: Arc<ControlPlane>, store: Store, models: Arc<Models>, outlets: Outlets, events: mpsc::Sender<Event>) -> Result<Self> {
         let l1 = build_l1(&cfg.mind_dir())?;
-        let mut people = People::load(store.as_ref())?;
-        people.ensure(store.as_ref(), &cfg.acl.owner.person_id, "主人", Tier::Owner)?;
-        people.backfill_groups(store.as_ref())?;
-        if let Err(e) = crate::social::lexicon::Lexicon::seed(store.as_ref(), &cfg.social.aliases) {
+        let mut people = People::load(&store).await?;
+        people.ensure(&store, &cfg.acl.owner.person_id, "主人", Tier::Owner).await?;
+        people.backfill_groups(&store).await?;
+        if let Err(e) = crate::social::lexicon::Lexicon::seed(&store, &cfg.social.aliases).await {
             warn!("lexicon seed failed: {e:#}");
         }
         let mut board = Board::load(&cfg.work_dir())?;
@@ -103,7 +103,7 @@ impl Bot {
         if recovered > 0 {
             info!("{recovered} interrupted task(s) moved back to the inbox");
         }
-        let state = MindState::load(&cfg.data_dir(), &cfg.mind_dir())?;
+        let state = MindState::load(&store, &cfg.mind_dir()).await?;
         Ok(Bot {
             speaker: Speaker::new(l1, cfg.runtime.session.clone()),
             people,
@@ -135,8 +135,8 @@ impl Bot {
     }
 
     #[cfg(test)]
-    fn new_with_default_control(cfg: Arc<Config>, store: Arc<dyn Store>, models: Arc<Models>, outlets: Outlets, events: mpsc::Sender<Event>) -> Result<Self> {
-        Self::new(cfg, ControlPlane::load(store.as_ref()), store, models, outlets, events)
+    async fn new_with_default_control(cfg: Arc<Config>, store: Store, models: Arc<Models>, outlets: Outlets, events: mpsc::Sender<Event>) -> Result<Self> {
+        Self::new(cfg, ControlPlane::load(&store).await, store, models, outlets, events).await
     }
 
     pub fn cfg(&self) -> Arc<Config> { self.cfg.clone() }
@@ -182,15 +182,15 @@ impl Bot {
             report_error(&e, Fault::Background);
             warn!("urgent review delivery failed: {e:#}");
         }
-        if let Err(e) = self.state.save(&self.cfg.data_dir()) {
+        if let Err(e) = self.state.save(&self.store).await {
             report_error(&e, Fault::StateSave);
             warn!("saving state failed: {e:#}");
         }
     }
 
-    fn runtime_identity(&self, env: &Envelope) -> Result<Who> {
+    async fn runtime_identity(&self, env: &Envelope) -> Result<Who> {
         let mut acl = self.cfg.acl.clone();
-        acl.known_agents.extend(bot_flags::list(self.store.as_ref(), bot_flags::CONFIRMED)?);
+        acl.known_agents.extend(bot_flags::list(&self.store, bot_flags::CONFIRMED).await?);
         Ok(identify(&acl, env))
     }
 
@@ -219,7 +219,7 @@ impl Bot {
         }
         for g in found {
             info!("{} is a member of {g}", who.person_id);
-            self.people.add_group(self.store.as_ref(), &who.person_id, &g)?;
+            self.people.add_group(&self.store, &who.person_id, &g).await?;
         }
         Ok(())
     }
@@ -285,7 +285,7 @@ impl Bot {
     }
 
     /// L2 for a chat, and the processing policy its recalled memories require.
-    fn frame(&self, ctx: &ChatCtx, current: usize, tasks: &str) -> Result<(String, ProcessingPolicy)> {
+    async fn frame(&self, ctx: &ChatCtx, current: usize, tasks: &str) -> Result<(String, ProcessingPolicy)> {
         let setting = match (ctx.is_group, ctx.platform) {
             (true, p) => format!("{p} 群聊"),
             (false, p) => format!("{p} 私聊"),
@@ -304,9 +304,9 @@ impl Bot {
             max_facts: mem.facts_in_context,
             half_life_days: mem.half_life_days,
         };
-        let recall = privacy::recall(self.store.as_ref(), &query)?;
+        let recall = privacy::recall(&self.store, &query).await?;
         let n = self.cfg.runtime.session.recap_messages;
-        let mut recent = self.store.recent_in_ns(&ctx.ns, n + current)?;
+        let mut recent = self.store.recent_in_ns(&ctx.ns, n + current).await?;
         recent.truncate(recent.len().saturating_sub(current));
         let recap: Vec<RecapLine> = recent
             .into_iter()
@@ -328,7 +328,7 @@ impl Bot {
         Ok((build_l2(&setting, &who, &privacy::render(&recall), &recap, tasks), policy))
     }
 
-    fn audit(&self, requester: &str, tool: &str, allowed: bool, reason: &str, outcome: Outcome) -> Result<()> {
+    async fn audit(&self, requester: &str, tool: &str, allowed: bool, reason: &str, outcome: Outcome) -> Result<()> {
         self.store.append_audit(&AuditRecord {
             ts: Utc::now(),
             requester: requester.into(),
@@ -336,7 +336,7 @@ impl Bot {
             allowed,
             reason: reason.into(),
             outcome,
-        })
+        }).await
     }
 
     fn group_ctx(&self, key: &str) -> Option<ChatCtx> {
@@ -363,8 +363,8 @@ impl Bot {
         })
     }
 
-    fn owner_ctx(&self) -> Option<ChatCtx> {
-        let v = self.store.kv_get("owner_last_chat").ok().flatten()?;
+    async fn owner_ctx(&self) -> Option<ChatCtx> {
+        let v = self.store.kv_get("owner_last_chat").await.ok().flatten()?;
         let platform: &'static str = match v.get("platform")?.as_str()? {
             "qq" => "qq",
             "telegram" => "telegram",

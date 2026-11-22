@@ -421,7 +421,8 @@ struct DshAudit<'a> {
     raw: std::fs::File,
     calls: std::fs::File,
     log: std::fs::File,
-    store: &'a dyn Store,
+    store: Store,
+    flushed: bool,
     model_id: String,
     kind: &'a str,
     started: std::time::Instant,
@@ -429,7 +430,7 @@ struct DshAudit<'a> {
 }
 
 impl<'a> DshAudit<'a> {
-    fn open(dir: &Path, store: &'a dyn Store, profile: &str, home: &Path, kind: &'a str) -> Result<Self> {
+    fn open(dir: &Path, store: &Store, profile: &str, home: &Path, kind: &'a str) -> Result<Self> {
         let append = |name| std::fs::OpenOptions::new().create(true).append(true).open(dir.join(name));
         let mut raw = append("dsh-events.jsonl")?;
         // A cancelled invocation may have ended on a partial line. Keep the next run separate.
@@ -440,7 +441,8 @@ impl<'a> DshAudit<'a> {
             raw,
             calls: append("dsh-tool-calls.jsonl")?,
             log: append("log.md")?,
-            store,
+            store: store.clone(),
+            flushed: false,
             model_id: dsh_profile_model(home, profile),
             kind,
             started: std::time::Instant::now(),
@@ -457,6 +459,24 @@ impl<'a> DshAudit<'a> {
             writeln!(self.calls)?;
         }
         Ok(())
+    }
+
+    async fn flush(&mut self) {
+        self.flushed = true;
+        let Some(record) = self.record() else { return };
+        let store = self.store.clone();
+        // A cancelled delegate can drop this join handle while the write is in flight.
+        // The owned task completes the write without a second attempt in Drop.
+        let write = tokio::spawn(async move {
+            store.append_model_call(&record).await.inspect_err(|e| {
+                tracing::warn!("DSH usage log failed: {e:#}");
+            })
+        });
+        match write.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => { let _ = writeln!(self.log, "- DSH usage storage failed: {e:#}"); }
+            Err(e) => tracing::warn!("DSH usage task failed: {e:#}"),
+        }
     }
 
     fn record(&self) -> Option<ModelCallRecord> {
@@ -481,18 +501,17 @@ impl<'a> DshAudit<'a> {
 
 impl Drop for DshAudit<'_> {
     fn drop(&mut self) {
-        // Store is synchronous, so cancellation also records any usage received before /stop.
         let usage = match self.record() {
             Some(record) => {
-                if let Err(e) = self.store.append_model_call(&record) {
-                    tracing::warn!("DSH usage log failed: {e:#}");
-                    let _ = writeln!(self.log, "- DSH usage storage failed: {e:#}");
-                }
-                format!(
+                let usage = format!(
                     "input={}, output={}, cost unknown (recorded as 0)",
                     record.uncached_input.saturating_add(record.cached_input),
                     record.output
-                )
+                );
+                if !self.flushed {
+                    self.store.append_model_call_best_effort(record);
+                }
+                usage
             }
             None => "usage not reported".into(),
         };
@@ -517,7 +536,7 @@ pub async fn dsh(
     hands: &crate::config::HandsCfg,
     timeout: Duration,
     resume: Option<&str>,
-    store: &dyn Store,
+    store: &Store,
     kind: &str,
 ) -> Result<DshOutput> {
     let executable = std::env::var_os("AGLI_DSH_BIN").filter(|s| !s.is_empty()).unwrap_or_else(|| program("dsh").into());
@@ -540,7 +559,7 @@ async fn dsh_run(
     home: &Path,
     timeout: Duration,
     resume: Option<&str>,
-    store: &dyn Store,
+    store: &Store,
     kind: &str,
 ) -> Result<DshOutput> {
     prepare_dsh_home(home)?;
@@ -558,6 +577,7 @@ async fn dsh_run(
     }
     .await;
     audit.error = result.as_ref().err().map(|e| format!("{e:#}"));
+    audit.flush().await;
     result
 }
 
@@ -596,7 +616,7 @@ mod tests {
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::write(profile.join("cordis.patch.yml"),
             "- id: agent-default-model\n  config: {provider: bailian, model: deepseek-v4.1-flash}").unwrap();
-        let store = crate::store::jsonl::JsonlStore::open(&dir.join("store")).unwrap();
+        let store = Store::memory();
         {
             let mut audit = DshAudit::open(&dir, &store, "agli", &dir, "test").unwrap();
             audit.line(b"{\"type\":\"status\",\"phase\":\"step_end\",\"usage\":{\"inputTokens\":5,\"outputTokens\":2}}\n").unwrap();
@@ -891,7 +911,7 @@ mod tests {
     #[tokio::test]
     async fn dsh_audits_success_failure_and_missing_usage_without_models() -> Result<()> {
         let dir = fixture_dir("audit");
-        let store = crate::store::jsonl::JsonlStore::open(&dir.join("store"))?;
+        let store = Store::memory();
         for role in ["events", "failure", "no-usage"] {
             let result = dsh_run(
                 fixture_command(&dir, role),
@@ -907,8 +927,7 @@ mod tests {
             .await;
             assert_eq!(result.is_ok(), role != "failure");
         }
-        let calls = std::fs::read_to_string(dir.join("store/model_calls.jsonl"))?;
-        let calls: Vec<ModelCallRecord> = calls.lines().map(serde_json::from_str).collect::<std::result::Result<_, _>>()?;
+        let calls = store.model_calls().await?;
         assert_eq!(calls.len(), 2);
         assert!(calls[0].ok && !calls[1].ok);
         assert_eq!(calls[0].scenario, "dsh:research");
@@ -926,7 +945,7 @@ mod tests {
     #[tokio::test]
     async fn dsh_validates_resume_identity_and_terminal_answer() -> Result<()> {
         let dir = fixture_dir("resume");
-        let store = crate::store::jsonl::JsonlStore::open(&dir.join("store"))?;
+        let store = Store::memory();
         for (role, session, ok) in [
             ("events", Some("session-research-25"), true),
             ("events", Some("different-session"), false),
@@ -961,7 +980,7 @@ mod tests {
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::Threading::{OpenProcess, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject};
         let dir = fixture_dir(if cancel { "cancel tree with spaces" } else { "timeout tree with spaces" });
-        let store = std::sync::Arc::new(crate::store::jsonl::JsonlStore::open(&dir.join("store"))?);
+        let store = Store::memory();
         let script = dir.join("tree.cmd");
         std::fs::write(
             &script,
@@ -973,10 +992,11 @@ mod tests {
         let mut cmd = Command::new(&script);
         cmd.current_dir(&dir);
         let work_dir = dir.clone();
+        let worker_store = store.clone();
         let handle = tokio::spawn(async move {
             // A full pipe must not prevent the timeout from firing (the fixture never reads stdin).
             let prompt = if cancel { String::new() } else { "x".repeat(1024 * 1024) };
-            dsh_run(cmd, &work_dir, &prompt, "agli", &work_dir.join("dsh-home"), Duration::from_secs(8), None, store.as_ref(), "research").await
+            dsh_run(cmd, &work_dir, &prompt, "agli", &work_dir.join("dsh-home"), Duration::from_secs(8), None, &worker_store, "research").await
         });
         let ready = tokio::time::timeout(Duration::from_secs(6), async {
             loop {
@@ -1015,9 +1035,9 @@ mod tests {
                 "descendant survived delegate cleanup"
             );
         }
-        let calls = std::fs::read_to_string(dir.join("store/model_calls.jsonl"))?;
-        assert_eq!(calls.lines().count(), 1);
-        let call: ModelCallRecord = serde_json::from_str(calls.lines().next().unwrap())?;
+        let calls = store.model_calls().await?;
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
         assert!(!call.ok);
         assert_eq!((call.uncached_input, call.output), (3, 2));
         std::fs::remove_dir_all(dir)?;
@@ -1140,7 +1160,7 @@ mod tests {
         let (ok_dir, nokey_dir) = (base.join("ok"), base.join("nokey"));
         std::fs::create_dir_all(&ok_dir)?;
         std::fs::create_dir_all(&nokey_dir)?;
-        let store = crate::store::jsonl::JsonlStore::open(&base.join("data"))?;
+        let store = Store::memory();
 
         let prompt = "Use web_search once to find the official homepage of the Rust programming language, \
                       then web_fetch that page. Reply with only the text of its <title> element.";
@@ -1148,9 +1168,9 @@ mod tests {
         println!("dsh answer: {}", out.text.trim());
         let events = std::fs::read_to_string(ok_dir.join("dsh-events.jsonl"))?;
         assert!(events.contains("web_search"), "no web_search call recorded");
-        let calls = std::fs::read_to_string(base.join("data").join("model_calls.jsonl")).unwrap_or_default();
-        println!("model calls: {}", calls.trim());
-        assert!(calls.contains("dsh:live-test"), "usage was not recorded");
+        let calls = store.model_calls().await?;
+        println!("model calls: {calls:?}");
+        assert!(calls.iter().any(|call| call.scenario == "dsh:live-test"), "usage was not recorded");
 
         // Without the dedicated model key the run must fail, not fall back to another key or provider.
         // SAFETY: as above.

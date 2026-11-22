@@ -21,50 +21,19 @@ fn unseen_texts(lines: &VecDeque<UnseenLine>) -> Vec<&str> {
 }
 
 #[tokio::test]
-async fn repeated_frame_reuses_recall_sources_and_writes_invalidate() {
+async fn frame_reads_episodes_appended_through_a_store_clone() {
     use crate::store::Episode;
-    let mut test = TestBot::new("recall-cache").await;
-    let a = &mut test.bot;
-    let store = Arc::new(crate::store::jsonl::JsonlStore::open(&a.cfg.data_dir()).unwrap());
-    a.store = store.clone();
-    let ctx = a.prepare_messages(vec![private_message("42", "hello")]).await.ctx.unwrap();
-    let mut episode = Episode { id: "original".into(), ts: Utc::now(), participants: vec![],
-        summary: "cached memory".into(), emotion: String::new(), salience: 0.5,
-        ns: ctx.ns.clone(), scope: Scope::Public, sources: vec![] };
-    store.append_episode(&episode).unwrap();
-    let cold = a.frame(&ctx, 0, "").unwrap();
-    let counts = store.recall_cache_counts();
-    assert_eq!(a.frame(&ctx, 0, "").unwrap(), cold);
-    assert_eq!(store.recall_cache_counts(), counts);
-    assert!(cold.0.contains("cached memory"));
-    for mutation in 0..3 {
-        let before = store.recall_cache_counts();
-        match mutation {
-            0 => { episode.id = "new".into(); store.append_episode(&episode).unwrap(); }
-            1 => {
-                episode.id = "archive".into();
-                episode.sources = vec!["original".into(), "new".into()];
-                store.archive_episode(&episode).unwrap();
-            }
-            2 => {
-                let mut person = store.persons().unwrap().into_values().next().unwrap();
-                person.facts.push(crate::store::Fact { text: "updated fact".into(), ns: ctx.ns.clone(),
-                    scope: Scope::Public, ts: Utc::now() });
-                store.save_person(&person).unwrap();
-            }
-            _ => unreachable!(),
-        }
-        assert!(store.recall_cache_counts().0 > before.0);
-        let result = a.frame(&ctx, 0, "").unwrap();
-        assert!(store.recall_cache_counts().1 > before.1);
-        let warm = store.recall_cache_counts();
-        assert_eq!(a.frame(&ctx, 0, "").unwrap(), result);
-        assert_eq!(store.recall_cache_counts(), warm);
-        // A fresh store provides the uncached reference without a production bypass.
-        a.store = Arc::new(crate::store::jsonl::JsonlStore::open(&a.cfg.data_dir()).unwrap());
-        assert_eq!(a.frame(&ctx, 0, "").unwrap(), result);
-        a.store = store.clone();
-    }
+    let mut test = TestBot::new("recall-store").await;
+    let bot = &mut test.bot;
+    let ctx = bot.prepare_messages(vec![private_message("42", "hello")]).await.ctx.unwrap();
+    let before = bot.frame(&ctx, 0, "").await.unwrap();
+    assert!(!before.0.contains("fresh memory"));
+    bot.store.clone().append_episode(&Episode {
+        id: "fresh".into(), ts: Utc::now(), participants: vec![],
+        summary: "fresh memory".into(), emotion: String::new(), salience: 0.5,
+        ns: ctx.ns.clone(), scope: Scope::Public,
+    }).await.unwrap();
+    assert!(bot.frame(&ctx, 0, "").await.unwrap().0.contains("fresh memory"));
 }
 
 fn session(quiet: u64, cap: u64) -> SessionCfg {
@@ -115,7 +84,7 @@ async fn debounce_uses_arrival_times_and_leaves_legacy_kv_untouched() {
     let store = &test.bot.store;
     let old_key = "debounce:telegram:42";
     let previous = json!({"samples": 4, "ewma_ms": 9000});
-    store.kv_set(old_key, previous.clone()).unwrap();
+    store.kv_set(old_key, previous.clone()).await.unwrap();
     let session = session(700, 500);
     let first = Instant::now();
     tokio::time::advance(Duration::from_secs(2)).await;
@@ -126,8 +95,8 @@ async fn debounce_uses_arrival_times_and_leaves_legacy_kv_untouched() {
     assert_eq!(texts(next_work(&mut queue, &acl(), &session).unwrap()), ["first"]);
     assert_eq!(texts(next_work(&mut queue, &acl(), &session).unwrap()), ["second"]);
     assert_eq!(texts(next_work(&mut queue, &acl(), &session).unwrap()), ["other"]);
-    assert_eq!(store.kv_get(old_key).unwrap(), Some(previous));
-    assert_eq!(store.kv_get("debounce:telegram:7").unwrap(), None);
+    assert_eq!(store.kv_get(old_key).await.unwrap(), Some(previous));
+    assert_eq!(store.kv_get("debounce:telegram:7").await.unwrap(), None);
 }
 
 #[tokio::test(start_paused = true)]
@@ -154,7 +123,7 @@ async fn debounce_three_spaced_owner_messages_prepare_one_reply() {
     assert_eq!(batch.lines, ["主人：先查方案 A", "主人：再对比方案 B", "主人：给我结论"]);
     let ctx = batch.ctx.unwrap();
     assert_eq!(ctx.message_id.as_deref(), Some("2"));
-    assert_eq!(a.store.recent_in_ns(&ctx.ns, 10).unwrap().len(), 3);
+    assert_eq!(a.store.recent_in_ns(&ctx.ns, 10).await.unwrap().len(), 3);
 }
 
 #[tokio::test(start_paused = true)]
@@ -394,6 +363,7 @@ struct TestBot {
 impl TestBot {
     async fn new(name: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("aglibot-test-batch-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let mut cfg = Config {
             root: dir.clone(), source: dir.clone(), acl: acl(),
             models: serde_yaml::from_str(include_str!("../../config/models.yaml")).unwrap(),
@@ -421,10 +391,10 @@ impl TestBot {
         m.q = 100.0;
         m.vision = true;
         cfg.scenarios.get_mut("chat").unwrap().model = None;
-        let store = Arc::new(crate::store::jsonl::JsonlStore::open(&cfg.data_dir()).unwrap());
+        let store = Store::memory();
         let models = Arc::new(Models::new(&cfg, store.clone()).await.unwrap());
         let (tx, _) = mpsc::channel(16);
-        let mut bot = Bot::new_with_default_control(Arc::new(cfg), store, models, Outlets::default(), tx).unwrap();
+        let mut bot = Bot::new_with_default_control(Arc::new(cfg), store, models, Outlets::default(), tx).await.unwrap();
         bot.state.energy.asleep = false;
         Self { bot, dir }
     }
@@ -459,7 +429,7 @@ async fn qq_candidate_approval_applies_agent_routing_and_rejection_is_durable() 
             a.on_messages(vec![env]).await.unwrap();
         }
     }
-    let reviews = a.store.reviews().unwrap();
+    let reviews = a.store.reviews().await.unwrap();
     assert_eq!(reviews.len(), 2);
     assert!(reviews.iter().all(|r| !r.urgent && r.status == ReviewStatus::Open));
     let ctx = owner_chat();
@@ -468,21 +438,21 @@ async fn qq_candidate_approval_applies_agent_routing_and_rejection_is_durable() 
     let text = a.run_command("/approve", &approved.to_string(), &ctx).await.unwrap();
     assert!(text.contains("config/acl.yaml") && text.contains("known_agents"));
     a.run_command("/reject", &format!("{rejected} 是人"), &ctx).await.unwrap();
-    assert!(a.runtime_identity(&group("7")).unwrap().is_agent);
+    assert!(a.runtime_identity(&group("7")).await.unwrap().is_agent);
     a.test_chat = Some(TestChat::new(&["你好"], &[Outcome::Sent]));
     for _ in 0..2 {
         let mut env = group("7"); env.mentions_me = true;
         a.on_messages(vec![env]).await.unwrap();
     }
     assert_eq!(a.test_chat.as_ref().unwrap().turns.len(), 1);
-    let reopened = Arc::new(crate::store::jsonl::JsonlStore::open(&a.cfg.data_dir()).unwrap());
-    let mut restarted = Bot::new_with_default_control(a.cfg.clone(), reopened, a.models.clone(), Outlets::default(), a.events.clone()).unwrap();
-    assert!(restarted.runtime_identity(&group("7")).unwrap().is_agent);
+    let reopened = a.store.clone();
+    let mut restarted = Bot::new_with_default_control(a.cfg.clone(), reopened, a.models.clone(), Outlets::default(), a.events.clone()).await.unwrap();
+    assert!(restarted.runtime_identity(&group("7")).await.unwrap().is_agent);
     for _ in 0..8 {
         let mut env = group("8"); env.chat_id = "group:readonly".into();
         restarted.on_messages(vec![env]).await.unwrap();
     }
-    assert_eq!(restarted.store.reviews().unwrap().len(), 2);
+    assert_eq!(restarted.store.reviews().await.unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -604,11 +574,13 @@ async fn group_reply_caps_addressed_and_unsolicited_after_stripping_markers() {
     let chat = a.test_chat.as_ref().unwrap();
     assert_eq!(*chat.sent_texts.lock().unwrap(), ["你好世界呀", "你好。"]);
     assert_eq!(chat.turns.len(), 2);
-    let prompts = chat.step_prompts.lock().unwrap();
-    assert_eq!(prompts.len(), 1);
-    assert!(prompts[0].1.contains("不超过 3 字"), "{prompts:?}");
-    assert!(prompts.iter().all(|p| !p.1.contains("<任务>")));
-    let records = a.store.recent_in_ns(&ctx.ns, 10).unwrap();
+    {
+        let prompts = chat.step_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].1.contains("不超过 3 字"), "{prompts:?}");
+        assert!(prompts.iter().all(|p| !p.1.contains("<任务>")));
+    }
+    let records = a.store.recent_in_ns(&ctx.ns, 10).await.unwrap();
     let sent: Vec<_> = records.iter().filter(|m| m.outgoing).map(|m| m.text.as_str()).collect();
     assert_eq!(sent, ["你好世界呀", "你好。"]);
 }
@@ -676,7 +648,7 @@ async fn taking_a_chime_back_at_formatting_sends_nothing() {
     a.test_chat.as_ref().unwrap().steps.lock().unwrap().push_back(Ok("[不发]".into()));
     a.converse(&ctx, "unsolicited".into(), 0, true).await.unwrap();
     assert!(a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().is_empty());
-    assert!(a.store.recent_in_ns(&ctx.ns, 10).unwrap().iter().all(|m| !m.outgoing));
+    assert!(a.store.recent_in_ns(&ctx.ns, 10).await.unwrap().iter().all(|m| !m.outgoing));
 }
 
 #[tokio::test]
@@ -715,7 +687,7 @@ fn delivery_preview_caps_unicode_including_ellipsis() {
 async fn delivery_cards_keep_paths_verdicts_and_cap_all_branches() {
     let mut test = TestBot::new("delivery-cards").await;
     let a = &mut test.bot;
-    a.store.kv_set("owner_last_chat", json!({"platform": "telegram", "chat_id": "42"})).unwrap();
+    a.store.kv_set("owner_last_chat", json!({"platform": "telegram", "chat_id": "42"})).await.unwrap();
     a.test_chat = Some(TestChat::new(&["[沉默]", "[沉默]", "[沉默]", "[沉默]"], &[]));
     let long = format!("{}不得注入的尾部", "中文🦀".repeat(300));
     let preview = delivery_preview(&long);
@@ -752,7 +724,7 @@ async fn delivery_cards_keep_paths_verdicts_and_cap_all_branches() {
 // these tests never invoke an external executor.
 async fn start_slot(a: &mut Bot, owner_run: bool) -> crate::work::board::Task {
     let task = a.board().add("slot", TaskKind::Research, "owner", TaskStatus::Inbox, None).unwrap();
-    assert_eq!(a.start_job_with_owner_slot(&task.id, owner_run).unwrap(), "开始做：slot");
+    assert_eq!(a.start_job_with_owner_slot(&task.id, owner_run).await.unwrap(), "开始做：slot");
     a.control.jobs().stop_one(&task.id).await.unwrap();
     spawn_test_job(a, &task, a.events.clone(), std::future::pending());
     task
@@ -766,9 +738,9 @@ async fn default_slots_preserve_second_start_refusal() {
     let first = start_slot(a, false).await;
     let next = a.board().add("next", TaskKind::Research, "owner", TaskStatus::Inbox, None).unwrap();
     let refusal = format!("正在做 {}，一次只做一件。", first.id);
-    assert_eq!(a.start_job(&next.id).unwrap(), refusal);
-    assert_eq!(a.start_job_with_owner_slot(&next.id, true).unwrap(), refusal);
-    assert_eq!(a.start_job(&first.id).unwrap(), refusal);
+    assert_eq!(a.start_job(&next.id).await.unwrap(), refusal);
+    assert_eq!(a.start_job_with_owner_slot(&next.id, true).await.unwrap(), refusal);
+    assert_eq!(a.start_job(&first.id).await.unwrap(), refusal);
     assert_eq!(a.board().get(&next.id).unwrap().status, TaskStatus::Inbox);
     a.stop_jobs().await;
 }
@@ -781,15 +753,15 @@ async fn parallel_slots_owner_extra_and_commands() {
     let first = start_slot(a, false).await;
     let second = start_slot(a, false).await;
     let next = a.board().add("next", TaskKind::Research, "owner", TaskStatus::Inbox, None).unwrap();
-    assert!(a.start_job(&next.id).unwrap().contains("槽位已满"));
-    assert!(a.start_job(&second.id).unwrap().contains("不能重复"));
+    assert!(a.start_job(&next.id).await.unwrap().contains("槽位已满"));
+    assert!(a.start_job(&second.id).await.unwrap().contains("不能重复"));
     let ctx = owner_chat();
     let mut non_owner = owner_chat();
     non_owner.partner = None;
     assert!(a.run_command("/run", &next.id, &non_owner).await.unwrap().contains("槽位已满"));
     assert_eq!(a.run_command("/run", &next.id, &ctx).await.unwrap(), "开始做：next");
     assert_eq!(a.control.jobs().len(), 3);
-    assert!(a.start_job_with_owner_slot("fourth", true).unwrap().contains("槽位已满"));
+    assert!(a.start_job_with_owner_slot("fourth", true).await.unwrap().contains("槽位已满"));
     let status = a.run_command("/status", "", &ctx).await.unwrap();
     for id in [&first.id, &second.id, &next.id] { assert!(status.contains(id)); }
     a.stop_jobs().await;
@@ -857,8 +829,8 @@ async fn parallel_completions_remove_their_own_jobs_and_deliver_once() {
         }
         assert!(rx.try_recv().is_err());
         assert_ne!(a.deliveries[0].task_id, a.deliveries[1].task_id);
-        a.store.kv_set("owner_last_chat", json!({"platform": "telegram", "chat_id": "42"})).unwrap();
-        a.control.set_frozen(a.store.as_ref(), true).unwrap();
+        a.store.kv_set("owner_last_chat", json!({"platform": "telegram", "chat_id": "42"})).await.unwrap();
+        a.control.set_frozen(&a.store, true).await.unwrap();
         a.test_chat = Some(TestChat::new(&["完成一", "完成二"], &[Outcome::Sent, Outcome::Sent]));
         wake(a).await;
         wake(a).await;
@@ -883,7 +855,7 @@ async fn parallel_watchdog_times_out_jobs_individually() {
     a.watchdog().await.unwrap();
     a.watchdog().await.unwrap();
     assert!(a.control.jobs().is_empty());
-    assert_eq!(a.store.reviews().unwrap().len(), 2);
+    assert_eq!(a.store.reviews().await.unwrap().len(), 2);
     for id in [&first.id, &second.id] { assert_eq!(a.board().get(id).unwrap().status, TaskStatus::Waiting); }
 }
 
@@ -904,7 +876,7 @@ fn fake_job(a: &mut Bot) -> crate::work::board::Task {
 
 #[tokio::test]
 async fn work_review_verdicts_and_late_followups_survive_completion_and_reload() {
-    use crate::store::{ReviewStatus, jsonl::JsonlStore};
+    use crate::store::ReviewStatus;
     let mut test = TestBot::new("review-completion").await;
     let a = &mut test.bot;
     a.state.energy.asleep = true;
@@ -939,20 +911,20 @@ async fn work_review_verdicts_and_late_followups_survive_completion_and_reload()
             a.on_job_done(outcome).await.unwrap();
             let board = Board::load(&a.cfg.work_dir()).unwrap();
             let saved = board.get(&task.id).unwrap();
-            let store = JsonlStore::open(&a.cfg.data_dir()).unwrap();
-            let reviews: Vec<_> = store.reviews().unwrap().into_iter().filter(|r| r.payload["task_id"] == task.id).collect();
+            let store = a.store.clone();
+            let reviews: Vec<_> = store.reviews().await.unwrap().into_iter().filter(|r| r.payload["task_id"] == task.id).collect();
             assert_eq!(reviews.len(), rounds);
             let last = reviews.last().unwrap();
             let expected = match case { "pass" => TaskStatus::Done, "late-followup" => TaskStatus::Inbox, _ => TaskStatus::Waiting };
             assert_eq!(saved.status, expected);
-            let notes = store.kv_get(&format!("daylog:{}", reflect::diary_day(Local::now()))).unwrap().unwrap();
+            let notes = store.kv_get(&format!("daylog:{}", reflect::diary_day(Local::now()))).await.unwrap().unwrap();
             let line = notes.as_array().unwrap().last().unwrap().as_str().unwrap();
             assert!(line.contains(&title));
             assert_eq!(line.contains("（完成）"), expected == TaskStatus::Done);
             if expected == TaskStatus::Waiting {
                 assert_eq!(last.status, ReviewStatus::Open);
                 assert!(saved.note.contains("/run") && saved.note.contains("具体修改意见"));
-                assert!(judge::digest(&store).unwrap().unwrap().contains(&title));
+                assert!(judge::digest(&store).await.unwrap().unwrap().contains(&title));
             } else {
                 assert_eq!(last.status, ReviewStatus::Closed);
             }
@@ -968,7 +940,7 @@ async fn work_review_verdicts_and_late_followups_survive_completion_and_reload()
 
 #[tokio::test]
 async fn resumed_passing_work_settles_only_its_automatic_revision_requests() {
-    use crate::store::{ReviewStatus, jsonl::JsonlStore};
+    use crate::store::ReviewStatus;
     let mut test = TestBot::new("superseded-work-review").await;
     let a = &mut test.bot;
     a.state.energy.asleep = true;
@@ -978,8 +950,8 @@ async fn resumed_passing_work_settles_only_its_automatic_revision_requests() {
     for (task_id, verdict) in [(&task.id[..], judge::Verdict::Revise), (&task.id, judge::Verdict::Defer),
         (&task.id, judge::Verdict::Owner), ("another-task", judge::Verdict::Revise)] {
         let j = judge::Judgement { verdict, reasons: "original reason".into(), fixes: "original fixes".into(), urgent: false };
-        old.push(judge::file(a.store.as_ref(), ReviewCategory::Verify, &task.title, "previous work", &j, true,
-            json!({"task_id":task_id,"work_round":1})).unwrap());
+        old.push(judge::file(&a.store, ReviewCategory::Verify, &task.title, "previous work", &j, true,
+            json!({"task_id":task_id,"work_round":1})).await.unwrap());
     }
     a.models = Arc::new(Models::stub(a.store.clone(), vec!["plan\n澄清：无".into(), "revised report".into(),
         r#"{"verdict":"pass","reasons":"addressed"}"#.into()]));
@@ -990,8 +962,8 @@ async fn resumed_passing_work_settles_only_its_automatic_revision_requests() {
     let Some(Event::JobDone(outcome)) = rx.recv().await else { panic!("missing resumed completion") };
     a.on_job_done(outcome).await.unwrap();
     assert_eq!(Board::load(&a.cfg.work_dir()).unwrap().get(&task.id).unwrap().status, TaskStatus::Done);
-    let store = JsonlStore::open(&a.cfg.data_dir()).unwrap();
-    let reviews = store.reviews().unwrap();
+    let store = a.store.clone();
+    let reviews = store.reviews().await.unwrap();
     let passed = reviews.last().unwrap();
     assert!(passed.verdict.starts_with("通过"));
     for (i, expected) in old.iter().enumerate() {
@@ -1004,7 +976,7 @@ async fn resumed_passing_work_settles_only_its_automatic_revision_requests() {
             assert_eq!(saved.status, ReviewStatus::Open);
         }
     }
-    let digest = judge::digest(&store).unwrap().unwrap();
+    let digest = judge::digest(&store).await.unwrap().unwrap();
     assert!(!digest.contains(&format!("#{} [", old[0].id)) && !digest.contains(&format!("#{} [", old[1].id)));
     assert!(digest.contains(&format!("#{} [", old[2].id)) && digest.contains(&format!("#{} [", old[3].id)));
 }
@@ -1031,8 +1003,8 @@ async fn watchdog_tick_stalls_waits_for_cancellation_and_delivers_once() {
     a.watchdog().await.unwrap();
     assert!(!a.control.jobs().is_empty());
     tokio::time::advance(Duration::from_secs(1)).await;
-    a.control.set_frozen(a.store.as_ref(), true).unwrap();
-    a.store.kv_set("owner_last_chat", json!({"platform": "telegram", "chat_id": "42"})).unwrap();
+    a.control.set_frozen(&a.store, true).await.unwrap();
+    a.store.kv_set("owner_last_chat", json!({"platform": "telegram", "chat_id": "42"})).await.unwrap();
     a.test_chat = Some(TestChat::new(&[], &[Outcome::Sent]));
     a.watchdog().await.unwrap();
     wake(a).await;
@@ -1047,7 +1019,7 @@ async fn watchdog_tick_stalls_waits_for_cancellation_and_delivers_once() {
     wake(a).await;
     assert!(a.test_chat.as_ref().unwrap().turns.is_empty());
     assert_eq!(a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().len(), 1);
-    let reviews = a.store.reviews().unwrap();
+    let reviews = a.store.reviews().await.unwrap();
     assert_eq!(reviews.len(), 1);
     assert!(reviews[0].urgent && reviews[0].pushed && !reviews[0].notified);
     assert_eq!(std::fs::read_to_string(log_path).unwrap(), log);
@@ -1072,7 +1044,7 @@ async fn watchdog_growth_and_followups_reset_stall_but_not_total_budget() {
     }
     assert!(a.control.jobs().is_empty());
     assert!(a.deliveries.is_empty());
-    let reviews = a.store.reviews().unwrap();
+    let reviews = a.store.reviews().await.unwrap();
     assert_eq!(reviews.len(), 1);
     assert!(reviews[0].urgent && !reviews[0].pushed);
     let saved = a.board().get(&task.id).unwrap().clone();
@@ -1100,7 +1072,7 @@ async fn watchdog_stalls_after_last_growth_and_with_missing_log() {
         }
         assert!(a.control.jobs().is_empty());
         assert!(a.deliveries.is_empty());
-        let reviews = a.store.reviews().unwrap();
+        let reviews = a.store.reviews().await.unwrap();
         assert_eq!(reviews.len(), 1);
         assert!(reviews[0].urgent && !reviews[0].pushed);
         assert!(reviews[0].detail.contains("没有增长"));
@@ -1192,11 +1164,11 @@ async fn wake(a: &mut Bot) {
 async fn urgent_relay_pushes_immediately_while_frozen_and_only_once() {
     let mut test = TestBot::new("urgent-relay").await;
     let a = &mut test.bot;
-    a.control.set_frozen(a.store.as_ref(), true).unwrap();
-    a.store.kv_set("owner_last_chat", json!({"platform":"telegram", "chat_id":"42"})).unwrap();
+    a.control.set_frozen(&a.store, true).await.unwrap();
+    a.store.kv_set("owner_last_chat", json!({"platform":"telegram", "chat_id":"42"})).await.unwrap();
     a.test_chat = Some(TestChat::new(&["<转告主人>今天 18 点前完成报告</转告主人>收到。"], &[Outcome::Sent, Outcome::Sent]));
     a.handle(WorkItem::Messages(vec![private_message("7", "请转告主人：今天 18 点前完成报告")])).await;
-    let items = a.store.reviews().unwrap();
+    let items = a.store.reviews().await.unwrap();
     assert_eq!(items.len(), 1);
     assert!(items[0].urgent && items[0].pushed && !items[0].notified);
     a.push_urgent().await.unwrap();
@@ -1204,36 +1176,36 @@ async fn urgent_relay_pushes_immediately_while_frozen_and_only_once() {
     assert_eq!(sent.len(), 2); // One owner alert, one reply to the sender; no tick needed.
     assert!(sent[0].contains("有件急事") && sent[0].contains("#1"));
     assert_eq!(sent[1], "收到。");
-    assert!(judge::digest(a.store.as_ref()).unwrap().unwrap().contains("已单独推送"));
-    a.relay_request("telegram:7", "下周截止").unwrap();
-    assert!(!a.store.reviews().unwrap()[1].urgent);
+    assert!(judge::digest(&a.store).await.unwrap().unwrap().contains("已单独推送"));
+    a.relay_request("telegram:7", "下周截止").await.unwrap();
+    assert!(!a.store.reviews().await.unwrap()[1].urgent);
 }
 
 #[tokio::test]
 async fn urgent_alerts_wait_for_owner_route_and_wake_and_do_not_retry_failed_sends() {
     let mut test = TestBot::new("urgent-wake").await;
     let a = &mut test.bot;
-    a.relay_request("telegram:7", "deadline today").unwrap();
+    a.relay_request("telegram:7", "deadline today").await.unwrap();
     a.push_urgent().await.unwrap(); // No route: do not claim the item.
-    a.store.kv_set("owner_last_chat", json!({"platform":"telegram", "chat_id":"42"})).unwrap();
-    a.control.set_frozen(a.store.as_ref(), true).unwrap();
+    a.store.kv_set("owner_last_chat", json!({"platform":"telegram", "chat_id":"42"})).await.unwrap();
+    a.control.set_frozen(&a.store, true).await.unwrap();
     a.state.energy.asleep = true;
     a.test_chat = Some(TestChat::new(&[], &[Outcome::Sent, Outcome::Unknown]));
     a.push_urgent().await.unwrap();
-    assert!(!a.store.reviews().unwrap()[0].pushed);
+    assert!(!a.store.reviews().await.unwrap()[0].pushed);
     assert!(a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().is_empty());
     wake(a).await;
-    assert!(a.store.reviews().unwrap()[0].pushed);
+    assert!(a.store.reviews().await.unwrap()[0].pushed);
     wake(a).await;
-    a.relay_request("telegram:7", "今天截止的另一件事").unwrap();
+    a.relay_request("telegram:7", "今天截止的另一件事").await.unwrap();
     a.push_urgent().await.unwrap(); // Unknown result must not be retried.
     a.push_urgent().await.unwrap();
-    let reopened = crate::store::jsonl::JsonlStore::open(&a.cfg.data_dir()).unwrap();
-    assert!(judge::claim_urgent(&reopened, false).unwrap().is_none());
-    let items = reopened.reviews().unwrap();
+    let reopened = a.store.clone();
+    assert!(judge::claim_urgent(&reopened, false).await.unwrap().is_none());
+    let items = reopened.reviews().await.unwrap();
     assert!(items[0].pushed && !items[1].pushed);
     assert_eq!(a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().len(), 2);
-    let digest = judge::digest(&reopened).unwrap().unwrap();
+    let digest = judge::digest(&reopened).await.unwrap().unwrap();
     assert!(digest.contains("#1") && digest.contains("#2"));
     assert_eq!(digest.matches("已单独推送").count(), 1);
 }
@@ -1246,7 +1218,7 @@ async fn replied_conversations_appraise_once_per_tick_and_skip_read_only_groups(
         r#"{"dp":0.03,"da":0.02,"dd":-0.01,"why":"friendly conversation"}"#.into(),
     ]));
     a.test_chat = Some(TestChat::new(&["hello", "hi", "[沉默]", "failed"], &[Outcome::Sent, Outcome::Sent, Outcome::Failed]));
-    a.control.set_frozen(a.store.as_ref(), true).unwrap();
+    a.control.set_frozen(&a.store, true).await.unwrap();
     let before = (a.state.mood.pleasure, a.state.mood.arousal, a.state.mood.dominance);
     a.on_messages(vec![private_message("7", "private input")]).await.unwrap();
     a.on_messages(group_messages(&["allowed input"], true)).await.unwrap();
@@ -1284,15 +1256,15 @@ async fn overnight_list_survives_restart_in_first_message_order() {
     let mut bot = private_message("9", "bot overnight");
     bot.sender_is_bot = true;
     a.prepare_messages(vec![bot]).await;
-    a.state.save(&a.cfg.data_dir()).unwrap();
+    a.state.save(&a.store).await.unwrap();
     let cfg = a.cfg.clone();
-    let store = Arc::new(crate::store::jsonl::JsonlStore::open(&cfg.data_dir()).unwrap());
+    let store = a.store.clone();
     let models = Arc::new(Models::new(&cfg, store.clone()).await.unwrap());
     let (tx, _) = mpsc::channel(16);
-    test.bot = Bot::new_with_default_control(cfg, store, models, Outlets::default(), tx).unwrap();
+    test.bot = Bot::new_with_default_control(cfg, store, models, Outlets::default(), tx).await.unwrap();
     let a = &mut test.bot;
     assert!(a.state.energy.asleep);
-    let chats = a.overnight_chats().unwrap();
+    let chats = a.overnight_chats().await.unwrap();
     assert_eq!(chats.iter().map(|c| c.chat_id.as_str()).collect::<Vec<_>>(), ["8", "7", "9"]);
     assert!(chats[2].is_agent);
     a.test_chat = Some(TestChat::new(&["[沉默]", "[不发]", "[沉默]"], &[]));
@@ -1301,7 +1273,7 @@ async fn overnight_list_survives_restart_in_first_message_order() {
     assert_eq!(calls.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["telegram:8", "telegram:7", "telegram:9"]);
     assert_eq!(calls[0].1.matches("person-8：overnight").count(), 2);
     assert!(calls[2].2.contains("bot / agent"));
-    assert!(a.overnight_chats().unwrap().is_empty());
+    assert!(a.overnight_chats().await.unwrap().is_empty());
     a.on_tick().await.unwrap(); // No second catch-up on an ordinary awake tick.
     assert_eq!(a.test_chat.as_ref().unwrap().turns.len(), 3);
 }
@@ -1312,22 +1284,22 @@ async fn overnight_wake_selects_unanswered_chat_messages_with_original_privacy()
     let a = &mut test.bot;
     Arc::make_mut(&mut a.cfg).runtime.session.recap_messages = 2;
     for (text, outgoing) in [("old question", false), ("last answer", true), ("unanswered before sleep", false)] {
-        a.store.append_message(&private_record("7", "7", text, outgoing)).unwrap();
+        a.store.append_message(&private_record("7", "7", text, outgoing)).await.unwrap();
     }
     a.state.energy.asleep = true;
     for i in 0..12 {
         a.prepare_messages(vec![private_message("7", &format!("night-{i}"))]).await;
     }
     // Same namespace, different send target; neither its text nor its outgoing cuts off chat 7.
-    a.store.append_message(&private_record("7", "other-chat", "other outgoing", true)).unwrap();
-    a.store.append_message(&private_record("7", "other-chat", "other incoming", false)).unwrap();
+    a.store.append_message(&private_record("7", "other-chat", "other outgoing", true)).await.unwrap();
+    a.store.append_message(&private_record("7", "other-chat", "other incoming", false)).await.unwrap();
     let mut restricted = private_record("7", "7", "restricted secret", false);
     restricted.scope = Scope::SelfOnly;
-    a.store.append_message(&restricted).unwrap();
+    a.store.append_message(&restricted).await.unwrap();
     a.prepare_messages(vec![private_message("8", "other person secret")]).await;
     // A newer daytime answer leaves no messages to catch up on; skip without completing a turn.
     a.prepare_messages(vec![private_message("9", "already answered")]).await;
-    a.store.append_message(&private_record("9", "9", "daytime answer", true)).unwrap();
+    a.store.append_message(&private_record("9", "9", "daytime answer", true)).await.unwrap();
     a.state.last_proactive = Some(Utc::now());
     a.test_chat = Some(TestChat::new(&["morning answer", "[沉默]"], &[Outcome::Sent]));
     wake(a).await;
@@ -1342,10 +1314,10 @@ async fn overnight_wake_selects_unanswered_chat_messages_with_original_privacy()
         assert!(!tail.contains(excluded), "{excluded}");
     }
     assert!(!frame.contains("night-0") && !frame.contains("restricted secret"));
-    let history = a.store.recent_in_ns(&Namespace::Person("telegram:7".into()), 1).unwrap();
+    let history = a.store.recent_in_ns(&Namespace::Person("telegram:7".into()), 1).await.unwrap();
     assert!(history[0].outgoing);
     assert_eq!(history[0].scope, Scope::Persons { ids: vec!["telegram:7".into()] });
-    let remaining = a.overnight_chats().unwrap();
+    let remaining = a.overnight_chats().await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].chat_id, "9");
 }
@@ -1356,20 +1328,20 @@ async fn overnight_frozen_and_disabled_private_chats_keep_the_list() {
     let a = &mut test.bot;
     a.state.energy.asleep = true;
     a.prepare_messages(vec![private_message("7", "pending")]).await;
-    let saved = a.store.kv_get(OVERNIGHT_CHATS).unwrap();
+    let saved = a.store.kv_get(OVERNIGHT_CHATS).await.unwrap();
     a.test_chat = Some(TestChat::new(&["[沉默]"], &[]));
-    a.control.set_frozen(a.store.as_ref(), true).unwrap();
+    a.control.set_frozen(&a.store, true).await.unwrap();
     wake(a).await;
-    assert_eq!(a.store.kv_get(OVERNIGHT_CHATS).unwrap(), saved);
+    assert_eq!(a.store.kv_get(OVERNIGHT_CHATS).await.unwrap(), saved);
     assert!(a.test_chat.as_ref().unwrap().turns.is_empty());
-    a.control.set_frozen(a.store.as_ref(), false).unwrap();
+    a.control.set_frozen(&a.store, false).await.unwrap();
     Arc::make_mut(&mut a.cfg).social.private_from_others = false;
     wake(a).await;
-    assert_eq!(a.store.kv_get(OVERNIGHT_CHATS).unwrap(), saved);
+    assert_eq!(a.store.kv_get(OVERNIGHT_CHATS).await.unwrap(), saved);
     assert!(a.test_chat.as_ref().unwrap().turns.is_empty());
     Arc::make_mut(&mut a.cfg).social.private_from_others = true;
     wake(a).await;
-    assert!(a.overnight_chats().unwrap().is_empty());
+    assert!(a.overnight_chats().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1391,12 +1363,12 @@ async fn overnight_respects_human_and_agent_caps_and_current_owner_identity() {
     a.test_chat = Some(TestChat::new(&[], &[]));
     wake(a).await;
     assert!(a.test_chat.as_ref().unwrap().turns.is_empty());
-    assert_eq!(a.overnight_chats().unwrap().len(), 4);
+    assert_eq!(a.overnight_chats().await.unwrap().len(), 4);
     a.floor = Floor::default();
     a.test_chat = Some(TestChat::new(&["[不发]"], &[]));
     wake(a).await;
     assert_eq!(a.test_chat.as_ref().unwrap().turns[0].0, "telegram:7");
-    assert_eq!(a.overnight_chats().unwrap().len(), 3);
+    assert_eq!(a.overnight_chats().await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -1412,18 +1384,18 @@ async fn overnight_clears_only_completed_turns_and_retries_failures_next_wake() 
     a.test_chat = Some(chat);
     wake(a).await;
     assert_eq!(a.test_chat.as_ref().unwrap().turns.len(), 5);
-    assert_eq!(a.overnight_chats().unwrap().iter().map(|c| c.chat_id.as_str()).collect::<Vec<_>>(), ["6", "7", "8"]);
+    assert_eq!(a.overnight_chats().await.unwrap().iter().map(|c| c.chat_id.as_str()).collect::<Vec<_>>(), ["6", "7", "8"]);
     for sender in ["6", "7", "8", "9"] {
-        let history = a.store.recent_in_ns(&Namespace::Person(format!("telegram:{sender}")), 10).unwrap();
+        let history = a.store.recent_in_ns(&Namespace::Person(format!("telegram:{sender}")), 10).await.unwrap();
         assert!(history.iter().all(|m| !m.outgoing));
     }
     a.test_chat = Some(TestChat::new(&["[不发]", "retry sent", "[沉默]"], &[Outcome::Sent]));
     wake(a).await;
     assert_eq!(a.test_chat.as_ref().unwrap().turns.len(), 3);
     assert!(a.test_chat.as_ref().unwrap().turns.iter().all(|c| c.1.contains("pending question")));
-    assert!(a.overnight_chats().unwrap().is_empty());
-    let reopened = crate::store::jsonl::JsonlStore::open(&a.cfg.data_dir()).unwrap();
-    assert_eq!(reopened.kv_get(OVERNIGHT_CHATS).unwrap(), Some(json!([])));
+    assert!(a.overnight_chats().await.unwrap().is_empty());
+    let reopened = a.store.clone();
+    assert_eq!(reopened.kv_get(OVERNIGHT_CHATS).await.unwrap(), Some(json!([])));
 }
 
 #[tokio::test]
@@ -1438,16 +1410,17 @@ async fn reflection_switch_parks_work_and_wakes_the_mind_without_failure() {
         task_id: task.id.clone(), title: task.title, ok: true,
         clarification: None, paused: Some(reason.into()), summary: reason.into(), verdict: None,
     }).await.unwrap();
-    let board = a.board();
-    let saved = board.get(&task.id).unwrap();
-    assert_eq!(saved.status, TaskStatus::Waiting);
-    assert_eq!(saved.note, reason);
-    drop(board);
+    {
+        let board = a.board();
+        let saved = board.get(&task.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Waiting);
+        assert_eq!(saved.note, reason);
+    }
     assert!(a.wake_decide);
-    let audits = a.store.audits().unwrap();
+    let audits = a.store.audits().await.unwrap();
     let result = audits.iter().find(|record| record.tool == "delegate_result").unwrap();
     assert_eq!(result.outcome, Outcome::Sent);
-    assert!(a.store.reviews().unwrap().is_empty());
+    assert!(a.store.reviews().await.unwrap().is_empty());
     assert_eq!(a.deliveries[0].paused.as_deref(), Some(reason));
 }
 
@@ -1463,13 +1436,14 @@ async fn clarification_completion_waits_without_failure_or_judge_review() {
         task_id: task.id.clone(), title: task.title, ok: true,
         clarification: Some(questions.into()), paused: None, summary: questions.into(), verdict: None,
     }).await.unwrap();
-    let board = a.board();
-    let saved = board.get(&task.id).unwrap();
-    assert_eq!(saved.status, TaskStatus::Waiting);
-    assert_eq!(saved.note, "等待主人澄清");
-    drop(board);
-    assert!(a.store.reviews().unwrap().is_empty());
-    let audits = a.store.audits().unwrap();
+    {
+        let board = a.board();
+        let saved = board.get(&task.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Waiting);
+        assert_eq!(saved.note, "等待主人澄清");
+    }
+    assert!(a.store.reviews().await.unwrap().is_empty());
+    let audits = a.store.audits().await.unwrap();
     let result = audits.iter().find(|record| record.tool == "delegate_result").unwrap();
     assert_eq!(result.outcome, Outcome::Sent);
     assert_eq!(a.deliveries.len(), 1);
@@ -1500,13 +1474,13 @@ async fn three_queued_owner_messages_prepare_one_turn_and_keep_individual_record
     assert_eq!(batch.lines.join("\n"), "主人：先查方案 A\n主人：再对比方案 B\n主人：给我结论");
     let ctx = batch.ctx.unwrap();
     assert_eq!(ctx.thread_ref().message_id.as_deref(), Some("3"));
-    let saved = a.store.recent_in_ns(&ctx.ns, 10).unwrap();
+    let saved = a.store.recent_in_ns(&ctx.ns, 10).await.unwrap();
     assert_eq!(saved.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["先查方案 A", "再对比方案 B", "给我结论"]);
     assert!(saved.iter().all(|m| !m.outgoing));
     assert!(a.people.get("owner").is_some());
     assert!(a.state.last_owner_contact.is_some());
-    assert_eq!(a.store.kv_get("owner_last_chat").unwrap().unwrap()["chat_id"], "42");
-    let (frame, _) = a.frame(&ctx, batch.current, "").unwrap();
+    assert_eq!(a.store.kv_get("owner_last_chat").await.unwrap().unwrap()["chat_id"], "42");
+    let (frame, _) = a.frame(&ctx, batch.current, "").await.unwrap();
     assert!(!frame.contains("先查方案 A") && !frame.contains("给我结论"));
     let task = a.board().add("研究", TaskKind::Research, "owner", TaskStatus::Inbox, Some(ctx.thread_ref())).unwrap();
     let mut intent = parse_intent(&format!("<补充 任务=\"{}\">补充条件</补充>", task.id));
@@ -1545,9 +1519,9 @@ async fn notices_respect_read_only_groups_and_do_not_advance_floor_or_bot_sample
         let batch = a.prepare_messages(vec![env.clone()]).await;
         assert!(batch.ctx.is_none() && !batch.speak && !batch.consider);
     }
-    assert_eq!(a.store.messages_after(&Namespace::Group("qq:34".into()), DateTime::<Utc>::MIN_UTC).unwrap().len(), 2);
+    assert_eq!(a.store.messages_after(&Namespace::Group("qq:34".into()), DateTime::<Utc>::MIN_UTC).await.unwrap().len(), 2);
     let sample_key = format!("qq_bot_samples:{}", env.sender_key());
-    let samples = a.store.kv_get(&sample_key).unwrap();
+    let samples = a.store.kv_get(&sample_key).await.unwrap();
     assert!(samples.is_some());
     Arc::make_mut(&mut a.cfg).social.groups.push("qq:34".into());
     env.notice = true;
@@ -1558,7 +1532,7 @@ async fn notices_respect_read_only_groups_and_do_not_advance_floor_or_bot_sample
         let batch = a.prepare_messages(vec![env.clone()]).await;
         assert!(!batch.speak && !batch.consider);
     }
-    assert_eq!(a.store.kv_get(&sample_key).unwrap(), samples);
+    assert_eq!(a.store.kv_get(&sample_key).await.unwrap(), samples);
     env.notice = false;
     for expected in [false, false, true] {
         assert_eq!(a.prepare_messages(vec![env.clone()]).await.consider, expected);
@@ -1600,9 +1574,11 @@ async fn readable_sources_are_limited_to_the_addressed_authors_input() {
     let turn = &a.test_chat.as_ref().unwrap().turns[0].1;
     assert!(turn.contains("addressed.zzz") && turn.contains("未读到内容"), "{turn}");
     assert!(!turn.contains("ambient.zzz"));
-    let sent = a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap();
-    assert!(sent[0].contains("addressed.zzz") && sent[0].contains("未读到内容") && !sent[0].contains("水果"));
-    assert!(!a.store.recent_in_ns(&Namespace::Group("telegram:-7".into()), 8).unwrap()
+    {
+        let sent = a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap();
+        assert!(sent[0].contains("addressed.zzz") && sent[0].contains("未读到内容") && !sent[0].contains("水果"));
+    }
+    assert!(!a.store.recent_in_ns(&Namespace::Group("telegram:-7".into()), 8).await.unwrap()
         .iter().any(|m| !m.outgoing && m.text.contains("addressed.zzz")));
 }
 
@@ -1693,7 +1669,7 @@ async fn bounded_source_reaches_same_chat_followup_and_matching_task_only() -> R
     let mut broken = private_message("42", "模拟本轮生成失败");
     broken.attachments.push(Attachment {kind: AttachmentKind::File, url:None, file_id:None, name:Some("broken.xyz".into()), size:None, quoted_from:None, media_id:None});
     a.on_messages(vec![broken]).await?;
-    assert!(a.store.recent_in_ns(&ctx.ns, 1)?.last().is_some_and(|m| m.outgoing && m.text.contains("broken.xyz") && m.text.contains("未读到内容")));
+    assert!(a.store.recent_in_ns(&ctx.ns, 1).await?.last().is_some_and(|m| m.outgoing && m.text.contains("broken.xyz") && m.text.contains("未读到内容")));
     a.speaker.say(&a.models, &ctx.key, &policy, SayTurn { now: Utc::now(), text: "继续".into(), images: vec![], ephemeral: vec![] }, || Ok(String::new())).await?;
     let calls = prompts.lock().unwrap();
     let turns = calls.last().unwrap()["messages"].as_array().unwrap();
@@ -1721,7 +1697,7 @@ async fn images_wait_until_he_is_addressed_and_unseen_ones_are_stated() {
     assert_eq!(a.test_chat.as_ref().unwrap().images, [0]);
     assert!(!a.pending_media.contains_key("telegram:-7"));
     // The note lives in the turn only; stored messages keep the placeholder.
-    let stored = a.store.recent_in_ns(&Namespace::Group("telegram:-7".into()), 10).unwrap();
+    let stored = a.store.recent_in_ns(&Namespace::Group("telegram:-7".into()), 10).await.unwrap();
     assert!(stored.iter().all(|m| !m.text.contains("这些图片你没看到")));
 }
 
@@ -1746,7 +1722,7 @@ async fn images_queue_on_arrival_and_collect_only_from_groups_and_the_owner() {
 
     // Someone else's private chat: described for that chat, never collected.
     let private = Envelope { is_group: false, mentions_me: true, chat_id: "55".into(), sender_id: "55".into(), ..with_image(group_messages(&["[图片]"], false).remove(0)) };
-    let who = a.runtime_identity(&private).unwrap();
+    let who = a.runtime_identity(&private).await.unwrap();
     assert!(!who.is_owner);
     let ctx = ChatCtx {
         key: "telegram:55".into(), platform: "telegram", chat_id: "55".into(), message_id: None,
@@ -1817,7 +1793,7 @@ async fn an_addressed_turn_may_answer_with_one_expression() {
     );
     chat.offers = vec![offer("ab12cd34")];
     a.test_chat = Some(chat);
-    a.store.save_media(&offer("ab12cd34").record).unwrap();
+    a.store.save_media(&offer("ab12cd34").record).await.unwrap();
     let mut png = std::io::Cursor::new(Vec::new());
     image::DynamicImage::new_rgb8(4, 4).write_to(&mut png, image::ImageFormat::Png).unwrap();
     let dir = crate::mind::media::media_dir(&a.cfg);
@@ -1840,11 +1816,11 @@ async fn an_addressed_turn_may_answer_with_one_expression() {
     // A reaction that fails falls back to the emoji as text; an id he was not offered sends
     // nothing, and neither does an id in a draft, where nothing was offered.
     assert_eq!(*chat.sent_texts.lock().unwrap(), ["sticker:ab12cd34", "react:128077", "react:128077", "👍", "👍"]);
-    let record = a.store.media("ab12cd34rest").unwrap().unwrap();
+    let record = a.store.media("ab12cd34rest").await.unwrap().unwrap();
     assert_eq!(record.sent_count, 1);
     assert!(record.last_sent.is_some());
     let ns = Namespace::Group("telegram:-7".into());
-    let mine: Vec<String> = a.store.recent_in_ns(&ns, 20).unwrap().into_iter().filter(|m| m.outgoing).map(|m| m.text).collect();
+    let mine: Vec<String> = a.store.recent_in_ns(&ns, 20).await.unwrap().into_iter().filter(|m| m.outgoing).map(|m| m.text).collect();
     assert_eq!(mine, ["[表情包：猫瞪着屏幕]", "[贴表情 👍]", "👍", "👍"]);
 }
 
@@ -1978,7 +1954,7 @@ async fn read_only_group_batches_store_people_and_scope_without_replies_or_model
     a.on_messages(group_messages(&["@bot reply now"], true)).await.unwrap();
     a.extract_due().await.unwrap();
     let ns = Namespace::Group("telegram:-7".into());
-    let msgs = a.store.messages_after(&ns, DateTime::<Utc>::MIN_UTC).unwrap();
+    let msgs = a.store.messages_after(&ns, DateTime::<Utc>::MIN_UTC).await.unwrap();
     assert_eq!(msgs.len(), 7);
     for m in &msgs {
         assert_eq!(m.ns, ns);
@@ -2006,32 +1982,34 @@ async fn ignored_groups_override_allowlist_without_storage_or_person_bookkeeping
     let a = &mut test.bot;
     Arc::make_mut(&mut a.cfg).social.ignored_groups.push("telegram:-7".into());
     a.models = Arc::new(Models::stub(a.store.clone(), vec![]));
-    let before = a.store.persons().unwrap().len();
+    let before = a.store.persons().await.unwrap().len();
     a.on_messages(group_messages(&["one", "two", "three"], true)).await.unwrap();
-    assert!(a.store.active_namespaces(DateTime::<Utc>::MIN_UTC).unwrap().is_empty());
-    assert_eq!(a.store.persons().unwrap().len(), before);
+    assert!(a.store.active_namespaces(DateTime::<Utc>::MIN_UTC).await.unwrap().is_empty());
+    assert_eq!(a.store.persons().await.unwrap().len(), before);
     assert_eq!(a.ignored_logged.len(), 1);
     assert!(a.speakers.is_empty() && a.unseen.is_empty());
     assert!(a.models.stub_prompts().is_empty());
 }
 
-fn reflection_messages(a: &Bot, id: &str, count: usize) -> Vec<MessageRecord> {
+async fn reflection_messages(a: &Bot, id: &str, count: usize) -> Vec<MessageRecord> {
     let ns: Namespace = id.parse().unwrap();
     let scope = match &ns {
         Namespace::Group(id) => Scope::Group { id: id.clone() },
         Namespace::Person(id) => Scope::Persons { ids: vec![id.clone()] },
         _ => unreachable!(),
     };
-    let start = Utc::now() - chrono::Duration::hours(1);
-    (0..count).map(|i| {
+    let start = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap() - chrono::Duration::hours(1);
+    let mut records = Vec::with_capacity(count);
+    for i in 0..count {
         let m = MessageRecord {
             ts: start + chrono::Duration::seconds(i as i64),
             ns: ns.clone(), scope: scope.clone(), sender: "owner".into(), text: format!("[{id}-message-{i}]"),
             ..private_record("owner", "42", "", false)
         };
-        a.store.append_message(&m).unwrap();
-        m
-    }).collect()
+        a.store.append_message(&m).await.unwrap();
+        records.push(m);
+    }
+    records
 }
 
 #[tokio::test]
@@ -2042,11 +2020,11 @@ async fn nightly_reflection_prioritizes_reply_chats_then_samples_read_only_activ
     cfg.runtime.mind_dir = test.dir.join("mind");
     cfg.social.ignored_groups = vec!["telegram:ignored".into()];
     cfg.social.read_only_reflect.max_messages_per_night = 3;
-    reflection_messages(a, "person/owner", 1);
-    reflection_messages(a, "group/telegram:-7", 1);
-    reflection_messages(a, "group/telegram:quiet", 2);
-    reflection_messages(a, "group/telegram:ignored", 20);
-    let busy = reflection_messages(a, "group/telegram:busy", 6);
+    reflection_messages(a, "person/owner", 1).await;
+    reflection_messages(a, "group/telegram:-7", 1).await;
+    reflection_messages(a, "group/telegram:quiet", 2).await;
+    reflection_messages(a, "group/telegram:ignored", 20).await;
+    let busy = reflection_messages(a, "group/telegram:busy", 6).await;
     let raw = json!({
         "episodes": [{"summary": "group event", "participants": ["owner"], "salience": 0.5}],
         "facts": [{"person": "owner", "text": "group fact"}]
@@ -2055,7 +2033,7 @@ async fn nightly_reflection_prioritizes_reply_chats_then_samples_read_only_activ
     let date = reflect::diary_day(Local::now());
     let after = Utc::now() - chrono::Duration::days(2);
     assert_eq!(a.extract_all(chrono::Duration::days(2)).await.unwrap(), 2);
-    reflect::read_only_nightly(&a.models, a.store.as_ref(), &mut a.people, &a.cfg.social, date, after).await.unwrap();
+    reflect::read_only_nightly(&a.models, &a.store, &mut a.people, &a.cfg.social, date, after).await.unwrap();
     let prompts = a.models.stub_prompts();
     assert_eq!(prompts.len(), 3);
     for (_, _, text) in &prompts[..2] {
@@ -2065,42 +2043,42 @@ async fn nightly_reflection_prioritizes_reply_chats_then_samples_read_only_activ
     for i in 0..6 {
         assert_eq!(text.contains(&format!("[group/telegram:busy-message-{i}]")), [0, 2, 5].contains(&i));
     }
-    assert_eq!(reflect::watermark(a.store.as_ref(), &busy[0].ns).unwrap(), busy[5].ts);
-    let episode = a.store.episodes().unwrap().pop().unwrap();
+    assert_eq!(reflect::watermark(&a.store, &busy[0].ns).await.unwrap(), busy[5].ts);
+    let episode = a.store.episodes().await.unwrap().pop().unwrap();
     assert_eq!((episode.ns, episode.scope), (busy[0].ns.clone(), busy[0].scope.clone()));
     let fact = &a.people.get("owner").unwrap().facts[0];
     assert_eq!((&fact.ns, &fact.scope), (&busy[0].ns, &busy[0].scope));
     // A repeated invocation cannot spend another quota; the next diary night can.
-    reflect::read_only_nightly(&a.models, a.store.as_ref(), &mut a.people, &a.cfg.social, date, after).await.unwrap();
+    reflect::read_only_nightly(&a.models, &a.store, &mut a.people, &a.cfg.social, date, after).await.unwrap();
     assert_eq!(a.models.stub_prompts().len(), 3);
-    reflect::read_only_nightly(&a.models, a.store.as_ref(), &mut a.people, &a.cfg.social, date.succ_opt().unwrap(), after).await.unwrap();
+    reflect::read_only_nightly(&a.models, &a.store, &mut a.people, &a.cfg.social, date.succ_opt().unwrap(), after).await.unwrap();
     assert!(a.models.stub_prompts()[3].2.contains("[group/telegram:quiet-message-0]"));
-    assert_eq!(reflect::watermark(a.store.as_ref(), &Namespace::Group("telegram:ignored".into())).unwrap(), DateTime::<Utc>::MIN_UTC);
+    assert_eq!(reflect::watermark(&a.store, &Namespace::Group("telegram:ignored".into())).await.unwrap(), DateTime::<Utc>::MIN_UTC);
 }
 
 #[tokio::test]
 async fn read_only_cost_budget_persists_after_failed_calls() {
     let mut test = TestBot::new("read-only-reflect-cost").await;
     let a = &mut test.bot;
-    reflection_messages(a, "group/telegram:a", 3);
-    reflection_messages(a, "group/telegram:b", 2);
-    reflection_messages(a, "group/telegram:c", 1);
+    reflection_messages(a, "group/telegram:a", 3).await;
+    reflection_messages(a, "group/telegram:b", 2).await;
+    reflection_messages(a, "group/telegram:c", 1).await;
     a.models = Arc::new(Models::stub(a.store.clone(), vec!["invalid JSON".into(),
         json!({"episodes": [{"summary": "group memory"}]}).to_string()]));
     a.models.stub_cost(0.05);
     let date = reflect::diary_day(Local::now());
     let after = Utc::now() - chrono::Duration::days(2);
-    reflect::read_only_nightly(&a.models, a.store.as_ref(), &mut a.people, &a.cfg.social, date, after).await.unwrap();
+    reflect::read_only_nightly(&a.models, &a.store, &mut a.people, &a.cfg.social, date, after).await.unwrap();
     assert_eq!(a.models.stub_prompts().len(), 2);
-    assert_eq!(a.store.spent_since(after).unwrap(), 0.10);
+    assert_eq!(a.store.spent_since(after).await.unwrap(), 0.10);
     assert!(a.models.stub_prompts()[0].2.contains("[group/telegram:a-message-0]"));
     assert!(a.models.stub_prompts()[1].2.contains("[group/telegram:b-message-0]"));
-    let episodes = a.store.episodes().unwrap();
+    let episodes = a.store.episodes().await.unwrap();
     assert_eq!(episodes.len(), 1);
     assert_eq!(episodes[0].summary, "group memory");
     assert_eq!(episodes[0].scope, Scope::Group { id: "telegram:b".into() });
     // Recover the ledger from storage; failed JSON still cost money, so no retry tonight.
-    reflect::read_only_nightly(&a.models, a.store.as_ref(), &mut a.people, &a.cfg.social, date, after).await.unwrap();
+    reflect::read_only_nightly(&a.models, &a.store, &mut a.people, &a.cfg.social, date, after).await.unwrap();
     assert_eq!(a.models.stub_prompts().len(), 2);
 }
 
@@ -2108,7 +2086,7 @@ async fn read_only_cost_budget_persists_after_failed_calls() {
 async fn read_only_zero_or_invalid_budgets_never_call_models() {
     let mut test = TestBot::new("read-only-reflect-zero").await;
     let a = &mut test.bot;
-    let msgs = reflection_messages(a, "group/telegram:quiet", 3);
+    let msgs = reflection_messages(a, "group/telegram:quiet", 3).await;
     a.models = Arc::new(Models::stub(a.store.clone(), vec![]));
     let date = reflect::diary_day(Local::now());
     let after = Utc::now() - chrono::Duration::days(2);
@@ -2116,10 +2094,10 @@ async fn read_only_zero_or_invalid_budgets_never_call_models() {
         let cfg = &mut Arc::make_mut(&mut a.cfg).social.read_only_reflect;
         cfg.max_messages_per_night = messages;
         cfg.max_cost_usd = cost;
-        reflect::read_only_nightly(&a.models, a.store.as_ref(), &mut a.people, &a.cfg.social, date, after).await.unwrap();
+        reflect::read_only_nightly(&a.models, &a.store, &mut a.people, &a.cfg.social, date, after).await.unwrap();
     }
     assert!(a.models.stub_prompts().is_empty());
-    assert_eq!(reflect::watermark(a.store.as_ref(), &msgs[0].ns).unwrap(), DateTime::<Utc>::MIN_UTC);
+    assert_eq!(reflect::watermark(&a.store, &msgs[0].ns).await.unwrap(), DateTime::<Utc>::MIN_UTC);
 }
 
 #[tokio::test]
@@ -2134,7 +2112,7 @@ async fn group_frame_reads_the_handwritten_card() {
     let path = dir.join("telegram_-7.md");
     let handwritten = "# 手写群卡\n\nOWNER_RULE: observer only.\n";
     std::fs::write(&path, handwritten).unwrap();
-    let (l2, _) = a.frame(&ctx, 0, "").unwrap();
+    let (l2, _) = a.frame(&ctx, 0, "").await.unwrap();
     assert!(l2.contains(handwritten.trim_end()));
     assert!(!a.speaker.l1().contains("OWNER_RULE"));
 }
@@ -2148,7 +2126,7 @@ async fn group_batch_observes_every_speaker_and_keeps_an_earlier_mention() {
     let ctx = batch.ctx.unwrap();
     assert_eq!(ctx.message_id.as_deref(), Some("2"));
     assert_eq!(unseen_texts(&a.unseen[&ctx.key]), ["member-0(100)：hello", "member-1(101)：context", "member-2(102)：question"]);
-    assert_eq!(a.store.recent_in_ns(&ctx.ns, 10).unwrap().len(), 3);
+    assert_eq!(a.store.recent_in_ns(&ctx.ns, 10).await.unwrap().len(), 3);
     assert_eq!(a.speakers[&ctx.key], ["telegram:100", "telegram:101", "telegram:102"]);
     for id in &a.speakers[&ctx.key] {
         assert!(a.people.get(id).is_some());
@@ -2174,7 +2152,7 @@ async fn calling_him_by_alias_addresses_him_like_a_mention() {
         json!({"term": "小庄", "kind": "alias"}),
         json!({"term": "Zhuang", "kind": "alias", "scope": "telegram:-7"}),
         json!({"term": "阿庄", "kind": "alias", "scope": "telegram:-9"}),
-    ]).unwrap();
+    ]).await.unwrap();
     assert!(a.prepare_messages(group_messages(&["小庄你怎么不说话了"], false)).await.speak);
     assert!(a.prepare_messages(group_messages(&["hey zhuang"], false)).await.speak);
     let quoted = a.prepare_messages(group_messages(&["[回复 某人: 小庄说的]我不同意"], false)).await;
@@ -2205,13 +2183,13 @@ async fn slang_reaches_the_turn_tail_and_floor_prompt_only_in_its_group() {
     let a = &mut test.bot;
     Arc::make_mut(&mut a.cfg).social.groups.push("telegram:-9".into());
     let here = a.group_ctx("telegram:-7").unwrap();
-    let frame_before = a.frame(&here, 1, "").unwrap().0;
+    let frame_before = a.frame(&here, 1, "").await.unwrap().0;
     a.store.insert_lexicon(&[
         json!({"term": "肉编器", "kind": "slang", "meaning": "手写汇编的人", "scope": "telegram:-7"}),
         json!({"term": "姐夫", "kind": "slang", "meaning": "群里大佬的戏称"}),
-    ]).unwrap();
-    a.lexicon.refresh(a.store.as_ref(), Utc::now());
-    assert_eq!(a.frame(&here, 1, "").unwrap().0, frame_before, "slang never changes L2");
+    ]).await.unwrap();
+    a.lexicon.refresh(&a.store, Utc::now()).await;
+    assert_eq!(a.frame(&here, 1, "").await.unwrap().0, frame_before, "slang never changes L2");
     a.test_chat = Some(TestChat::new(&["[沉默]", "[沉默]", "[沉默]", "[沉默]"], &[]));
     a.on_messages(group_messages(&["群里都是肉编器"], true)).await.unwrap();
     a.on_messages(group_messages(&["今天天气不错"], true)).await.unwrap();
@@ -2262,7 +2240,7 @@ async fn reply_caps_still_run_per_message_without_losing_batch_text() {
     let Event::Inbound(next) = inbound("42", "four", "4") else { unreachable!() };
     let next = a.prepare_messages(vec![next]).await;
     assert!(!next.speak);
-    assert_eq!(a.store.recent_in_ns(&next.ctx.unwrap().ns, 10).unwrap().len(), 4);
+    assert_eq!(a.store.recent_in_ns(&next.ctx.unwrap().ns, 10).await.unwrap().len(), 4);
 }
 
 fn owner_chat() -> ChatCtx {
@@ -2427,10 +2405,10 @@ async fn mention_resolution_is_unique_recent_group_only_and_capped() {
     assert!(targets(&i.pieces).is_empty());
     // Owner identity can differ from the platform id; read the stored QQ mapping.
     ctx.platform = "qq";
-    a.people.ensure(a.store.as_ref(), "linked-owner", "主人", Tier::Owner).unwrap();
+    a.people.ensure(&a.store, "linked-owner", "主人", Tier::Owner).await.unwrap();
     let mut person = a.people.get("linked-owner").unwrap().clone();
     person.platform_ids = vec!["telegram:42".into(), "qq:777".into()];
-    a.people.save(a.store.as_ref(), person).unwrap();
+    a.people.save(&a.store, person).await.unwrap();
     let mut i = parse_intent("<提及>主人</提及>");
     resolve_mentions(&mut i.pieces, &ctx, &["linked-owner".into()], &a.people, 103);
     assert_eq!(targets(&i.pieces), [777]);
@@ -2591,14 +2569,14 @@ async fn owner_fast_controls_stop_workers_before_the_actor_updates_the_board() -
     let mut group = private_message("42", "/freeze");
     group.is_group = true;
     for env in [private_message("7", "/freeze"), private_message("42", "/stop extra"), group] {
-        assert!(!try_handle_fast_control(&a.cfg, a.store.as_ref(), &a.outlets, &a.control, &tx, &env).await);
+        assert!(!try_handle_fast_control(&a.cfg, &a.store, &a.outlets, &a.control, &tx, &env).await);
     }
     assert!(replies.try_recv().is_err() && rx.try_recv().is_err());
 
     for (command, reason) in [("/stop", "主人让我停下"), ("/freeze", "冻结")] {
         let task = fake_job(a);
         let env = private_message("42", command);
-        assert!(try_handle_fast_control(&a.cfg, a.store.as_ref(), &a.outlets, &a.control, &tx, &env).await);
+        assert!(try_handle_fast_control(&a.cfg, &a.store, &a.outlets, &a.control, &tx, &env).await);
         assert!(a.control.jobs().is_empty());
         assert_eq!(a.board().get(&task.id).unwrap().status, TaskStatus::Active);
         assert_eq!(a.frozen(), command == "/freeze");
@@ -2607,7 +2585,7 @@ async fn owner_fast_controls_stop_workers_before_the_actor_updates_the_board() -
             assert_eq!(reply["text"], format!("停了：{}", task.id));
         } else {
             assert_eq!(reply["text"], OwnerState::Frozen.message());
-            assert_eq!(a.store.kv_get("frozen")?, Some(json!(true)));
+            assert_eq!(a.store.kv_get("frozen").await?, Some(json!(true)));
         }
         let event = rx.try_recv()?;
         assert!(matches!(event, Event::Control(_)));
@@ -2617,9 +2595,9 @@ async fn owner_fast_controls_stop_workers_before_the_actor_updates_the_board() -
         assert_eq!(saved.note, reason);
     }
     let env = private_message("42", "/unfreeze");
-    assert!(try_handle_fast_control(&a.cfg, a.store.as_ref(), &a.outlets, &a.control, &tx, &env).await);
+    assert!(try_handle_fast_control(&a.cfg, &a.store, &a.outlets, &a.control, &tx, &env).await);
     assert_eq!(replies.try_recv()?["text"], OwnerState::Unfrozen.message());
-    assert_eq!(a.store.kv_get("frozen")?, Some(json!(false)));
+    assert_eq!(a.store.kv_get("frozen").await?, Some(json!(false)));
     assert!(!a.frozen() && rx.try_recv().is_err());
     server.abort();
     Ok(())
@@ -2679,7 +2657,7 @@ async fn structured_output_escalates_once_after_bad_json_and_respects_spend_limi
     let policy = ProcessingPolicy::Any;
     let result: Value = models.ask_structured("format", &policy, "", "value", &schema).await?;
     assert_eq!(result, json!({"value": 9}));
-    let limit = SpendLimit { since: Utc::now(), max_usd: 1.0 };
+    let limit = SpendLimit::start(&a.store, 1.0).await?;
     assert!(models.ask_structured_with_limit::<Value>("format", &policy, "", "value", &schema, Some(limit)).await.is_err());
     let requests = requests.lock().unwrap();
     assert_eq!(requests.iter().map(|r| r["model"].as_str().unwrap()).collect::<Vec<_>>(), ["fast", "stronger", "fast"]);

@@ -1,10 +1,10 @@
 //! Fast variables: mood (PAD), energy and circadian sleep, drives (SDT needs). The heartbeat
 //! advances them; `tail()` shows them to the model in L4 only.
 //!
-//! Runtime state lives in `data/state/state.json` (gitignored), seeded from `mind/state/*.json`,
+//! Runtime state lives in the store, seeded from `mind/state/*.json`,
 //! so the tracked seed files never churn.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDate, NaiveTime, Utc};
@@ -14,6 +14,7 @@ use super::context::StateSnapshot;
 use super::models::{Models, extract_json};
 use crate::config::RoutineCfg;
 use crate::ns::ProcessingPolicy;
+use crate::store::Store;
 
 #[derive(Default)]
 pub struct ConversationAppraisals {
@@ -148,16 +149,17 @@ pub fn in_sleep_window(t: NaiveTime, r: &RoutineCfg) -> bool {
     }
 }
 
+pub(crate) const MIND_STATE_KEY: &str = "mind_state";
+
 impl MindState {
-    fn path(data_dir: &Path) -> PathBuf {
-        data_dir.join("state").join("state.json")
+    pub async fn load(store: &Store, mind_dir: &Path) -> Result<Self> {
+        if let Some(value) = store.kv_get(MIND_STATE_KEY).await? {
+            return serde_json::from_value(value).context("decoding mind_state from storage");
+        }
+        Self::load_seed(mind_dir)
     }
 
-    pub fn load(data_dir: &Path, mind_dir: &Path) -> Result<Self> {
-        let path = Self::path(data_dir);
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            return serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()));
-        }
+    fn load_seed(mind_dir: &Path) -> Result<Self> {
         let seed = |name: &str| -> Result<serde_json::Value> {
             let p = mind_dir.join("state").join(name);
             let text = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
@@ -176,13 +178,8 @@ impl MindState {
         })
     }
 
-    pub fn save(&self, data_dir: &Path) -> Result<()> {
-        let path = Self::path(data_dir);
-        std::fs::create_dir_all(path.parent().unwrap_or(data_dir))?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+    pub async fn save(&self, store: &Store) -> Result<()> {
+        store.kv_set(MIND_STATE_KEY, serde_json::to_value(self)?).await
     }
 
     pub fn snapshot(&self) -> StateSnapshot {
@@ -270,7 +267,7 @@ mod tests {
 
     fn state() -> MindState {
         let mind = Path::new(env!("CARGO_MANIFEST_DIR")).join("mind");
-        MindState::load(Path::new("/nonexistent-aglibot"), &mind).unwrap()
+        MindState::load_seed(&mind).unwrap()
     }
 
     #[test]
@@ -312,10 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn conversation_appraisal_batches_clamps_and_consumes_once() {
-        use std::sync::Arc;
-        use crate::store::jsonl::JsonlStore;
-        let dir = std::env::temp_dir().join(format!("agli-appraisal-{}", std::process::id()));
-        let store = Arc::new(JsonlStore::open(&dir).unwrap());
+        let store = Store::memory();
         let models = Models::stub(store, vec![r#"{"dp":4,"da":-3,"dd":0.05,"why":"conversation"}"#.into(), "invalid JSON".into()]);
         let mut queue = ConversationAppraisals::default();
         let mut s = state();
@@ -345,15 +339,11 @@ mod tests {
         assert_eq!(models.stub_prompts().len(), 2); // Invalid JSON is not retried.
         queue.apply(&models, &mut s).await;
         assert_eq!(models.stub_prompts().len(), 2);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
     async fn conversation_appraisal_preserves_provider_restrictions() {
-        use std::sync::Arc;
-        use crate::store::jsonl::JsonlStore;
-        let dir = std::env::temp_dir().join(format!("agli-appraisal-policy-{}", std::process::id()));
-        let models = Models::stub(Arc::new(JsonlStore::open(&dir).unwrap()), vec![
+        let models = Models::stub(Store::memory(), vec![
             r#"{"dp":0,"da":0,"dd":0,"why":"neutral"}"#.into(),
         ]);
         let mut queue = ConversationAppraisals::default();
@@ -367,6 +357,5 @@ mod tests {
         queue.record("second".into(), providers(&["b"]));
         queue.apply(&models, &mut s).await;
         assert_eq!(models.stub_prompts().len(), 1);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

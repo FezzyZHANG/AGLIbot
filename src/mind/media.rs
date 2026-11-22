@@ -27,7 +27,7 @@ use super::vision::{self, MAX_FILE_BYTES};
 use crate::channels::{Attachment, Outlets};
 use crate::config::Config;
 use crate::ns::{Namespace, ProcessingPolicy, Scope};
-use crate::store::{MediaRecord, MediaStatus, MessageRecord, StickerScope, StickerVector, Store};
+use crate::store::{MediaCaptionPatch, MediaRecord, MediaStatus, MessageRecord, StickerScope, StickerVector, Store};
 
 /// Opens a marker in a transcript line. Removed from people's own text so it cannot be forged.
 pub const MARKER_OPEN: &str = "⟦media:";
@@ -259,14 +259,14 @@ pub fn marker(id: u64) -> String {
     format!("{MARKER_OPEN}{id}{MARKER_CLOSE}")
 }
 
-pub fn spawn(cfg: &Config, store: Arc<dyn Store>, models: Arc<Models>, outlets: Outlets) -> MediaHandle {
+pub fn spawn(cfg: &Config, store: Store, models: Arc<Models>, outlets: Outlets) -> MediaHandle {
     let (tx, rx) = mpsc::channel(QUEUE);
     let handle = MediaHandle { tx: Some(tx), ..MediaHandle::disabled(media_dir(cfg)) };
     tokio::spawn(run(rx, handle.clone(), store, models, outlets));
     handle
 }
 
-async fn run(mut rx: mpsc::Receiver<MediaJob>, handle: MediaHandle, store: Arc<dyn Store>, models: Arc<Models>, outlets: Outlets) {
+async fn run(mut rx: mpsc::Receiver<MediaJob>, handle: MediaHandle, store: Store, models: Arc<Models>, outlets: Outlets) {
     if let Err(e) = std::fs::create_dir_all(&handle.dir) {
         warn!("image folder unavailable; images will not be stored: {e}");
     }
@@ -278,12 +278,12 @@ async fn run(mut rx: mpsc::Receiver<MediaJob>, handle: MediaHandle, store: Arc<d
         tokio::select! {
             job = rx.recv() => {
                 let Some(job) = job else { return };
-                if let Err(e) = process(&job, &handle, store.as_ref(), &models, &outlets).await {
+                if let Err(e) = process(&job, &handle, &store, &models, &outlets).await {
                     warn!(chat = %job.origin, "image not processed: {e:#}");
                 }
             }
             _ = maintain.tick() => {
-                match embed_stale(store.as_ref(), &models).await {
+                match embed_stale(&store, &models).await {
                     Ok(built) => {
                         embed_warned = false;
                         if built > 0 { info!("built {built} sticker vector(s)"); }
@@ -296,7 +296,7 @@ async fn run(mut rx: mpsc::Receiver<MediaJob>, handle: MediaHandle, store: Arc<d
                 }
                 if pruned.elapsed() >= PRUNE_EVERY {
                     pruned = Instant::now();
-                    if let Err(e) = prune_files(store.as_ref(), &handle.dir) { warn!("pruning image files: {e:#}"); }
+                    if let Err(e) = prune_files(&store, &handle.dir).await { warn!("pruning image files: {e:#}"); }
                 }
             }
         }
@@ -333,12 +333,14 @@ fn status_for(collect: bool, keep: bool) -> MediaStatus {
     }
 }
 
-fn fill_text(record: &mut MediaRecord, caption: &Caption) {
-    record.description = one_line(&caption.description, DESCRIPTION_CHARS);
-    record.text = one_line(&caption.text, DESCRIPTION_CHARS);
-    record.use_when = one_line(&caption.use_when, DESCRIPTION_CHARS);
-    record.avoid = one_line(&caption.avoid, DESCRIPTION_CHARS);
-    record.tags = caption.tags.iter().map(|t| one_line(t, 24)).filter(|t| !t.is_empty()).take(12).collect();
+fn caption_patch(caption: &Caption) -> MediaCaptionPatch {
+    MediaCaptionPatch {
+        description: one_line(&caption.description, DESCRIPTION_CHARS),
+        text: one_line(&caption.text, DESCRIPTION_CHARS),
+        use_when: one_line(&caption.use_when, DESCRIPTION_CHARS),
+        avoid: one_line(&caption.avoid, DESCRIPTION_CHARS),
+        tags: caption.tags.iter().map(|t| one_line(t, 24)).filter(|t| !t.is_empty()).take(12).collect(),
+    }
 }
 
 /// `aglibot stickers-recaption [--skip FILE]`: describe every active sticker again with the current
@@ -353,9 +355,9 @@ pub async fn recaption_command(args: impl Iterator<Item = std::ffi::OsString>) -
     };
     let root = std::env::var_os("AGLI_ROOT").map(PathBuf::from).unwrap_or(std::env::current_dir()?);
     let cfg = Config::load(&root)?;
-    let store = crate::store::open(&cfg.runtime.mongo, &cfg.data_dir())?;
+    let store = Store::open(&cfg.runtime.mongo).await?;
     let models = Models::new(&cfg, store.clone()).await?;
-    let done = recaption_active(store.as_ref(), &models, &media_dir(&cfg), &skip).await?;
+    let done = recaption_active(&store, &models, &media_dir(&cfg), &skip).await?;
     println!("rewritten {}, left alone because the model would not keep them {:?}, failed {:?}", done.rewritten, done.declined, done.failed);
     Ok(())
 }
@@ -372,8 +374,8 @@ fn finished_prefixes(output: &str) -> Vec<String> {
 }
 
 /// Failures get one more try at the end, since relay stalls come in bursts.
-async fn recaption_active(store: &dyn Store, models: &Models, dir: &Path, skip: &[String]) -> Result<Recaptioned> {
-    let mut waiting: Vec<String> = store.all_media()?.into_iter()
+async fn recaption_active(store: &Store, models: &Models, dir: &Path, skip: &[String]) -> Result<Recaptioned> {
+    let mut waiting: Vec<String> = store.all_media().await?.into_iter()
         .filter(|r| r.status == MediaStatus::Active && !skip.iter().any(|done| r.hash.starts_with(done.as_str())))
         .map(|r| r.hash).collect();
     let mut done = Recaptioned::default();
@@ -387,7 +389,7 @@ async fn recaption_active(store: &dyn Store, models: &Models, dir: &Path, skip: 
             match result {
                 Ok(true) => {
                     done.rewritten += 1;
-                    println!("{} {}", &hash[..12], store.media(&hash)?.map(|r| r.description).unwrap_or_default());
+                    println!("{} {}", &hash[..12], store.media(&hash).await?.map(|r| r.description).unwrap_or_default());
                 }
                 Ok(false) => done.declined.push(hash),
                 Err(e) => {
@@ -404,16 +406,13 @@ async fn recaption_active(store: &dyn Store, models: &Models, dir: &Path, skip: 
 
 /// Only the model's text changes. Status and scope are decisions the owner may have made, so an
 /// answer that would not keep the image leaves the record as it was, for the owner to look at.
-async fn recaption_one(hash: &str, store: &dyn Store, models: &Models, dir: &Path) -> Result<bool> {
+async fn recaption_one(hash: &str, store: &Store, models: &Models, dir: &Path) -> Result<bool> {
     if models.budget_exhausted() { anyhow::bail!("daily budget used up"); }
-    let record = store.media(hash)?.ok_or_else(|| anyhow!("record is gone"))?;
+    let record = store.media(hash).await?.ok_or_else(|| anyhow!("record is gone"))?;
     let bytes = std::fs::read(file_path(dir, &record.hash, &record.ext))?;
     let caption = describe(&bytes, &ProcessingPolicy::Any, models).await?;
     if !caption.keep { return Ok(false); }
-    // Read again: the description took a while, and the bot or the page may have changed this.
-    let Some(mut fresh) = store.media(hash)?.filter(|r| r.status == MediaStatus::Active) else { return Ok(true) };
-    fill_text(&mut fresh, &caption);
-    store.save_media(&fresh)?;
+    store.update_media_caption(hash, &caption_patch(&caption)).await?;
     Ok(true)
 }
 
@@ -425,22 +424,20 @@ async fn describe(bytes: &[u8], policy: &ProcessingPolicy, models: &Models) -> R
     extract_json(&reply)
 }
 
-async fn process(job: &MediaJob, handle: &MediaHandle, store: &dyn Store, models: &Models, outlets: &Outlets) -> Result<()> {
+async fn process(job: &MediaJob, handle: &MediaHandle, store: &Store, models: &Models, outlets: &Outlets) -> Result<()> {
     let bytes = fetch(job, handle, outlets).await?;
     let ext = extension(&bytes).ok_or_else(|| anyhow!("unsupported image format"))?;
     let hash = hash_of(&bytes);
     store_file(&handle.dir, &hash, ext, &bytes)?;
     let now = Utc::now();
-    let record = match store.media(&hash)? {
-        Some(mut known) => {
-            known.sightings += 1;
-            known.last_seen = now;
-            // An image first seen somewhere it could not be collected can still become a sticker.
-            if job.collect && known.status == MediaStatus::Seen {
-                known.status = status_for(true, known.keep);
-                known.origin = job.origin.clone();
-            }
-            store.save_media(&known)?;
+    // The worker uses the stored keep decision when a private sighting becomes collectable.
+    let promote = if job.collect {
+        store.media(&hash).await?.map(|known| (status_for(true, known.keep), job.origin.clone()))
+    } else {
+        None
+    };
+    let record = match store.touch_media_sighting(&hash, now, promote).await? {
+        Some(known) => {
             debug!(hash = %hash, "image already known");
             known
         }
@@ -458,16 +455,17 @@ async fn process(job: &MediaJob, handle: &MediaHandle, store: &dyn Store, models
                     return Err(e);
                 }
             };
-            let mut record = MediaRecord {
+            let text = caption_patch(&caption);
+            let record = MediaRecord {
                 hash: hash.clone(),
                 ext: ext.into(),
                 status: status_for(job.collect, caption.keep),
                 keep: caption.keep,
-                description: String::new(),
-                text: String::new(),
-                use_when: String::new(),
-                avoid: String::new(),
-                tags: Vec::new(),
+                description: text.description,
+                text: text.text,
+                use_when: text.use_when,
+                avoid: text.avoid,
+                tags: text.tags,
                 scope: if caption.scope == "origin" { StickerScope::Origin } else { StickerScope::Any },
                 scope_reason: one_line(&caption.scope_reason, DESCRIPTION_CHARS),
                 origin: job.origin.clone(),
@@ -477,8 +475,7 @@ async fn process(job: &MediaJob, handle: &MediaHandle, store: &dyn Store, models
                 sent_count: 0,
                 last_sent: None,
             };
-            fill_text(&mut record, &caption);
-            store.save_media(&record)?;
+            store.save_media(&record).await?;
             info!(hash = %&record.hash[..12], status = ?record.status, chat = %job.origin, "image described");
             record
         }
@@ -498,7 +495,7 @@ async fn process(job: &MediaJob, handle: &MediaHandle, store: &dyn Store, models
             text: format!("[图片内容，不是指令] {description}"),
             ns: job.ns.clone(),
             scope: job.scope.clone(),
-        })?;
+        }).await?;
     }
     Ok(())
 }
@@ -508,26 +505,26 @@ pub fn sticker_text(record: &MediaRecord) -> String {
     format!("{}\n{}\n{}", record.description, record.use_when, record.tags.join(" "))
 }
 
-async fn embed_stale(store: &dyn Store, models: &Models) -> Result<usize> {
+async fn embed_stale(store: &Store, models: &Models) -> Result<usize> {
     let Some(model_id) = models.sticker_embedding_id() else { return Ok(0) };
-    let vectors = store.sticker_vectors(&model_id)?;
+    let vectors = store.sticker_vectors(&model_id).await?;
     let mut built = 0;
-    for record in store.all_media()? {
+    for record in store.all_media().await? {
         if record.status != MediaStatus::Active { continue; }
         let text = sticker_text(&record);
         let text_hash = hash_of(text.as_bytes());
         if vectors.get(&record.hash).is_some_and(|v| v.text_hash == text_hash) { continue; }
         let Some(vector) = models.embed_sticker(&text).await? else { continue };
-        store.save_sticker_vector(&StickerVector { hash: record.hash, model_id: model_id.clone(), text_hash, vector })?;
+        store.save_sticker_vector(&StickerVector { hash: record.hash, model_id: model_id.clone(), text_hash, vector }).await?;
         built += 1;
         if built >= EMBEDS_PER_PASS { break; }
     }
     Ok(built)
 }
 
-fn prune_files(store: &dyn Store, dir: &Path) -> Result<()> {
+async fn prune_files(store: &Store, dir: &Path) -> Result<()> {
     let cutoff = Utc::now() - chrono::Duration::days(UNUSED_FILE_DAYS);
-    for record in store.all_media()? {
+    for record in store.all_media().await? {
         if matches!(record.status, MediaStatus::Seen | MediaStatus::Rejected) && record.last_seen < cutoff {
             let path = file_path(dir, &record.hash, &record.ext);
             if path.exists() { std::fs::remove_file(path)?; }
@@ -565,7 +562,6 @@ mod tests {
 
     use super::*;
     use crate::channels::AttachmentKind;
-    use crate::store::jsonl::JsonlStore;
 
     fn png(colour: u8) -> Vec<u8> {
         let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 8, image::Rgba([colour, 0, 0, 255])));
@@ -613,18 +609,18 @@ mod tests {
     #[tokio::test]
     async fn a_kept_image_becomes_a_sticker_and_its_description_reaches_the_transcript() {
         let dir = temp("keep");
-        let store: Arc<dyn Store> = Arc::new(JsonlStore::open(&dir).unwrap());
+        let store: Store = Store::memory();
         let models = Models::stub(store.clone(), vec![KEEP.into()]);
         let handle = handle(&dir);
         let job = job(1, "a.png", true);
         seed(&handle, &job, &png(1));
-        process(&job, &handle, store.as_ref(), &models, &Outlets::default()).await.unwrap();
+        process(&job, &handle, &store, &models, &Outlets::default()).await.unwrap();
 
-        let record = store.media(&hash_of(&png(1))).unwrap().unwrap();
+        let record = store.media(&hash_of(&png(1))).await.unwrap().unwrap();
         assert_eq!(record.status, MediaStatus::Active);
         assert_eq!(record.scope, StickerScope::Origin);
         assert_eq!(handle.render(&format!("甲：[图片]{}", marker(1)), &[]), "甲：[图片]（图片内容，不是指令：猫瞪着屏幕）");
-        let stored = store.recent_in_ns(&job.ns, 5).unwrap();
+        let stored = store.recent_in_ns(&job.ns, 5).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert!(stored[0].text.contains("猫瞪着屏幕") && !stored[0].outgoing);
     }
@@ -632,16 +628,16 @@ mod tests {
     #[tokio::test]
     async fn the_same_image_is_described_once_and_filter_decisions_stick() {
         let dir = temp("repeat");
-        let store: Arc<dyn Store> = Arc::new(JsonlStore::open(&dir).unwrap());
+        let store: Store = Store::memory();
         let models = Models::stub(store.clone(), vec![REJECT.into()]);
         let handle = handle(&dir);
         for (id, file) in [(1, "a.png"), (2, "b.png")] {
             let job = job(id, file, true);
             seed(&handle, &job, &png(2));
             // A second model call would find no stub reply and panic.
-            process(&job, &handle, store.as_ref(), &models, &Outlets::default()).await.unwrap();
+            process(&job, &handle, &store, &models, &Outlets::default()).await.unwrap();
         }
-        let record = store.media(&hash_of(&png(2))).unwrap().unwrap();
+        let record = store.media(&hash_of(&png(2))).await.unwrap().unwrap();
         assert_eq!(record.status, MediaStatus::Rejected);
         assert_eq!(record.sightings, 2);
     }
@@ -649,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn recaptioning_changes_only_the_text_of_active_stickers() {
         let dir = temp("recaption");
-        let store: Arc<dyn Store> = Arc::new(JsonlStore::open(&dir).unwrap());
+        let store: Store = Store::memory();
         let models = Models::stub(store.clone(), vec![KEEP.into(), REJECT.into()]);
         let handle = handle(&dir);
         let job = job(1, "a.png", true);
@@ -660,24 +656,24 @@ mod tests {
             use_when: "旧场合".into(), avoid: String::new(), tags: vec!["旧".into()], scope: StickerScope::Any, scope_reason: "主人定的".into(),
             origin: "qq:group:1".into(), first_seen: Utc::now(), last_seen: Utc::now(), sightings: 5, sent_count: 2, last_sent: None,
         };
-        store.save_media(&record).unwrap();
+        store.save_media(&record).await.unwrap();
         // Disabled stickers make no model call: a second reply would go unused, a third would panic.
         record.hash = "disabled".into();
         record.status = MediaStatus::Disabled;
-        store.save_media(&record).unwrap();
+        store.save_media(&record).await.unwrap();
 
-        let done = recaption_active(store.as_ref(), &models, &dir, &[]).await.unwrap();
+        let done = recaption_active(&store, &models, &dir, &[]).await.unwrap();
         assert_eq!(done.rewritten, 1);
-        let fresh = store.media(&hash).unwrap().unwrap();
+        let fresh = store.media(&hash).await.unwrap().unwrap();
         assert_eq!(fresh.description, "猫瞪着屏幕");
         assert_eq!(fresh.tags, ["猫"]);
         assert_eq!((fresh.status, fresh.scope, fresh.sightings, fresh.sent_count), (MediaStatus::Active, StickerScope::Any, 5, 2));
-        assert_eq!(store.media("disabled").unwrap().unwrap().description, "旧描述");
+        assert_eq!(store.media("disabled").await.unwrap().unwrap().description, "旧描述");
 
         // The model no longer wants it: the sticker stays as it was and is reported.
-        let done = recaption_active(store.as_ref(), &models, &dir, &[]).await.unwrap();
+        let done = recaption_active(&store, &models, &dir, &[]).await.unwrap();
         assert_eq!(done.declined, std::slice::from_ref(&hash));
-        assert_eq!(store.media(&hash).unwrap().unwrap().description, "猫瞪着屏幕");
+        assert_eq!(store.media(&hash).await.unwrap().unwrap().description, "猫瞪着屏幕");
     }
 
     #[test]
@@ -692,7 +688,7 @@ rewritten 1, left alone";
     #[tokio::test]
     async fn a_sticker_whose_file_is_missing_is_reported_not_lost() {
         let dir = temp("recaption-missing");
-        let store: Arc<dyn Store> = Arc::new(JsonlStore::open(&dir).unwrap());
+        let store: Store = Store::memory();
         let models = Models::stub(store.clone(), vec![]);
         let handle = handle(&dir);
         let job = job(1, "a.png", true);
@@ -703,28 +699,28 @@ rewritten 1, left alone";
             hash: hash.clone(), ext: "png".into(), status: MediaStatus::Active, keep: true, description: "旧描述".into(), text: String::new(),
             use_when: String::new(), avoid: String::new(), tags: Vec::new(), scope: StickerScope::Any, scope_reason: String::new(),
             origin: "qq:group:1".into(), first_seen: Utc::now(), last_seen: Utc::now(), sightings: 1, sent_count: 0, last_sent: None,
-        }).unwrap();
-        let done = recaption_active(store.as_ref(), &models, &dir, &[]).await.unwrap();
+        }).await.unwrap();
+        let done = recaption_active(&store, &models, &dir, &[]).await.unwrap();
         assert_eq!(done.failed, std::slice::from_ref(&hash));
-        assert_eq!(store.media(&hash).unwrap().unwrap().description, "旧描述");
+        assert_eq!(store.media(&hash).await.unwrap().unwrap().description, "旧描述");
     }
 
     #[tokio::test]
     async fn other_peoples_private_images_never_become_stickers_until_seen_where_collectable() {
         let dir = temp("private");
-        let store: Arc<dyn Store> = Arc::new(JsonlStore::open(&dir).unwrap());
+        let store: Store = Store::memory();
         let models = Models::stub(store.clone(), vec![KEEP.into()]);
         let handle = handle(&dir);
         let private = job(1, "a.png", false);
         seed(&handle, &private, &png(3));
-        process(&private, &handle, store.as_ref(), &models, &Outlets::default()).await.unwrap();
+        process(&private, &handle, &store, &models, &Outlets::default()).await.unwrap();
         let hash = hash_of(&png(3));
-        assert_eq!(store.media(&hash).unwrap().unwrap().status, MediaStatus::Seen);
+        assert_eq!(store.media(&hash).await.unwrap().unwrap().status, MediaStatus::Seen);
 
         let group = job(2, "b.png", true);
         seed(&handle, &group, &png(3));
-        process(&group, &handle, store.as_ref(), &models, &Outlets::default()).await.unwrap();
-        let record = store.media(&hash).unwrap().unwrap();
+        process(&group, &handle, &store, &models, &Outlets::default()).await.unwrap();
+        let record = store.media(&hash).await.unwrap().unwrap();
         assert_eq!(record.status, MediaStatus::Active);
         assert_eq!(record.origin, "qq:group:1");
     }
@@ -732,13 +728,13 @@ rewritten 1, left alone";
     #[tokio::test]
     async fn a_failed_description_keeps_the_file_and_leaves_no_description() {
         let dir = temp("failed");
-        let store: Arc<dyn Store> = Arc::new(JsonlStore::open(&dir).unwrap());
+        let store: Store = Store::memory();
         let models = Models::stub(store.clone(), vec!["not json".into()]);
         let handle = handle(&dir);
         let job = job(1, "a.png", true);
         seed(&handle, &job, &png(4));
-        assert!(process(&job, &handle, store.as_ref(), &models, &Outlets::default()).await.is_err());
-        assert!(store.media(&hash_of(&png(4))).unwrap().is_none());
+        assert!(process(&job, &handle, &store, &models, &Outlets::default()).await.is_err());
+        assert!(store.media(&hash_of(&png(4))).await.unwrap().is_none());
         assert_eq!(handle.render(&format!("甲：[图片]{}", marker(1)), &[]), "甲：[图片]");
         assert_eq!(handle.cached(&job.attachment).await.unwrap(), png(4));
     }
@@ -764,7 +760,7 @@ rewritten 1, left alone";
         dotenvy::dotenv().ok();
         let cfg = Config::load(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
         let dir = temp("live");
-        let store: Arc<dyn Store> = Arc::new(JsonlStore::open(&dir).unwrap());
+        let store: Store = Store::memory();
         let models = Models::new(&cfg, store.clone()).await.unwrap();
         let handle = handle(&dir);
         let job = job(1, "a.png", true);
@@ -773,31 +769,31 @@ rewritten 1, left alone";
         image.write_to(&mut bytes, ImageFormat::Png).unwrap();
         let bytes = bytes.into_inner();
         seed(&handle, &job, &bytes);
-        process(&job, &handle, store.as_ref(), &models, &Outlets::default()).await.unwrap();
-        let record = store.media(&hash_of(&bytes)).unwrap().unwrap();
+        process(&job, &handle, &store, &models, &Outlets::default()).await.unwrap();
+        let record = store.media(&hash_of(&bytes)).await.unwrap().unwrap();
         println!("{record:#?}");
         assert!(!record.description.is_empty());
 
         // Vectors only exist for stickers, so make this one a sticker whatever the filter said.
-        store.save_media(&MediaRecord { status: MediaStatus::Active, ..record.clone() }).unwrap();
-        assert_eq!(embed_stale(store.as_ref(), &models).await.unwrap(), 1);
-        assert_eq!(embed_stale(store.as_ref(), &models).await.unwrap(), 0);
-        let vectors = store.sticker_vectors(&models.sticker_embedding_id().unwrap()).unwrap();
+        store.save_media(&MediaRecord { status: MediaStatus::Active, ..record.clone() }).await.unwrap();
+        assert_eq!(embed_stale(&store, &models).await.unwrap(), 1);
+        assert_eq!(embed_stale(&store, &models).await.unwrap(), 0);
+        let vectors = store.sticker_vectors(&models.sticker_embedding_id().unwrap()).await.unwrap();
         assert_eq!(vectors[&record.hash].vector.len(), 1024);
     }
 
-    #[test]
-    fn old_unused_files_go_and_stickers_stay() {
+    #[tokio::test]
+    async fn old_unused_files_go_and_stickers_stay() {
         let dir = temp("prune");
-        let store = JsonlStore::open(&dir).unwrap();
+        let store = Store::memory();
         let old = Utc::now() - chrono::Duration::days(UNUSED_FILE_DAYS + 1);
         for (hash, status) in [("kept", MediaStatus::Active), ("gone", MediaStatus::Rejected), ("also", MediaStatus::Seen)] {
             std::fs::write(file_path(&dir, hash, "png"), b"x").unwrap();
             store.save_media(&MediaRecord { hash: hash.into(), ext: "png".into(), status, keep: false, description: String::new(),
                 text: String::new(), use_when: String::new(), avoid: String::new(), tags: vec![], scope: StickerScope::Any,
-                scope_reason: String::new(), origin: String::new(), first_seen: old, last_seen: old, sightings: 1, sent_count: 0, last_sent: None }).unwrap();
+                scope_reason: String::new(), origin: String::new(), first_seen: old, last_seen: old, sightings: 1, sent_count: 0, last_sent: None }).await.unwrap();
         }
-        prune_files(&store, &dir).unwrap();
+        prune_files(&store, &dir).await.unwrap();
         assert!(file_path(&dir, "kept", "png").exists());
         assert!(!file_path(&dir, "gone", "png").exists());
         assert!(!file_path(&dir, "also", "png").exists());

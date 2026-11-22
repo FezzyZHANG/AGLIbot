@@ -1,24 +1,23 @@
-//! The same contract runs against JSONL and (explicitly opt-in) MongoDB.
-
-use super::*;
-use chrono::Duration;
+use chrono::TimeDelta;
 use serde_json::json;
 
+use super::*;
+
 pub(super) fn time() -> DateTime<Utc> {
-    "2026-10-31T12:00:00.123456789Z".parse().unwrap()
+    "2026-11-01T10:00:00.123456789Z".parse().unwrap()
 }
 
 pub(super) fn message(ns: &str, text: &str, ts: DateTime<Utc>) -> MessageRecord {
     MessageRecord {
         ts,
-        platform: "telegram".into(),
-        chat_id: "1".into(),
-        sender: "owner".into(),
-        sender_name: "主人".into(),
+        platform: "qq".into(),
+        chat_id: "7".into(),
+        sender: "qq:8".into(),
+        sender_name: "name".into(),
         outgoing: false,
         text: text.into(),
         ns: ns.parse().unwrap(),
-        scope: Scope::Persons { ids: vec!["owner".into()] },
+        scope: Scope::Public,
     }
 }
 
@@ -26,331 +25,371 @@ pub(super) fn call(ts: DateTime<Utc>, cost_usd: f64) -> ModelCallRecord {
     ModelCallRecord {
         ts,
         scenario: "chat".into(),
-        model_id: "model-a".into(),
+        model_id: "model".into(),
         session_id: "session".into(),
-        uncached_input: u64::MAX,
+        uncached_input: i64::MAX as u64,
         cached_input: 2,
         cache_write: 3,
         output: 4,
         latency_ms: 5,
         cost_usd,
         ok: false,
-        error: Some("failed".into()),
-        escalated_from: Some("model-b".into()),
+        error: Some("request failed".into()),
+        escalated_from: None,
     }
 }
 
-fn same<T: Serialize>(got: &T, expected: &T) {
-    assert_eq!(serde_json::to_value(got).unwrap(), serde_json::to_value(expected).unwrap());
-}
-
-pub(super) fn contract(store: &dyn Store) {
-    assert!(store.load_embeddings("embed-a").unwrap().is_empty());
-    let mut embedding = EpisodeEmbedding { episode_id: "episode/a.$".into(), model_id: "embed-a".into(), vector: vec![0.5, -0.25] };
-    store.save_embedding(&embedding).unwrap();
-    assert_eq!(store.load_embeddings("embed-a").unwrap()[&embedding.episode_id], embedding.vector);
-    assert!(store.load_embeddings("embed-b").unwrap().is_empty());
-    embedding.vector = vec![0.25, 0.75];
-    store.save_embedding(&embedding).unwrap();
-    assert_eq!(store.load_embeddings("embed-a").unwrap().len(), 1);
-    assert_eq!(store.load_embeddings("embed-a").unwrap()[&embedding.episode_id], embedding.vector);
-    embedding.model_id = "embed-b".into();
-    store.save_embedding(&embedding).unwrap();
-    assert!(store.load_embeddings("embed-a").unwrap().is_empty());
-    let ts = time();
-    let ns: Namespace = "person/a".parse().unwrap();
-    assert!(store.recent_in_ns(&ns, 10).unwrap().is_empty());
-    assert!(store.messages_after(&ns, ts).unwrap().is_empty());
-    assert!(store.active_namespaces(ts).unwrap().is_empty());
-    assert_eq!(store.spent_since(ts).unwrap(), 0.0);
-    assert!(store.persons().unwrap().is_empty());
-    assert!(store.group("telegram:-7").unwrap().is_none());
-    assert!(store.relations(&Namespace::Group("telegram:-7".into())).unwrap().is_empty());
-    assert!(store.episodes().unwrap().is_empty());
-    assert!(store.lessons().unwrap().is_empty());
-    assert!(store.reviews().unwrap().is_empty());
-    assert_eq!(store.next_review_id().unwrap(), 1);
-    assert_eq!(store.next_review_id().unwrap(), 1); // Reading does not reserve an id.
-    assert_eq!(store.kv_get("missing").unwrap(), None);
-
-    // Deliberately out of timestamp order, with equal timestamps and sub-millisecond boundaries.
-    let messages = [
-        message("person/a", "later first", ts + Duration::days(1)),
-        message("person/a", "before", ts - Duration::nanoseconds(1)),
-        message("group/g", "other namespace", ts + Duration::nanoseconds(1)),
-        message("person/a", "at", ts),
-        message("person/a", "after", ts + Duration::nanoseconds(1)),
-        message("person/a", "equal", ts),
-        message("self", "self", ts + Duration::nanoseconds(1)),
-        message("project/p", "project", ts + Duration::nanoseconds(1)),
-    ];
-    for m in &messages {
-        store.append_message(m).unwrap();
-    }
-    same(&store.recent_in_ns(&ns, 3).unwrap(), &vec![messages[3].clone(), messages[4].clone(), messages[5].clone()]);
-    assert!(store.recent_in_ns(&ns, 0).unwrap().is_empty());
-    same(
-        &store.recent_in_ns(&ns, usize::MAX).unwrap(),
-        &vec![messages[0].clone(), messages[1].clone(), messages[3].clone(), messages[4].clone(), messages[5].clone()],
-    );
-    same(&store.messages_after(&ns, ts).unwrap(), &vec![messages[0].clone(), messages[4].clone()]);
-    assert_eq!(
-        store.active_namespaces(ts).unwrap(),
-        vec![Namespace::SelfNs, ns, Namespace::Group("g".into()), Namespace::Project("p".into())]
-    );
-    assert!(store.messages_after(&"person/absent".parse().unwrap(), ts).unwrap().is_empty());
-    assert!(store.active_namespaces(ts + Duration::days(1)).unwrap().is_empty());
-
-    for c in [call(ts - Duration::nanoseconds(1), 10.0), call(ts, 0.25), call(ts + Duration::nanoseconds(1), 0.5)] {
-        store.append_model_call(&c).unwrap();
-    }
-    assert_eq!(store.spent_since(ts).unwrap(), 0.75);
-    assert_eq!(store.spent_since(ts + Duration::nanoseconds(1)).unwrap(), 0.5);
-    assert_eq!(store.spent_since(ts + Duration::days(1)).unwrap(), 0.0);
-
-    let e = Episode {
-        id: "same-id".into(),
-        ts,
-        participants: vec!["owner".into()],
-        summary: "event".into(),
-        emotion: "curious".into(),
+pub(super) fn episode() -> Episode {
+    Episode {
+        id: "e1".into(),
+        ts: time(),
+        participants: vec!["qq:8".into()],
+        summary: "memory".into(),
+        emotion: "happy".into(),
         salience: 0.5,
         ns: Namespace::SelfNs,
         scope: Scope::SelfOnly,
-        sources: vec![],
-    };
-    let mut earlier = e.clone();
-    earlier.ts -= Duration::days(1);
-    store.append_episode(&e).unwrap();
-    store.append_episode(&earlier).unwrap();
-    same(&store.episodes().unwrap(), &vec![e.clone(), earlier.clone()]); // Append, even with duplicate ids.
-    let mut archive = Episode { id: "archive".into(), sources: vec![e.id.clone()], ..e.clone() };
-    archive.scope = Scope::Public;
-    assert!(store.archive_episode(&archive).is_err());
-    archive.scope = e.scope.clone();
-    archive.ns = Namespace::Person("other".into());
-    assert!(store.archive_episode(&archive).is_err());
-    archive.ns = e.ns.clone();
-    archive.sources = vec!["missing".into()];
-    assert!(store.archive_episode(&archive).is_err());
-    archive.sources = vec![e.id.clone()];
-    store.archive_episode(&archive).unwrap();
-    store.archive_episode(&archive).unwrap();
-    same(&store.episodes().unwrap(), &vec![archive.clone()]);
-    same(&store.all_episodes().unwrap(), &vec![e, earlier, archive.clone()]);
-    archive.summary = "conflicting retry".into();
-    assert!(store.archive_episode(&archive).is_err());
-    archive.id = "overlapping-archive".into();
-    assert!(store.archive_episode(&archive).is_err());
+    }
+}
 
-    let l = Lesson {
-        id: "lesson".into(),
-        ts,
-        text: "lesson".into(),
-        scope: Scope::SelfOnly,
-        sources: vec!["same-id".into()],
-    };
-    let mut l2 = l.clone();
-    l2.text = "second".into();
-    l2.ts -= Duration::days(1);
-    store.append_lesson(&l).unwrap();
-    store.append_lesson(&l2).unwrap();
-    same(&store.lessons().unwrap(), &vec![l, l2]);
-
-    let mut person = Person {
-        person_id: "p.z".into(),
-        platform_ids: vec!["qq:1".into()],
-        name: "old".into(),
+pub(super) fn person() -> Person {
+    Person {
+        person_id: "qq:8".into(),
+        platform_ids: vec!["qq:8".into()],
+        name: "name".into(),
         kind: PersonKind::Human,
         tier: Tier::Owner,
         trust: 0.5,
-        intimacy: 0.25,
-        last_update: None,
-        last_update_day: None,
-        facts: vec![Fact { text: "fact".into(), ns: Namespace::SelfNs, scope: Scope::SelfOnly, ts }],
-        last_seen: ts,
-        groups: vec!["qq:9".into()],
-    };
-    store.save_person(&person).unwrap();
-    let mut other = person.clone();
-    other.person_id = "$other".into();
-    store.save_person(&other).unwrap();
-    person.name = "new".into();
-    person.facts.clear();
-    store.save_person(&person).unwrap();
-    same(
-        &store.persons().unwrap(),
-        &BTreeMap::from([(other.person_id.clone(), other), (person.person_id.clone(), person)]),
-    );
+        intimacy: 0.5,
+        last_seen: time(),
+        last_update: Some(time()),
+        last_update_day: Some(time().date_naive()),
+        facts: vec![Fact {
+            text: "fact".into(),
+            ns: Namespace::SelfNs,
+            scope: Scope::SelfOnly,
+            ts: time(),
+        }],
+        groups: vec!["qq:7".into()],
+    }
+}
 
-    let mut group = Group {
-        chat_id: "telegram:-7".into(), members: vec!["a".into(), "b".into()],
-        norms: vec!["old".into()], topics: vec!["Rust".into()], my_role: "observer".into(),
-        activity_stats: ActivityStats { messages: u64::MAX, first_seen: ts, last_seen: ts },
-        ns: Namespace::Group("telegram:-7".into()), scope: Scope::Group { id: "telegram:-7".into() },
-    };
-    store.save_group(&group).unwrap();
-    group.norms = vec!["new".into()];
-    store.save_group(&group).unwrap();
-    same(&store.group(&group.chat_id).unwrap(), &Some(group.clone()));
-    let mut other_group = group.clone();
-    other_group.chat_id = "qq:-7".into();
-    other_group.ns = Namespace::Group(other_group.chat_id.clone());
-    other_group.scope = Scope::Group { id: other_group.chat_id.clone() };
-    other_group.norms.clear();
-    store.save_group(&other_group).unwrap();
-    same(&store.group(&group.chat_id).unwrap(), &Some(group.clone()));
-    same(&store.group(&other_group.chat_id).unwrap(), &Some(other_group.clone()));
-    assert!(store.group("missing").unwrap().is_none());
+pub(super) fn audit() -> AuditRecord {
+    AuditRecord {
+        ts: time(),
+        requester: "owner".into(),
+        tool: "send".into(),
+        allowed: true,
+        reason: "test".into(),
+        outcome: Outcome::Sent,
+    }
+}
 
-    let mut relation = Relation {
-        a: "$a.with.dots".into(), b: "b".into(), kind: "helps".into(), evidence: vec![ts],
-        strength: 0.5, ns: group.ns.clone(), scope: group.scope.clone(),
-    };
-    store.save_relation(&relation).unwrap();
-    let mut other_relation = relation.clone();
-    other_relation.ns = other_group.ns.clone();
-    other_relation.scope = other_group.scope.clone();
-    store.save_relation(&other_relation).unwrap();
-    relation.strength = 0.9;
-    relation.evidence.push(ts + Duration::nanoseconds(1));
-    store.save_relation(&relation).unwrap();
-    same(&store.relations(&group.ns).unwrap(), &vec![relation]);
-    same(&store.relations(&other_group.ns).unwrap(), &vec![other_relation]);
-    assert!(store.relations(&Namespace::Person("a".into())).unwrap().is_empty());
+pub(super) fn json_payload() -> Value {
+    json!({"$date": {"$numberLong": "123"}, "ts": "literal", "a.b": [null, 1, u64::MAX, {"$oid": "literal"}]})
+}
 
-    let mut review = ReviewItem {
-        id: 9,
-        ts,
+pub(super) fn review() -> NewReview {
+    NewReview {
+        ts: time(),
         category: ReviewCategory::Act,
         subject: "subject".into(),
         detail: "detail".into(),
-        verdict: "转交主人".into(),
+        verdict: "review".into(),
         status: ReviewStatus::Open,
-        payload: json!({"$date": "literal", "a.b": u64::MAX}),
+        payload: json_payload(),
         notified: false,
         urgent: true,
-        pushed: true,
-    };
-    store.save_review(&review).unwrap();
-    let mut lower = review.clone();
-    lower.id = 2;
-    store.save_review(&lower).unwrap();
-    review.status = ReviewStatus::Approved;
-    review.payload = Value::Null;
-    review.notified = true;
-    store.save_review(&review).unwrap();
-    same(&store.reviews().unwrap(), &vec![review, lower]);
-    assert_eq!(store.next_review_id().unwrap(), 10);
-    assert_eq!(store.next_review_id().unwrap(), 10);
+        pushed: false,
+    }
+}
 
-    store
-        .kv_set("$key.with.dots", json!({"$date": "literal", "a.b": [u64::MAX, true, null], "nul\0key": "值"}))
-        .unwrap();
+pub(super) fn media() -> MediaRecord {
+    MediaRecord {
+        hash: "hash".into(),
+        ext: "png".into(),
+        status: MediaStatus::Seen,
+        keep: true,
+        description: "original".into(),
+        text: "image text".into(),
+        use_when: "often".into(),
+        avoid: "rarely".into(),
+        tags: vec!["original".into()],
+        scope: StickerScope::Origin,
+        scope_reason: "private".into(),
+        origin: "qq:8".into(),
+        first_seen: time(),
+        last_seen: time(),
+        sightings: 1,
+        sent_count: 0,
+        last_sent: None,
+    }
+}
+
+pub(super) fn vector() -> StickerVector {
+    StickerVector {
+        hash: "hash".into(),
+        model_id: "model".into(),
+        text_hash: "text".into(),
+        vector: vec![0.5, -0.25],
+    }
+}
+
+pub(super) async fn contract(store: &Store) -> Result<()> {
+    let t = time();
+    let ms = truncate_ms(t);
+    let group = "group/qq:7".parse()?;
+    let person_ns = "person/qq:8".parse()?;
+    let later = ms + TimeDelta::milliseconds(1);
+    for (ns, text, ts) in [
+        ("group/qq:7", "later", later),
+        ("group/qq:7", "first", t),
+        ("person/qq:8", "other", t),
+        ("group/qq:7", "second", ms),
+    ] {
+        store.append_message(&message(ns, text, ts)).await?;
+    }
+    let texts =
+        |messages: Vec<MessageRecord>| messages.into_iter().map(|m| m.text).collect::<Vec<_>>();
+    assert!(store.recent_in_ns(&group, 0).await?.is_empty());
     assert_eq!(
-        store.kv_get("$key.with.dots").unwrap(),
-        Some(json!({"$date": "literal", "a.b": [u64::MAX, true, null], "nul\0key": "值"}))
+        texts(store.recent_in_ns(&group, 2).await?),
+        ["second", "later"]
     );
-    store.kv_set("$key.with.dots", Value::Null).unwrap();
-    assert_eq!(store.kv_get("$key.with.dots").unwrap(), Some(Value::Null));
-    store.kv_set("", json!([1, "two"])).unwrap();
-    assert_eq!(store.kv_get("").unwrap(), Some(json!([1, "two"])));
-    store.kv_set("persist", json!({"ok": true})).unwrap();
+    assert_eq!(texts(store.messages_after(&group, t).await?), ["later"]);
+    assert_eq!(
+        texts(
+            store
+                .messages_after(&group, ms - TimeDelta::nanoseconds(1))
+                .await?
+        ),
+        ["first", "second", "later"]
+    );
+    assert_eq!(store.recent_in_ns(&person_ns, 1).await?[0].ts, ms);
+    assert_eq!(
+        store.active_namespaces(t).await?,
+        std::slice::from_ref(&group)
+    );
+    assert_eq!(
+        store
+            .active_namespaces(ms - TimeDelta::milliseconds(1))
+            .await?,
+        [person_ns, group]
+    );
 
-    store
-        .append_audit(&AuditRecord {
-            ts,
-            requester: "owner".into(),
-            tool: "test".into(),
-            allowed: false,
-            reason: "denied".into(),
-            outcome: Outcome::Denied,
-        })
-        .unwrap();
+    store.append_model_call(&call(t, 0.25)).await?;
+    store.append_model_call(&call(later, 0.5)).await?;
+    assert_eq!(store.spent_since(t).await?, 0.75);
+    assert_eq!(store.spent_since(later).await?, 0.5);
+    assert_eq!(
+        store
+            .spent_since(later + TimeDelta::milliseconds(1))
+            .await?,
+        0.0
+    );
+    assert_eq!(store.model_calls().await?[0].ts, ms);
+    assert!(
+        store
+            .append_model_call(&ModelCallRecord {
+                output: u64::MAX,
+                ..call(t, 0.0)
+            })
+            .await
+            .is_err()
+    );
 
-    assert!(store.lexicon().unwrap().is_empty());
-    store.insert_lexicon(&[
-        json!({"term": "小庄", "kind": "alias", "scope": null, "enabled": true}),
-        json!({"term": "肉编器", "kind": "slang", "meaning": "手写汇编的人", "scope": "qq:1"}),
-    ]).unwrap();
-    assert!(store.insert_lexicon(&[json!({"term": "小庄", "kind": "slang", "meaning": "x"})]).is_err(), "missing scope equals null");
-    store.insert_lexicon(&[json!({"term": "小庄", "kind": "alias", "scope": "qq:1"})]).unwrap();
+    store.append_episode(&episode()).await?;
+    assert_eq!(store.episodes().await?[0].ts, ms);
+    let mut person = person();
+    store.save_person(&person).await?;
+    person.name = "edited".into();
+    store.save_person(&person).await?;
+    let persons = store.persons().await?;
+    let stored = &persons[&person.person_id];
+    assert_eq!(persons.len(), 1);
+    assert_eq!(stored.name, "edited");
+    assert_eq!(stored.last_seen, ms);
+    assert_eq!(stored.last_update, Some(ms));
+    assert_eq!(stored.facts[0].ts, ms);
+    store.append_audit(&audit()).await?;
+    assert_eq!(store.audits().await?[0].ts, ms);
+
+    let mut writes = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        let store = store.clone();
+        writes.spawn(async move { store.create_review(review()).await });
+    }
+    let mut ids = Vec::new();
+    while let Some(result) = writes.join_next().await {
+        ids.push(result??.id);
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, (1..=16).collect::<Vec<_>>());
+    let mut reviews = store.reviews().await?;
+    assert_eq!(reviews.len(), 16);
+    let item = &mut reviews[0];
+    assert_eq!(item.ts, ms);
+    assert_eq!(item.payload, json_payload());
+    item.status = ReviewStatus::Approved;
+    store.save_review(item).await?;
+    assert_eq!(store.reviews().await?[0].status, ReviewStatus::Approved);
+    item.id = 99;
+    assert!(store.save_review(item).await.is_err());
+
+    assert!(store.kv_get("key").await?.is_none());
+    store.kv_set("key", Value::Null).await?;
+    assert_eq!(store.kv_get("key").await?, Some(Value::Null));
+    store.kv_set("key", json_payload()).await?;
+    assert_eq!(store.kv_get("key").await?, Some(json_payload()));
+
+    let entries = [json!({"term": "a"}), json!({"term": "a", "scope": "qq:7"})];
+    store.insert_lexicon(&[]).await?;
+    store.insert_lexicon(&entries).await?;
+    assert!(
+        store
+            .insert_lexicon(&[json!({"term": "a", "scope": null})])
+            .await
+            .is_err()
+    );
+    assert!(store.insert_lexicon(&entries[1..]).await.is_err());
+    assert_eq!(store.lexicon().await?, entries);
+
+    media_contract(store).await?;
+    Ok(())
 }
 
-pub(super) fn persisted(store: &dyn Store) {
-    let lexicon = store.lexicon().unwrap();
-    let keys: std::collections::BTreeSet<_> = lexicon.iter().map(lexicon_key).collect();
-    assert_eq!(keys, [("小庄".into(), None), ("小庄".into(), Some("qq:1".into())), ("肉编器".into(), Some("qq:1".into()))].into());
-    assert!(lexicon.iter().any(|d| d["meaning"] == "手写汇编的人" && d["kind"] == "slang"));
-    assert!(lexicon.iter().all(|d| d.get("_id").is_none()));
-    assert!(store.load_embeddings("embed-a").unwrap().is_empty());
-    assert_eq!(store.load_embeddings("embed-b").unwrap(), BTreeMap::from([("episode/a.$".into(), vec![0.25, 0.75])]));
-    let audit = store.audits().unwrap();
-    assert_eq!(audit.len(), 1);
-    assert_eq!(audit[0].outcome, Outcome::Denied);
-    assert_eq!(audit[0].reason, "denied");
-    assert_eq!(store.recent_in_ns(&"person/a".parse().unwrap(), 100).unwrap().len(), 5);
-    assert_eq!(store.episodes().unwrap().len(), 1);
-    let all = store.all_episodes().unwrap();
-    assert_eq!(all.len(), 3);
-    assert_eq!(all[0].summary, "event");
-    assert_eq!(all[1].ts, time() - Duration::days(1));
-    assert_eq!(all[2].sources, ["same-id"]);
-    store.archive_episode(&all[2]).unwrap();
-    assert_eq!(store.all_episodes().unwrap().len(), 3);
-    assert_eq!(store.lessons().unwrap().len(), 2);
-    assert_eq!(store.persons().unwrap()["p.z"].name, "new");
-    let group = store.group("telegram:-7").unwrap().unwrap();
-    assert_eq!(group.norms, ["new"]);
-    assert_eq!(group.activity_stats.messages, u64::MAX);
-    assert_eq!(group.activity_stats.last_seen, time());
-    assert!(store.group("qq:-7").unwrap().unwrap().norms.is_empty());
-    let relations = store.relations(&group.ns).unwrap();
-    assert_eq!(relations.len(), 1);
-    assert_eq!(relations[0].strength, 0.9);
-    assert_eq!(relations[0].evidence, [time(), time() + Duration::nanoseconds(1)]);
-    let reviews = store.reviews().unwrap();
-    assert_eq!(reviews.iter().map(|r| r.id).collect::<Vec<_>>(), [9, 2]);
-    assert_eq!(reviews[0].status, ReviewStatus::Approved);
-    assert_eq!(store.next_review_id().unwrap(), 10);
-    assert_eq!(store.spent_since(time()).unwrap(), 0.75);
-    assert_eq!(store.kv_get("persist").unwrap(), Some(json!({"ok": true})));
-    store.append_message(&message("person/a", "after reopen", time())).unwrap();
-    assert_eq!(store.recent_in_ns(&"person/a".parse().unwrap(), 1).unwrap()[0].text, "after reopen");
-}
+async fn media_contract(store: &Store) -> Result<()> {
+    let record = media();
+    let hash = &record.hash;
+    let ms = truncate_ms(record.first_seen);
+    let later = ms + TimeDelta::milliseconds(1);
+    assert!(store.media(hash).await?.is_none());
+    assert!(
+        store
+            .touch_media_sighting(hash, later, None)
+            .await?
+            .is_none()
+    );
+    store.record_media_sent(hash, later).await?;
+    assert!(
+        store
+            .patch_media(hash, &MediaEditPatch::default())
+            .await?
+            .is_none()
+    );
+    store.save_media(&record).await?;
 
-#[test]
-fn jsonl_store_contract_and_reopen() {
-    let dir = std::env::temp_dir().join(format!("aglibot-store-contract-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let store = jsonl::JsonlStore::open(&dir).unwrap();
-    contract(&store);
-    drop(store);
-    persisted(&jsonl::JsonlStore::open(&dir).unwrap());
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn no_mongo_url_selects_jsonl() {
-    let dir = std::env::temp_dir().join(format!("aglibot-store-selection-{}", std::process::id()));
-    let store = open(&crate::config::MongoCfg::default(), &dir).unwrap();
-    store.kv_set("backend", json!("jsonl")).unwrap();
-    assert!(dir.join("kv.json").exists());
-    drop(store);
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn invalid_mongo_url_fails_without_fallback_or_secret_in_error() {
-    let dir = std::env::temp_dir().join(format!("aglibot-no-fallback-{}", std::process::id()));
-    let cfg = crate::config::MongoCfg { url: Some("invalid://username:secret@host".into()), ..Default::default() };
-    let error = match open(&cfg, &dir) {
-        Err(e) => format!("{e:#}"),
-        Ok(_) => panic!("invalid Mongo URL must fail"),
+    let caption = MediaCaptionPatch {
+        description: "caption".into(),
+        text: "ocr".into(),
+        use_when: "use".into(),
+        avoid: "avoid".into(),
+        tags: vec!["caption".into()],
     };
-    assert!(error.contains("MongoDB startup"));
-    assert!(error.contains("no JSONL fallback"));
-    assert!(!error.contains("secret"));
-    assert!(!error.contains("username"));
-    assert!(!dir.exists());
+    assert!(!store.update_media_caption(hash, &caption).await?);
+    let edit = MediaEditPatch {
+        description: Some("owner edit".into()),
+        scope: Some(StickerScope::Any),
+        ..Default::default()
+    };
+    let (sighting, sent, edited) = tokio::join!(
+        store.touch_media_sighting(hash, later, Some((MediaStatus::Active, "$group".into()))),
+        store.record_media_sent(hash, later),
+        store.patch_media(hash, &edit),
+    );
+    assert!(sighting?.is_some());
+    sent?;
+    assert!(edited?.is_some());
+    let promoted = store.media(hash).await?.unwrap();
+    assert_eq!(promoted.status, MediaStatus::Active);
+    assert_eq!(promoted.origin, "$group");
+    assert_eq!(promoted.description, "owner edit");
+    assert_eq!(promoted.scope, StickerScope::Any);
+    assert_eq!(promoted.first_seen, ms);
+    assert_eq!(promoted.last_seen, later);
+    assert_eq!(promoted.last_sent, Some(later));
+    assert_eq!(promoted.sightings, 2);
+    assert_eq!(promoted.sent_count, 1);
+
+    let mut writes = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        let store = store.clone();
+        writes.spawn(async move {
+            store
+                .touch_media_sighting(
+                    "hash",
+                    later,
+                    Some((MediaStatus::Rejected, "another".into())),
+                )
+                .await?;
+            store.record_media_sent("hash", later).await
+        });
+    }
+    assert!(store.update_media_caption(hash, &caption).await?);
+    while let Some(result) = writes.join_next().await {
+        result??;
+    }
+    let records = store.all_media().await?;
+    assert_eq!(records.len(), 1);
+    let edited = &records[0];
+    assert_eq!(edited.sightings, 18);
+    assert_eq!(edited.sent_count, 17);
+    assert_eq!(edited.origin, "$group");
+    assert_eq!(edited.status, MediaStatus::Active);
+    assert_eq!(edited.scope, StickerScope::Any);
+    assert_eq!(edited.description, caption.description);
+    assert_eq!(edited.text, caption.text);
+    assert_eq!(edited.use_when, caption.use_when);
+    assert_eq!(edited.avoid, caption.avoid);
+    assert_eq!(edited.tags, caption.tags);
+
+    let disable = MediaEditPatch {
+        status: Some(MediaStatus::Disabled),
+        ..Default::default()
+    };
+    assert_eq!(
+        store.patch_media(hash, &disable).await?.unwrap().status,
+        MediaStatus::Disabled
+    );
+    assert!(!store.update_media_caption(hash, &caption).await?);
+    let vector = vector();
+    store.save_sticker_vector(&vector).await?;
+    assert_eq!(
+        store.sticker_vectors("model").await?[hash].vector,
+        vector.vector
+    );
+    assert!(store.sticker_vectors("another").await?.is_empty());
+    store.delete_media(hash).await?;
+    assert!(store.all_media().await?.is_empty());
+    assert!(store.sticker_vectors("model").await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn mem_store_contract() -> Result<()> {
+    contract(&Store::memory()).await
+}
+
+#[tokio::test]
+async fn missing_mongo_url_fails_without_jsonl_fallback() {
+    let cfg = crate::config::MongoCfg {
+        url: None,
+        ..Default::default()
+    };
+    let Err(error) = Store::open(&cfg).await else {
+        panic!("expected missing URL error")
+    };
+    assert!(error.to_string().contains("MONGO_URL is required"));
+}
+
+#[tokio::test]
+async fn invalid_mongo_url_redacts_credentials() {
+    let cfg = crate::config::MongoCfg {
+        url: Some("invalid://username:secret@example.com".into()),
+        ..Default::default()
+    };
+    let Err(error) = Store::open(&cfg).await else {
+        panic!("expected invalid URL error")
+    };
+    assert!(!format!("{error:#}").contains("secret"));
 }

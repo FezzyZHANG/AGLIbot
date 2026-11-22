@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::mind::embedding::{EmbeddingCfg, cosine};
 use crate::mind::llm::LlmClient;
 use crate::mind::media::{file_path, media_dir};
-use crate::store::{MediaRecord, MediaStatus, StickerScope, Store};
+use crate::store::{MediaEditPatch, MediaRecord, MediaStatus, StickerScope, Store};
 
 const DEFAULT_PORT: u16 = 8790;
 const PAGE: &str = include_str!("stickers_web.html");
@@ -33,7 +33,7 @@ const LIST_MAX: usize = 300;
 const SEARCH_HITS: usize = 5;
 
 struct App {
-    store: Arc<dyn Store>,
+    store: Store,
     dir: PathBuf,
     port: u16,
     llm: LlmClient,
@@ -51,7 +51,7 @@ pub async fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
     };
     let root = std::env::var_os("AGLI_ROOT").map(PathBuf::from).unwrap_or(std::env::current_dir()?);
     let cfg = Config::load(&root)?;
-    let store = crate::store::open(&cfg.runtime.mongo, &cfg.data_dir())?;
+    let store = Store::open(&cfg.runtime.mongo).await?;
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.with_context(|| format!("binding port {port}"))?;
     let app = Arc::new(App {
         store, dir: media_dir(&cfg), port,
@@ -122,9 +122,9 @@ fn visible(record: &MediaRecord) -> bool {
     record.status != MediaStatus::Seen
 }
 
-fn found(store: &dyn Store, hash: &str) -> Result<Option<MediaRecord>> {
+async fn found(store: &Store, hash: &str) -> Result<Option<MediaRecord>> {
     if !valid_hash(hash) { return Ok(None); }
-    Ok(store.media(hash)?.filter(visible))
+    Ok(store.media(hash).await?.filter(visible))
 }
 
 #[derive(Deserialize, Default)]
@@ -169,7 +169,7 @@ fn matches(record: &MediaRecord, filter: &Filter) -> bool {
 }
 
 async fn list(State(app): State<Shared>, Query(filter): Query<Filter>) -> Response {
-    let all = match app.store.all_media() { Ok(all) => all, Err(e) => return failure(e) };
+    let all = match app.store.all_media().await { Ok(all) => all, Err(e) => return failure(e) };
     let mut origins: BTreeMap<String, usize> = BTreeMap::new();
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for record in all.iter().filter(|r| visible(r)) {
@@ -199,7 +199,7 @@ async fn list(State(app): State<Shared>, Query(filter): Query<Filter>) -> Respon
 }
 
 async fn file(State(app): State<Shared>, Path(hash): Path<String>) -> Response {
-    let record = match found(app.store.as_ref(), &hash) {
+    let record = match found(&app.store, &hash).await {
         Ok(Some(record)) => record,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return failure(e),
@@ -228,43 +228,55 @@ struct Edit {
 }
 
 async fn edit(State(app): State<Shared>, Path(hash): Path<String>, Json(edit): Json<Edit>) -> Response {
-    let mut record = match found(app.store.as_ref(), &hash) {
-        Ok(Some(record)) => record,
+    match found(&app.store, &hash).await {
+        Ok(Some(_)) => {}
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return failure(e),
+    }
+    let scope = match edit.scope.as_deref() {
+        Some(text) => match parse_scope(text) {
+            Some(scope) => Some(scope),
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => None,
     };
-    if let Some(text) = edit.description { record.description = text.trim().to_string(); }
-    if let Some(text) = edit.use_when { record.use_when = text.trim().to_string(); }
-    if let Some(text) = edit.avoid { record.avoid = text.trim().to_string(); }
-    if let Some(tags) = edit.tags { record.tags = tags.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect(); }
-    if let Some(text) = edit.scope {
-        let Some(scope) = parse_scope(&text) else { return StatusCode::BAD_REQUEST.into_response() };
-        record.scope = scope;
-    }
-    if let Some(text) = edit.status {
-        let Some(status) = parse_status(&text) else { return StatusCode::BAD_REQUEST.into_response() };
-        record.status = status;
-    }
-    match app.store.save_media(&record) {
-        Ok(()) => Json(record).into_response(),
+    let status = match edit.status.as_deref() {
+        Some(text) => match parse_status(text) {
+            Some(status) => Some(status),
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => None,
+    };
+    let trimmed = |value: String| value.trim().to_owned();
+    let patch = MediaEditPatch {
+        description: edit.description.map(trimmed),
+        use_when: edit.use_when.map(trimmed),
+        avoid: edit.avoid.map(trimmed),
+        tags: edit.tags.map(|tags| tags.into_iter().map(trimmed).filter(|tag| !tag.is_empty()).collect()),
+        scope,
+        status,
+    };
+    match app.store.patch_media(&hash, &patch).await {
+        Ok(Some(record)) => Json(record).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => failure(e),
     }
 }
 
-fn delete(app: &App, record: &MediaRecord) -> Result<()> {
-    app.store.delete_media(&record.hash)?;
+async fn delete(app: &App, record: &MediaRecord) -> Result<()> {
+    app.store.delete_media(&record.hash).await?;
     let path = file_path(&app.dir, &record.hash, &record.ext);
     if path.exists() { std::fs::remove_file(path)?; }
     Ok(())
 }
 
 async fn remove(State(app): State<Shared>, Path(hash): Path<String>) -> Response {
-    let record = match found(app.store.as_ref(), &hash) {
+    let record = match found(&app.store, &hash).await {
         Ok(Some(record)) => record,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return failure(e),
     };
-    match delete(&app, &record) {
+    match delete(&app, &record).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => failure(e),
     }
@@ -286,16 +298,16 @@ async fn bulk(State(app): State<Shared>, Json(bulk): Json<Bulk>) -> Response {
     };
     let mut done = 0;
     for hash in &bulk.hashes {
-        let Ok(Some(mut record)) = found(app.store.as_ref(), hash) else { continue };
+        let Ok(Some(record)) = found(&app.store, hash).await else { continue };
         let result = match status {
-            Some(status) => {
-                record.status = status;
-                app.store.save_media(&record)
-            }
-            None => delete(&app, &record),
+            Some(status) => app.store.patch_media(hash, &MediaEditPatch { status: Some(status), ..Default::default() })
+                .await.map(|record| record.is_some()),
+            None => delete(&app, &record).await.map(|()| true),
         };
-        if let Err(e) = result { return failure(e); }
-        done += 1;
+        match result {
+            Ok(changed) => done += usize::from(changed),
+            Err(e) => return failure(e),
+        }
     }
     Json(json!({"done": done})).into_response()
 }
@@ -320,16 +332,17 @@ async fn search(State(app): State<Shared>, Json(search): Json<Search>) -> Respon
         Ok(result) => result,
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "向量模型不可用，Ollama 在运行吗？"}))).into_response(),
     };
-    let (vectors, all) = match (app.store.sticker_vectors(&cfg.model_id()), app.store.all_media()) {
+    let (vectors, all) = match (app.store.sticker_vectors(&cfg.model_id()).await, app.store.all_media().await) {
         (Ok(vectors), Ok(all)) => (vectors, all),
         (Err(e), _) | (_, Err(e)) => return failure(e),
     };
+    let waiting = all.iter().filter(|r| r.status == MediaStatus::Active && !vectors.contains_key(&r.hash)).count();
     let mut hits: Vec<Hit> = all.into_iter().filter(|r| r.status == MediaStatus::Active).filter_map(|record| {
         let stored = vectors.get(&record.hash)?;
         let score = cosine(&query, &stored.vector).ok()?;
         Some(Hit { score, record })
     }).collect();
-    let waiting = app.store.all_media().map(|all| all.iter().filter(|r| r.status == MediaStatus::Active && !vectors.contains_key(&r.hash)).count()).unwrap_or(0);
+
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
     hits.truncate(SEARCH_HITS);
     Json(json!({"hits": hits, "waiting": waiting})).into_response()
@@ -341,7 +354,6 @@ mod tests {
 
     use super::*;
     use crate::mind::media::sticker_text;
-    use crate::store::jsonl::JsonlStore;
 
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const PRIVATE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -358,7 +370,7 @@ mod tests {
     struct Running {
         base: String,
         port: u16,
-        store: Arc<dyn Store>,
+        store: Store,
         dir: PathBuf,
         http: reqwest::Client,
     }
@@ -367,9 +379,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aglibot-test-web-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let store: Arc<dyn Store> = Arc::new(JsonlStore::open(&dir).unwrap());
-        store.save_media(&record(HASH, MediaStatus::Active)).unwrap();
-        store.save_media(&record(PRIVATE, MediaStatus::Seen)).unwrap();
+        let store: Store = Store::memory();
+        store.save_media(&record(HASH, MediaStatus::Active)).await.unwrap();
+        store.save_media(&record(PRIVATE, MediaStatus::Seen)).await.unwrap();
         for hash in [HASH, PRIVATE] { std::fs::write(file_path(&dir, hash, "png"), b"png").unwrap(); }
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -399,7 +411,7 @@ mod tests {
         let change = json!({"status": "disabled"});
         assert_eq!(web.http.patch(&url).json(&change).send().await.unwrap().status(), 403);
         assert_eq!(web.http.get(format!("{}/api/stickers", web.base)).header("host", "evil.example").send().await.unwrap().status(), 403);
-        assert_eq!(web.store.media(HASH).unwrap().unwrap().status, MediaStatus::Active);
+        assert_eq!(web.store.media(HASH).await.unwrap().unwrap().status, MediaStatus::Active);
         for host in ["8.8.8.8", "192.168.1.9.evil.example"] {
             let response = web.http.get(format!("{}/api/stickers", web.base)).header("host", format!("{host}:{}", web.port)).send().await.unwrap();
             assert_eq!(response.status(), 403, "{host}");
@@ -409,7 +421,7 @@ mod tests {
 
         let response = web.http.patch(&url).header(UI_HEADER, "1").json(&change).send().await.unwrap();
         assert_eq!(response.status(), 200);
-        assert_eq!(web.store.media(HASH).unwrap().unwrap().status, MediaStatus::Disabled);
+        assert_eq!(web.store.media(HASH).await.unwrap().unwrap().status, MediaStatus::Disabled);
     }
 
     #[test]
@@ -426,17 +438,17 @@ mod tests {
     async fn edits_change_the_embedded_text_and_delete_removes_the_file() {
         let web = start("edit").await;
         let url = format!("{}/api/stickers/{HASH}", web.base);
-        let before = sticker_text(&web.store.media(HASH).unwrap().unwrap());
+        let before = sticker_text(&web.store.media(HASH).await.unwrap().unwrap());
         let body = json!({"description": "狗", "tags": ["狗", " "], "scope": "origin"});
         assert_eq!(web.http.patch(&url).header(UI_HEADER, "1").json(&body).send().await.unwrap().status(), 200);
-        let edited = web.store.media(HASH).unwrap().unwrap();
+        let edited = web.store.media(HASH).await.unwrap().unwrap();
         assert_eq!(edited.tags, ["狗"]);
         assert_eq!(edited.scope, StickerScope::Origin);
         assert_ne!(sticker_text(&edited), before);
         assert_eq!(web.http.patch(&url).header(UI_HEADER, "1").json(&json!({"scope": "x"})).send().await.unwrap().status(), 400);
 
         assert_eq!(web.http.delete(&url).header(UI_HEADER, "1").send().await.unwrap().status(), 204);
-        assert!(web.store.media(HASH).unwrap().is_none());
+        assert!(web.store.media(HASH).await.unwrap().is_none());
         assert!(!file_path(&web.dir, HASH, "png").exists());
     }
 
@@ -446,7 +458,7 @@ mod tests {
         let body = json!({"hashes": [HASH, PRIVATE, "nonsense"], "action": "disabled"});
         let done: Value = web.http.post(format!("{}/api/bulk", web.base)).header(UI_HEADER, "1").json(&body).send().await.unwrap().json().await.unwrap();
         assert_eq!(done["done"], 1);
-        assert_eq!(web.store.media(PRIVATE).unwrap().unwrap().status, MediaStatus::Seen);
+        assert_eq!(web.store.media(PRIVATE).await.unwrap().unwrap().status, MediaStatus::Seen);
         let search = web.http.post(format!("{}/api/search", web.base)).header(UI_HEADER, "1").json(&json!({"text": "猫"})).send().await.unwrap();
         assert_eq!(search.status(), 503);
     }

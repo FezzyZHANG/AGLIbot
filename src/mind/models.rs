@@ -2,7 +2,7 @@
 //! the budget, and on failure escalate once to the next stronger model on the Pareto front
 //! (docs/DESIGN.md 5d). JSON answers get a self-check: unparsable output also escalates.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -20,7 +20,7 @@ pub struct Models {
     sticker_embedding: Option<super::embedding::EmbeddingCfg>,
     router: Router,
     llm: LlmClient,
-    store: Arc<dyn Store>,
+    store: Store,
     budget: Mutex<Budget>,
     has_local: bool,
     #[cfg(test)]
@@ -38,12 +38,25 @@ struct Stub {
 #[derive(Clone, Copy)]
 pub struct SpendLimit {
     pub since: DateTime<Utc>,
-    pub max_usd: f64,
+    max_usd: f64,
+    pub(super) baseline_usd: f64,
 }
 
 impl SpendLimit {
-    pub fn exhausted(&self, store: &dyn Store) -> Result<bool> {
-        Ok(!self.max_usd.is_finite() || self.max_usd <= 0.0 || store.spent_since(self.since)? >= self.max_usd)
+    pub async fn start(store: &Store, max_usd: f64) -> Result<Self> {
+        let since = Utc::now();
+        // BSON includes the entire starting millisecond. Exclude spend already booked in it.
+        let baseline_usd = if max_usd.is_finite() && max_usd > 0.0 {
+            store.spent_since(since).await?
+        } else {
+            0.0
+        };
+        Ok(Self { since, max_usd, baseline_usd })
+    }
+
+    pub async fn exhausted(&self, store: &Store) -> Result<bool> {
+        Ok(!self.max_usd.is_finite() || self.max_usd <= 0.0
+            || store.spent_since(self.since).await? - self.baseline_usd >= self.max_usd)
     }
 }
 
@@ -69,7 +82,7 @@ pub fn extract_json<T: DeserializeOwned>(text: &str) -> Result<T> {
 
 impl Models {
     /// Models without credentials, and local models whose server is down, are left out of routing.
-    pub async fn new(cfg: &Config, store: Arc<dyn Store>) -> Result<Self> {
+    pub async fn new(cfg: &Config, store: Store) -> Result<Self> {
         let llm = LlmClient::new(cfg.models.providers.clone())?;
         let mut usable = Vec::new();
         for m in &cfg.models.models {
@@ -86,7 +99,7 @@ impl Models {
         router
             .select("chat", &ProcessingPolicy::Any, false)
             .map_err(|e| anyhow!("没有可用的聊天模型，请在 .env 里配置至少一个提供商的密钥：{e}"))?;
-        let budget = Budget::new(cfg.models.daily_budget_usd, store.spent_since(local_midnight_utc())?);
+        let budget = Budget::new(cfg.models.daily_budget_usd, store.spent_since(local_midnight_utc()).await?);
         Ok(Models {
             sticker_embedding: cfg.models.sticker_embedding.clone().filter(|e| e.validate().is_ok()),
             router, llm, store, budget: Mutex::new(budget), has_local,
@@ -96,7 +109,7 @@ impl Models {
     }
 
     #[cfg(test)]
-    pub fn stub(store: Arc<dyn Store>, replies: Vec<String>) -> Self {
+    pub fn stub(store: Store, replies: Vec<String>) -> Self {
         Self {
             sticker_embedding: None,
             router: Router::new(vec![], Default::default()),
@@ -136,7 +149,7 @@ impl Models {
     /// One call with an image, for the background worker: no retry or escalation.
     pub async fn describe_image(&self, policy: &ProcessingPolicy, system: &str, frames: Vec<String>) -> Result<String> {
         #[cfg(test)]
-        if self.stub.is_some() { return self.stub_reply("caption", policy, "image") }
+        if self.stub.is_some() { return self.stub_reply("caption", policy, "image").await }
         let model = self.pick("caption", policy)?;
         let turns = [Turn::UserParts(super::media::caption_parts(frames))];
         let effort = self.effort("caption");
@@ -157,15 +170,18 @@ impl Models {
     }
 
     #[cfg(test)]
-    fn stub_reply(&self, scenario: &str, policy: &ProcessingPolicy, user: &str) -> Result<String> {
-        let mut stub = self.stub.as_ref().unwrap().lock().unwrap();
-        stub.prompts.push((scenario.into(), policy.clone(), user.into()));
+    async fn stub_reply(&self, scenario: &str, policy: &ProcessingPolicy, user: &str) -> Result<String> {
+        let (cost_usd, reply) = {
+            let mut stub = self.stub.as_ref().unwrap().lock().unwrap();
+            stub.prompts.push((scenario.into(), policy.clone(), user.into()));
+            (stub.cost_usd, stub.replies.pop_front().expect("unexpected model call"))
+        };
         self.store.append_model_call(&ModelCallRecord {
             ts: Utc::now(), scenario: scenario.into(), model_id: "stub".into(), session_id: scenario.into(),
             uncached_input: 0, cached_input: 0, cache_write: 0, output: 0, latency_ms: 0,
-            cost_usd: stub.cost_usd, ok: true, error: None, escalated_from: None,
-        })?;
-        Ok(stub.replies.pop_front().expect("unexpected model call"))
+            cost_usd, ok: true, error: None, escalated_from: None,
+        }).await?;
+        Ok(reply)
     }
 
     pub fn router(&self) -> &Router {
@@ -229,7 +245,7 @@ impl Models {
             error: error.clone(),
             escalated_from: escalated_from.map(String::from),
         };
-        if let Err(e) = self.store.append_model_call(&call) {
+        if let Err(e) = self.store.append_model_call(&call).await {
             warn!("failed to log model call: {e:#}");
         }
         match error {
@@ -258,7 +274,7 @@ impl Models {
                 },
                 _ => "",
             };
-            let text = self.stub_reply(scenario, policy, text)?;
+            let text = self.stub_reply(scenario, policy, text).await?;
             let reply = Reply { text, raw: None, usage: Usage::default(), latency: Duration::ZERO };
             return Ok((reply, model_id.into()));
         }
@@ -279,7 +295,7 @@ impl Models {
     /// A cheap side call with no retry/escalation; the caller owns the fallback.
     pub async fn ask_once(&self, scenario: &str, policy: &ProcessingPolicy, system: &str, user: &str) -> Result<String> {
         #[cfg(test)]
-        if self.stub.is_some() { return self.stub_reply(scenario, policy, user) }
+        if self.stub.is_some() { return self.stub_reply(scenario, policy, user).await }
         let model = self.pick(scenario, policy)?;
         let turns = [Turn::User(user.to_string())];
         let effort = self.effort(scenario);
@@ -290,7 +306,7 @@ impl Models {
     /// One-shot call: `system` is the stable prefix (usually L1), `user` the task.
     pub async fn ask(&self, scenario: &str, policy: &ProcessingPolicy, system: &str, user: &str) -> Result<String> {
         #[cfg(test)]
-        if self.stub.is_some() { return self.stub_reply(scenario, policy, user) }
+        if self.stub.is_some() { return self.stub_reply(scenario, policy, user).await }
         let model = self.pick(scenario, policy)?;
         let turns = [Turn::User(user.to_string())];
         let effort = self.effort(scenario);
@@ -313,12 +329,12 @@ impl Models {
             serde_json::from_str(text.trim()).or_else(|_| extract_json(text))
         }
 
-        if let Some(limit) = limit && limit.exhausted(self.store.as_ref())? {
+        if let Some(limit) = limit && limit.exhausted(&self.store).await? {
             return Err(super::router::BudgetDenied("read-only reflection cost budget exhausted".into()).into());
         }
         #[cfg(test)]
         if self.stub.is_some() {
-            return parse(&self.stub_reply(scenario, policy, user)?);
+            return parse(&self.stub_reply(scenario, policy, user).await?);
         }
         let model = self.pick(scenario, policy)?;
         let turns = [Turn::User(user.to_string())];
@@ -357,12 +373,12 @@ impl Models {
         user: &str,
         limit: Option<SpendLimit>,
     ) -> Result<T> {
-        if let Some(limit) = limit && limit.exhausted(self.store.as_ref())? {
+        if let Some(limit) = limit && limit.exhausted(&self.store).await? {
             return Err(super::router::BudgetDenied("read-only reflection cost budget exhausted".into()).into());
         }
         #[cfg(test)]
         if self.stub.is_some() {
-            return extract_json(&self.stub_reply(scenario, policy, user)?);
+            return extract_json(&self.stub_reply(scenario, policy, user).await?);
         }
         if limit.is_some() {
             return extract_json(&self.ask_once(scenario, policy, system, user).await?);

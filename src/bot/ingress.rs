@@ -55,9 +55,9 @@ pub fn owner_command(acl: &AclCfg, env: &Envelope) -> bool {
     !env.is_group && (task_caption || (env.authored_text.trim_start().starts_with('/') && env.text.trim_start().starts_with('/'))) && identify(acl, env).is_owner
 }
 
-pub(super) fn set_freeze(control: &ControlPlane, store: &dyn Store, platform: &str, freeze: bool) -> Result<OwnerState> {
+pub(super) async fn set_freeze(control: &ControlPlane, store: &Store, platform: &str, freeze: bool) -> Result<OwnerState> {
     let state = if freeze { OwnerState::Frozen } else { OwnerState::Unfrozen };
-    let before = control.set_frozen(store, freeze).inspect_err(|_| report(Fault::StateSave))?;
+    let before = control.set_frozen(store, freeze).await.inspect_err(|_| report(Fault::StateSave))?;
     if before != freeze && platform != "telegram" { notify_state(state); }
     Ok(state)
 }
@@ -67,7 +67,7 @@ pub(super) fn stop_receipt(stopped: &[String]) -> String {
 }
 
 pub async fn try_handle_fast_control(
-    cfg: &Config, store: &dyn Store, outlets: &Outlets, control: &ControlPlane,
+    cfg: &Config, store: &Store, outlets: &Outlets, control: &ControlPlane,
     events: &mpsc::UnboundedSender<Event>, env: &Envelope,
 ) -> bool {
     let cmd = env.authored_text.trim();
@@ -79,7 +79,7 @@ pub async fn try_handle_fast_control(
         (stop_receipt(&stopped), Some(ControlEvent::Stopped { stopped }))
     } else {
         let freeze = cmd == "/freeze";
-        match set_freeze(control, store, env.platform, freeze) {
+        match set_freeze(control, store, env.platform, freeze).await {
             Ok(state) => {
                 let event = if freeze {
                     Some(ControlEvent::Frozen { stopped: control.jobs().stop_all().await })
@@ -91,7 +91,7 @@ pub async fn try_handle_fast_control(
             Err(e) => (format!("出错了：{e:#}"), None),
         }
     };
-    if let Err(e) = store.kv_set("owner_last_chat", json!({"platform": env.platform, "chat_id": env.chat_id})) {
+    if let Err(e) = store.kv_set("owner_last_chat", json!({"platform": env.platform, "chat_id": env.chat_id})).await {
         report(Fault::StateSave);
         warn!("saving owner route: {e:#}");
     }
@@ -304,7 +304,7 @@ impl Bot {
 
     pub(super) async fn on_message(&mut self, mut env: Envelope, batch: &mut ReplyBatch) -> Result<()> {
         let now = Utc::now();
-        let who = self.runtime_identity(&env)?;
+        let who = self.runtime_identity(&env).await?;
         let group_key = env.group_key();
         if let Some(g) = &group_key {
             if self.cfg.social.ignored_groups.contains(g) {
@@ -323,10 +323,10 @@ impl Bot {
         if !who.is_owner && env.platform == "qq" && self.cfg.acl.owner.qq_user_id == 0 && !env.is_group {
             info!("message from qq user {} — set OWNER_QQ_ID if that is you", env.sender_id);
         }
-        self.people.observe(self.store.as_ref(), &env, &who, now)?;
+        self.people.observe(&self.store, &env, &who, now).await?;
         self.check_qq_groups(&env, &who).await?;
         let observed_at = env.arrived.and_then(|t| chrono::Duration::from_std(t.elapsed()).ok()).map_or(now, |age| now - age);
-        if !env.notice && let Err(e) = bot_flags::observe(self.store.as_ref(), &env, &who, observed_at) {
+        if !env.notice && let Err(e) = bot_flags::observe(&self.store, &env, &who, observed_at).await {
             warn!("QQ agent heuristic failed: {e:#}");
         }
 
@@ -372,7 +372,7 @@ impl Bot {
             text: env.text.clone(),
             ns: ctx.ns.clone(),
             scope: ctx.scope.clone(),
-        })?;
+        }).await?;
 
         let markers = self.queue_media(&mut env, &who, &ctx);
         let spoken = format!("{}{markers}", env.text.replace(crate::mind::media::MARKER_OPEN, ""));
@@ -405,7 +405,7 @@ impl Bot {
                 text: reply,
                 ns: ctx.ns.clone(),
                 scope: ctx.scope.clone(),
-            });
+            }).await;
         }
 
         if !env.attachments.is_empty() {
@@ -415,7 +415,7 @@ impl Bot {
         }
 
         if who.is_owner && !env.is_group {
-            self.store.kv_set("owner_last_chat", json!({"platform": env.platform, "chat_id": env.chat_id}))?;
+            self.store.kv_set("owner_last_chat", json!({"platform": env.platform, "chat_id": env.chat_id})).await?;
             self.state.talked_with_owner(now);
             if owner_command(&self.cfg.acl, &env) {
                 let line = if env.authored_text.trim_start().starts_with('/') { env.authored_text.trim() } else { env.text.trim() };
@@ -436,7 +436,7 @@ impl Bot {
             let label = if who.is_owner { "主人".to_string() } else { self.people.name_of(&who.person_id) };
             batch.lines.push(format!("{label}：{spoken}"));
             if asleep && !who.is_owner {
-                self.remember_overnight(&env, who.is_agent)?;
+                self.remember_overnight(&env, who.is_agent).await?;
                 info!("asleep: not replying to {} now", who.person_id);
                 return Ok(());
             }
@@ -451,7 +451,7 @@ impl Bot {
 
         let called = match (&group_key, env.mentions_me) {
             (Some(g), false) => {
-                self.lexicon.refresh(self.store.as_ref(), now);
+                self.lexicon.refresh(&self.store, now).await;
                 self.lexicon.called_by(g, &env.text).map(String::from)
             }
             _ => None,

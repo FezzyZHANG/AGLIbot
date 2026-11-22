@@ -23,12 +23,12 @@ pub(super) struct OvernightChat {
 pub(super) const OVERNIGHT_CHATS: &str = "overnight_chats";
 
 impl Bot {
-    pub(super) fn overnight_chats(&self) -> Result<Vec<OvernightChat>> {
-        Ok(self.store.kv_get(OVERNIGHT_CHATS)?.map(serde_json::from_value).transpose()?.unwrap_or_default())
+    pub(super) async fn overnight_chats(&self) -> Result<Vec<OvernightChat>> {
+        Ok(self.store.kv_get(OVERNIGHT_CHATS).await?.map(serde_json::from_value).transpose()?.unwrap_or_default())
     }
 
-    pub(super) fn remember_overnight(&self, env: &Envelope, is_agent: bool) -> Result<()> {
-        let mut chats = self.overnight_chats()?;
+    pub(super) async fn remember_overnight(&self, env: &Envelope, is_agent: bool) -> Result<()> {
+        let mut chats = self.overnight_chats().await?;
         if let Some(chat) = chats.iter_mut().find(|c| c.platform == env.platform && c.chat_id == env.chat_id) {
             chat.is_agent |= is_agent;
         } else {
@@ -37,10 +37,10 @@ impl Bot {
                 platform: env.platform.into(), chat_id: env.chat_id.clone(), sender_id: env.sender_id.clone(), is_agent,
             });
         }
-        self.store.kv_set(OVERNIGHT_CHATS, json!(chats))
+        self.store.kv_set(OVERNIGHT_CHATS, json!(chats)).await
     }
 
-    pub(super) fn overnight_turn(&self, chat: &OvernightChat) -> Result<Option<(ChatCtx, String, usize)>> {
+    pub(super) async fn overnight_turn(&self, chat: &OvernightChat) -> Result<Option<(ChatCtx, String, usize)>> {
         let platform = match chat.platform.as_str() {
             "telegram" => "telegram",
             "qq" => "qq",
@@ -51,7 +51,7 @@ impl Bot {
             platform, chat_id: chat.chat_id.clone(), sender_id: chat.sender_id.clone(), sender_name: String::new(),
             sender_is_bot: chat.is_agent, is_group: false, mentions_me: false, text: String::new(), message_id: None, arrived: None,
         };
-        let mut who = self.runtime_identity(&env)?;
+        let mut who = self.runtime_identity(&env).await?;
         if who.is_owner {
             return Ok(None);
         }
@@ -61,7 +61,7 @@ impl Bot {
             ns: Namespace::Person(who.person_id.clone()), scope: Scope::Persons { ids: vec![who.person_id.clone()] },
             audience: self.people.private_audience(&who.person_id), is_group: false, partner: Some(who),
         };
-        let messages = self.store.messages_after(&ctx.ns, DateTime::UNIX_EPOCH)?;
+        let messages = self.store.messages_after(&ctx.ns, DateTime::UNIX_EPOCH).await?;
         let in_chat = |m: &MessageRecord| m.platform == platform && m.chat_id == chat.chat_id;
         let start = messages.iter().rposition(|m| in_chat(m) && m.outgoing).map_or(0, |i| i + 1);
         let pending = &messages[start..];
@@ -75,10 +75,10 @@ impl Bot {
         if self.frozen() || !self.cfg.social.private_from_others {
             return Ok(());
         }
-        let mut remaining = self.overnight_chats()?;
+        let mut remaining = self.overnight_chats().await?;
         for chat in remaining.clone() {
             let result = async {
-                let Some((ctx, mut body, current)) = self.overnight_turn(&chat)? else { return Ok(false) };
+                let Some((ctx, mut body, current)) = self.overnight_turn(&chat).await? else { return Ok(false) };
                 if body.is_empty() {
                     return Ok(false);
                 }
@@ -93,7 +93,7 @@ impl Bot {
             match result {
                 Ok(true) => {
                     remaining.retain(|c| c.platform != chat.platform || c.chat_id != chat.chat_id);
-                    self.store.kv_set(OVERNIGHT_CHATS, json!(remaining))?;
+                    self.store.kv_set(OVERNIGHT_CHATS, json!(remaining)).await?;
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -142,7 +142,7 @@ impl Bot {
             return Ok(());
         }
         self.state.last_digest = Some(local.date_naive());
-        if let (Some(text), Some(ctx)) = (judge::digest(self.store.as_ref())?, self.owner_ctx()) {
+        if let (Some(text), Some(ctx)) = (judge::digest(&self.store).await?, self.owner_ctx().await) {
             let outcome = match self.outlets.send(ctx.platform, &ctx.chat_id, &text).await {
                 Ok(()) => Outcome::Sent,
                 Err(e) => {
@@ -151,18 +151,18 @@ impl Bot {
                     Outcome::Failed
                 }
             };
-            self.audit("me", "daily_digest", true, "", outcome)?;
+            self.audit("me", "daily_digest", true, "", outcome).await?;
         }
         Ok(())
     }
 
     pub(super) async fn push_urgent(&self) -> Result<()> {
-        let Some(ctx) = self.owner_ctx() else { return Ok(()) };
-        while let Some(mut item) = judge::claim_urgent(self.store.as_ref(), self.state.energy.asleep)? {
+        let Some(ctx) = self.owner_ctx().await else { return Ok(()) };
+        while let Some(mut item) = judge::claim_urgent(&self.store, self.state.energy.asleep).await? {
             let outcome = match self.send_plain(&ctx, &judge::urgent_message(&item)).await {
                 Ok(()) => {
                     item.pushed = true;
-                    self.store.save_review(&item)?;
+                    self.store.save_review(&item).await?;
                     Outcome::Sent
                 }
                 Err(e) => {
@@ -171,7 +171,7 @@ impl Bot {
                     Outcome::Unknown
                 }
             };
-            self.audit("me", "urgent_review", true, &item.id.to_string(), outcome)?;
+            self.audit("me", "urgent_review", true, &item.id.to_string(), outcome).await?;
         }
         Ok(())
     }
@@ -179,11 +179,11 @@ impl Bot {
     /// Extract chats with enough unprocessed messages.
     pub(super) async fn extract_due(&mut self) -> Result<()> {
         let after = Utc::now() - chrono::Duration::days(2);
-        for ns in self.store.active_namespaces(after)? {
+        for ns in self.store.active_namespaces(after).await? {
             if !self.cfg.social.reflects_normally(&ns) { continue }
-            let since = reflect::watermark(self.store.as_ref(), &ns)?;
-            if self.store.messages_after(&ns, since)?.len() >= self.cfg.runtime.memory.extract_after {
-                reflect::extract_ns(&self.models, self.store.as_ref(), &mut self.people, &ns).await?;
+            let since = reflect::watermark(&self.store, &ns).await?;
+            if self.store.messages_after(&ns, since).await?.len() >= self.cfg.runtime.memory.extract_after {
+                reflect::extract_ns(&self.models, &self.store, &mut self.people, &ns).await?;
             }
         }
         Ok(())
@@ -191,9 +191,9 @@ impl Bot {
 
     pub(super) async fn extract_all(&mut self, window: chrono::Duration) -> Result<usize> {
         let mut n = 0;
-        for ns in self.store.active_namespaces(Utc::now() - window)? {
+        for ns in self.store.active_namespaces(Utc::now() - window).await? {
             if !self.cfg.social.reflects_normally(&ns) { continue }
-            let o = reflect::extract_ns(&self.models, self.store.as_ref(), &mut self.people, &ns).await?;
+            let o = reflect::extract_ns(&self.models, &self.store, &mut self.people, &ns).await?;
             n += usize::from(o.messages > 0);
         }
         Ok(n)
@@ -206,10 +206,10 @@ impl Bot {
         }
         info!("going to sleep: reflecting on {date}");
         self.extract_all(chrono::Duration::days(2)).await?;
-        reflect::read_only_nightly(&self.models, self.store.as_ref(), &mut self.people, &self.cfg.social, date,
+        reflect::read_only_nightly(&self.models, &self.store, &mut self.people, &self.cfg.social, date,
             Utc::now() - chrono::Duration::days(2)).await?;
         let dir = self.cfg.mind_dir().join("life").join("journal");
-        if let Some(path) = reflect::write_journal(&self.models, self.store.as_ref(), self.speaker.l1(), dir, date).await? {
+        if let Some(path) = reflect::write_journal(&self.models, &self.store, self.speaker.l1(), dir, date).await? {
             info!("journal written: {}", path.display());
         }
         self.state.last_reflect = Some(date);
@@ -219,7 +219,7 @@ impl Bot {
 
     pub(super) async fn think(&mut self, now: DateTime<Utc>) -> Result<()> {
         let gap = chrono::Duration::hours(self.cfg.runtime.heartbeat.proactive_gap_hours);
-        let owner_known = self.owner_ctx().is_some();
+        let owner_known = self.owner_ctx().await.is_some();
         let quiet_since_owner = self.state.last_owner_contact.is_none_or(|t| now - t >= chrono::Duration::hours(1));
         let may_message_owner = owner_known && quiet_since_owner && self.state.last_proactive.is_none_or(|t| now - t >= gap);
         let startable: Vec<String> = if self.control.jobs().len() >= self.cfg.runtime.hands.max_jobs {
@@ -259,7 +259,7 @@ impl Bot {
         match decide::validate(&d, &situation) {
             Action::Nothing => {}
             Action::Work { task_id } => {
-                let msg = self.start_job(&task_id)?;
+                let msg = self.start_job(&task_id).await?;
                 info!("{msg}");
             }
             Action::MessageOwner { reason } => self.reach_out(&reason).await?,
@@ -268,11 +268,11 @@ impl Bot {
     }
 
     pub(super) async fn reach_out(&mut self, reason: &str) -> Result<()> {
-        let Some(ctx) = self.owner_ctx() else { return Ok(()) };
+        let Some(ctx) = self.owner_ctx().await else { return Ok(()) };
         self.state.last_proactive = Some(Utc::now());
         let body = format!("（没有新消息。你决定主动找主人聊几句，因为：{reason}。自然地开个头；改主意了就只回复 [不发]。）");
         self.converse_with_options(&ctx, body, 0, false, true).await?;
-        self.audit("me", "reach_out_owner", true, reason, Outcome::Sent)?;
+        self.audit("me", "reach_out_owner", true, reason, Outcome::Sent).await?;
         Ok(())
     }
 }
