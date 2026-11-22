@@ -12,13 +12,17 @@ pub struct Who {
 }
 
 pub fn identify(acl: &AclCfg, env: &Envelope) -> Who {
+    identify_with(acl, env, |_| false)
+}
+
+pub fn identify_with(acl: &AclCfg, env: &Envelope, confirmed_agent: impl FnOnce(&str) -> bool) -> Who {
     let owner_id = match env.platform {
         "telegram" => acl.owner.telegram_user_id,
         "qq" => acl.owner.qq_user_id,
         _ => 0,
     };
     let key = env.sender_key();
-    let is_agent = env.sender_is_bot || acl.known_agents.iter().any(|a| a == &key);
+    let is_agent = env.sender_is_bot || acl.known_agents.iter().any(|a| a == &key) || confirmed_agent(&key);
     let is_owner = owner_id != 0 && !is_agent && env.sender_id == owner_id.to_string();
     let person_id = if is_owner { acl.owner.person_id.clone() } else { key };
     Who { person_id, is_owner, is_agent }

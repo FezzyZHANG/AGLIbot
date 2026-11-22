@@ -7,7 +7,7 @@ use crate::channels::{ReplyPiece, reply_text};
 use crate::error_report::{Fault, report};
 use crate::mind::{context::{tail, user_turn}, speak::SayTurn};
 use crate::ns::ProcessingPolicy;
-use crate::store::{MessageRecord, Outcome};
+use crate::store::{MediaStatus, MessageRecord, Outcome, StickerScope};
 
 impl Bot {
     pub(super) async fn converse(&mut self, ctx: &ChatCtx, body: String, current: usize, unsolicited: bool) -> Result<()> {
@@ -39,7 +39,7 @@ impl Bot {
             .collect();
         // Slang goes in the tail, never L1/L2, so the cached prefix is unchanged.
         notes.extend(self.slang_note(ctx, &body, now).await);
-        let turn_tail = tail(now.with_timezone(&Local), &self.state.snapshot(), busy.as_deref(), &notes);
+        let turn_tail = tail(now.with_timezone(&Local), self.state.asleep, busy.as_deref(), &notes);
         // Recall runs on every turn (cheap at this volume) so the policy is known before routing.
         let tasks = ctx.task_cards(&self.board());
         let (l2, policy) = self.frame(ctx, current, &tasks).await?;
@@ -193,7 +193,8 @@ impl Bot {
         if let Some(offer) = &sticker {
             // Text already went out, so its record below still matters; a lone sticker has nothing to keep.
             match self.send_sticker(ctx, offer).await {
-                Ok(()) => stored.push(format!("[表情包：{}]", offer.record.description)),
+                Ok(true) => stored.push(format!("[表情包：{}]", offer.record.description)),
+                Ok(false) => {}
                 Err(e) if intent.text.is_empty() && stored.is_empty() => return Err(e.context(Fault::Delivery)),
                 Err(e) => {
                     report(Fault::Delivery);
@@ -202,14 +203,7 @@ impl Bot {
             }
         }
         if !intent.text.is_empty() { stored.insert(0, intent.text.clone()); }
-        if current > 0 && self.cfg.social.reflects_normally(&ctx.ns) {
-            for message in self.store.recent_in_ns(&ctx.ns, current).await? {
-                if !message.outgoing && message.platform == ctx.platform && message.chat_id == ctx.chat_id
-                    && message.scope.permits(&ctx.audience) {
-                    self.appraisals.record(message.text, policy.clone());
-                }
-            }
-        }
+        if stored.is_empty() { return Ok(()) }
         self.store.append_message(&MessageRecord {
             ts: Utc::now(),
             platform: ctx.platform.into(),
@@ -249,9 +243,14 @@ impl Bot {
         }
     }
 
-    pub(super) async fn send_sticker(&self, ctx: &ChatCtx, offer: &crate::mind::expression::Offer) -> Result<()> {
+    pub(super) async fn send_sticker(&self, ctx: &ChatCtx, offer: &crate::mind::expression::Offer) -> Result<bool> {
         let reply_to = if ctx.is_group { ctx.message_id.as_deref() } else { None };
-        let record = &offer.record;
+        let Some(record) = self.store.media(&offer.record.hash).await?.filter(|r| {
+            r.status == MediaStatus::Active && (r.scope == StickerScope::Any || r.origin == ctx.key)
+        }) else {
+            info!("skipping sticker {} in {}: no longer active and permitted", offer.id, ctx.key);
+            return Ok(false);
+        };
         #[cfg(test)]
         let sent = if let Some(test) = &self.test_chat {
             test.sent_texts.lock().unwrap().push(format!("sticker:{}", offer.id));
@@ -268,7 +267,7 @@ impl Bot {
         }
         info!("sent sticker {} in {}", offer.id, ctx.key);
         self.store.record_media_sent(&record.hash, Utc::now()).await?;
-        Ok(())
+        Ok(true)
     }
 
     /// One step on the chat's open session after the draft. Tests answer from `steps`, and an

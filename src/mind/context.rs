@@ -3,13 +3,12 @@
 //! L1 constitution — boundaries, identity, voice, how to use his "hands"; changes only when evolution commits.
 //! L2 session frame — who he is talking to, what he may recall about them, a recap; frozen for one session.
 //! L3 transcript — append-only turns, never rewritten.
-//! L4 volatile tail — time, mood, energy, what he is busy with; inside the newest user turn, never in system.
+//! L4 volatile tail — time, sleep, and current work; inside the newest user turn, never in system.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, Weekday};
-use serde_json::Value;
 
 /// Read a text file with line endings normalised, so L1 bytes are identical across platforms.
 pub fn read_norm(path: &Path) -> Result<String> {
@@ -91,11 +90,6 @@ pub fn build_l2(setting: &str, who: &str, memory: &str, recap: &[RecapLine], tas
     out
 }
 
-pub struct StateSnapshot {
-    pub mood: Value,
-    pub energy: Value,
-}
-
 fn weekday_zh(d: Weekday) -> &'static str {
     match d {
         Weekday::Mon => "周一",
@@ -109,18 +103,11 @@ fn weekday_zh(d: Weekday) -> &'static str {
 }
 
 /// L4: the only place volatile state appears. `busy` names the work he is focused on, if any.
-pub fn tail(now: DateTime<Local>, st: &StateSnapshot, busy: Option<&str>, notes: &[String]) -> String {
-    let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-    let label = st.mood.get("label").and_then(Value::as_str).unwrap_or("平静");
-    let asleep = st.energy.get("asleep").and_then(Value::as_bool).unwrap_or(false);
+pub fn tail(now: DateTime<Local>, asleep: bool, busy: Option<&str>, notes: &[String]) -> String {
     let mut out = format!(
-        "<当前状态>\n时间：{} {}\n心境：{label}（P {:.1} / A {:.1} / D {:.1}）\n精力：{:.1}",
+        "<当前状态>\n时间：{} {}",
         now.format("%Y-%m-%d %H:%M"),
         weekday_zh(now.weekday()),
-        num(&st.mood, "pleasure"),
-        num(&st.mood, "arousal"),
-        num(&st.mood, "dominance"),
-        num(&st.energy, "level"),
     );
     if asleep {
         out.push_str("\n你本来在睡觉，被消息吵醒了。");
@@ -143,7 +130,6 @@ pub fn user_turn(tail: &str, body: &str) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use serde_json::json;
 
     fn mind() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("mind")
@@ -165,14 +151,12 @@ mod tests {
         let l1 = build_l1(&mind()).unwrap();
         let l2 = build_l2("私聊", "card", "", &[], "");
         let now = Local.with_ymd_and_hms(2026, 10, 31, 14, 5, 0).unwrap();
-        let calm = StateSnapshot { mood: json!({"label": "平静"}), energy: json!({"level": 0.8}) };
-        let upset = StateSnapshot { mood: json!({"label": "烦躁"}), energy: json!({"level": 0.2, "asleep": true}) };
-        let (t1, t2) = (tail(now, &calm, None, &[]), tail(now, &upset, Some("查 P vs NP"), &[]));
-        assert_ne!(t1, t2);
+        let t1 = tail(now, false, None, &[]);
+        let t2 = tail(now, true, Some("查 P vs NP"), &["这里有一条备注。".into()]);
         for layer in [&l1, &l2] {
-            assert!(!layer.contains("烦躁") && !layer.contains("2026-10-31"));
+            assert!(!layer.contains("2026-10-31"));
         }
-        assert!(t1.contains("周六"));
-        assert!(t2.contains("吵醒") && t2.contains("P vs NP"));
+        assert_eq!(t1, "<当前状态>\n时间：2026-10-31 14:05 周六\n</当前状态>");
+        assert_eq!(t2, "<当前状态>\n时间：2026-10-31 14:05 周六\n你本来在睡觉，被消息吵醒了。\n你正在专心做：查 P vs NP\n这里有一条备注。\n</当前状态>");
     }
 }

@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use super::llm::Part;
+use super::llm::{JsonSchema, Part};
 use super::models::{Models, extract_json};
 use super::vision::{self, MAX_FILE_BYTES};
 use crate::channels::{Attachment, Outlets};
@@ -80,6 +80,27 @@ struct Caption {
     scope: String,
     #[serde(default, deserialize_with = "lenient")]
     scope_reason: String,
+}
+
+pub(super) fn caption_schema() -> JsonSchema {
+    JsonSchema {
+        name: "image_caption",
+        schema: serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["description", "text", "keep", "use_when", "avoid", "tags", "scope", "scope_reason"],
+            "properties": {
+                "description": {"type": "string"},
+                "text": {"type": "string"},
+                "keep": {"type": "boolean"},
+                "use_when": {"type": "string"},
+                "avoid": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "scope": {"type": "string", "enum": ["", "any", "origin"]},
+                "scope_reason": {"type": "string"}
+            }
+        }),
+    }
 }
 
 /// The value when it has the expected type, the default otherwise.

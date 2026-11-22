@@ -380,6 +380,14 @@ impl MongoStore {
         Ok(())
     }
 
+    pub async fn mark_reviews_notified(&self, ids: &[u64]) -> Result<()> {
+        let ids = ids.iter().copied().map(i64::try_from).collect::<Result<Vec<_>, _>>()?;
+        self.collection("reviews")
+            .update_many(doc! { "_id": { "$in": ids } }, doc! { "$set": { "notified": true } })
+            .await?;
+        Ok(())
+    }
+
     pub async fn kv_get(&self, key: &str) -> Result<Option<Value>> {
         self.raw("kv")
             .find_one(doc! { "_id": key })
@@ -394,6 +402,21 @@ impl MongoStore {
             .upsert(true)
             .await?;
         Ok(())
+    }
+
+    pub async fn kv_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut pattern = String::from("^");
+        for c in prefix.chars() {
+            if r"\.^$|?*+()[]{}".contains(c) {
+                pattern.push('\\');
+            }
+            pattern.push(c);
+        }
+        collect(
+            self.raw("kv").find(doc! { "_id": { "$regex": pattern } })
+                .projection(doc! { "_id": 1 }).await?,
+            |doc| Ok(doc.get_str("_id")?.to_owned()),
+        ).await
     }
 
     pub async fn lexicon(&self) -> Result<Vec<Value>> {

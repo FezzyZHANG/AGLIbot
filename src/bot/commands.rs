@@ -8,7 +8,6 @@ use crate::channels::{Envelope, ReplyPiece, reply_text};
 use crate::error_report::Fault;
 use crate::mind::judge;
 use crate::ns::ProcessingPolicy;
-use crate::social::bot_flags;
 use crate::store::{Outcome, ReviewCategory, ReviewStatus};
 use crate::work::board::{Board, TaskKind, TaskStatus};
 
@@ -108,14 +107,9 @@ impl Bot {
                 .into(),
             "/status" => {
                 let (spent, limit) = self.models.spent_today();
-                let s = &self.state;
                 format!(
-                    "心境 {}，精力 {:.2}{}，社交需求 {:.2}，好奇 {:.2}\n今日花费 ${spent:.4} / ${limit:.2}\n运行任务：{}\n冻结：{}\n聊天模型：{}",
-                    s.mood.label,
-                    s.energy.level,
-                    if s.energy.asleep { "（睡觉中）" } else { "" },
-                    s.drives.social,
-                    s.drives.curiosity,
+                    "状态：{}\n今日花费 ${spent:.4} / ${limit:.2}\n运行任务：{}\n冻结：{}\n聊天模型：{}",
+                    if self.state.asleep { "睡觉中" } else { "清醒" },
                     self.running_jobs(),
                     self.frozen(),
                     self.models.pick("chat", &ProcessingPolicy::Any).map(|m| m.id).unwrap_or_else(|e| e.to_string()),
@@ -152,7 +146,13 @@ impl Bot {
                 }
                 state.message().into()
             }
-            "/digest" => judge::digest(&self.store).await?.unwrap_or_else(|| "没有待你决定的事。".into()),
+            "/digest" => match judge::build_digest(&self.store).await? {
+                Some((text, ids)) => {
+                    judge::mark_notified(&self.store, &ids).await?;
+                    text
+                }
+                None => "没有待你决定的事。".into(),
+            },
             "/approve" | "/reject" => {
                 let (id, reason) = arg.split_once(char::is_whitespace).map(|(i, r)| (i, r.trim())).unwrap_or((arg, ""));
                 let id = id.trim_start_matches('#').parse()?;
@@ -177,7 +177,7 @@ impl Bot {
             return Ok(format!("#{id} 已经处理过了。"));
         }
         if let Some(sender) = item.payload.get("agent_candidate").and_then(Value::as_str) {
-            bot_flags::settle(&self.store, sender, approve).await?;
+            self.bot_flags.settle(&self.store, sender, approve).await?;
         }
         item.status = if approve { ReviewStatus::Approved } else { ReviewStatus::Rejected };
         if !reason.is_empty() {

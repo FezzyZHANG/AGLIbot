@@ -2,15 +2,14 @@
 //! messages from the world, heartbeat ticks (inner life), and finished background work.
 //!
 //! Main loop (docs/DESIGN.md 2c): Envelope → identity → acl → floor (groups) →
-//! privacy-filtered recall → speak → store. Ticks advance state and wake `decide` only when
-//! something changed; nothing-changed ticks make no model calls.
+//! privacy-filtered recall → speak → store. Ticks advance the routine and check scheduler timers.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::{Local, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
@@ -23,10 +22,13 @@ use crate::mind::{
     context::{RecapLine, build_l1, build_l2, read_opt},
     models::Models,
     speak::Speaker,
-    state::{ConversationAppraisals, MindState},
+    state::MindState,
 };
 use crate::ns::{Audience, Namespace, ProcessingPolicy, Scope};
-use crate::social::{bot_flags, floor::Floor, identity::{Who, identify}, people::People, privacy::{self, Query}};
+use crate::social::{
+    bot_flags::BotFlags, floor::Floor, identity::{Who, identify_with}, people::People,
+    privacy::{self, Query}, skill_lines::SkillLines,
+};
 use crate::store::{AuditRecord, Outcome, Store, Tier};
 use crate::work::{board::Board, research};
 
@@ -64,7 +66,10 @@ pub struct Bot {
     people: People,
     floor: Floor,
     state: MindState,
-    appraisals: ConversationAppraisals,
+    bot_flags: BotFlags,
+    skill_lines: SkillLines,
+    last_proactive_check: Option<DateTime<Utc>>,
+    nightly_retry: Option<(NaiveDate, u8, DateTime<Utc>)>,
     board: Arc<Mutex<Board>>,
     control: Arc<ControlPlane>,
     /// Group lines he has not yet "read" into his session, per chat key.
@@ -103,13 +108,18 @@ impl Bot {
         if recovered > 0 {
             info!("{recovered} interrupted task(s) moved back to the inbox");
         }
-        let state = MindState::load(&store, &cfg.mind_dir()).await?;
+        let state = MindState::load(&store).await?;
+        let bot_flags = BotFlags::load(&store).await?;
+        let skill_lines = SkillLines::load(&cfg.mind_dir());
         Ok(Bot {
             speaker: Speaker::new(l1, cfg.runtime.session.clone()),
             people,
             floor: Floor::default(),
             state,
-            appraisals: ConversationAppraisals::default(),
+            bot_flags,
+            skill_lines,
+            last_proactive_check: None,
+            nightly_retry: None,
             board: Arc::new(Mutex::new(board)),
             control,
             unseen: HashMap::new(),
@@ -188,10 +198,8 @@ impl Bot {
         }
     }
 
-    async fn runtime_identity(&self, env: &Envelope) -> Result<Who> {
-        let mut acl = self.cfg.acl.clone();
-        acl.known_agents.extend(bot_flags::list(&self.store, bot_flags::CONFIRMED).await?);
-        Ok(identify(&acl, env))
+    fn runtime_identity(&self, env: &Envelope) -> Who {
+        identify_with(&self.cfg.acl, env, |key| self.bot_flags.confirmed().contains(key))
     }
 
     /// On someone's first QQ private message this run, ask NapCat which of the bot's groups they

@@ -127,12 +127,15 @@ impl People {
 
     /// Membership is never revoked: someone who left may still hear about the group in private.
     pub async fn add_group(&mut self, store: &Store, person_id: &str, group: &str) -> Result<()> {
-        let Some(p) = self.cache.get_mut(person_id) else { return Ok(()) };
+        let Some(p) = self.cache.get(person_id) else { return Ok(()) };
         if p.groups.iter().any(|g| g == group) {
             return Ok(());
         }
-        p.groups.push(group.into());
-        store.save_person(p).await
+        let mut updated = p.clone();
+        updated.groups.push(group.into());
+        store.save_person(&updated).await?;
+        self.cache.insert(person_id.into(), updated);
+        Ok(())
     }
 
     /// Once per store: group membership from messages stored before `groups` existed.
@@ -166,12 +169,15 @@ impl People {
         if !self.cache.contains_key(person_id) {
             self.ensure(store, person_id, "", Tier::Stranger).await?;
         }
-        let Some(p) = self.cache.get_mut(person_id) else { return Ok(()) };
+        let Some(p) = self.cache.get(person_id) else { return Ok(()) };
         if p.facts.iter().any(|f| f.text == fact.text) {
             return Ok(());
         }
-        p.facts.push(fact);
-        store.save_person(p).await
+        let mut updated = p.clone();
+        updated.facts.push(fact);
+        store.save_person(&updated).await?;
+        self.cache.insert(person_id.into(), updated);
+        Ok(())
     }
 }
 

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
 
-use super::models::{Models, SpendLimit};
+use super::{llm::JsonSchema, models::{Models, SpendLimit}};
 use crate::config::SocialCfg;
 use crate::ns::{Namespace, ProcessingPolicy, Scope};
 use crate::social::people::People;
@@ -39,6 +39,45 @@ struct Extracted {
     episodes: Vec<RawEpisode>,
     #[serde(default)]
     facts: Vec<RawFact>,
+}
+
+fn extract_schema() -> JsonSchema {
+    JsonSchema {
+        name: "memory_extraction",
+        schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["episodes", "facts"],
+            "properties": {
+                "episodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["summary", "participants", "emotion", "salience"],
+                        "properties": {
+                            "summary": {"type": "string"},
+                            "participants": {"type": "array", "items": {"type": "string"}},
+                            "emotion": {"type": "string"},
+                            "salience": {"type": "number"}
+                        }
+                    }
+                },
+                "facts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["person", "text"],
+                        "properties": {
+                            "person": {"type": "string"},
+                            "text": {"type": "string"}
+                        }
+                    }
+                }
+            }
+        }),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -96,7 +135,7 @@ async fn extract_messages(
          只输出一个 JSON 对象：{{\"episodes\": [{{\"summary\": \"\", \"participants\": [], \"emotion\": \"\", \"salience\": 0.5}}], \
          \"facts\": [{{\"person\": \"\", \"text\": \"\"}}]}}，没有就给空数组。\n\n{transcript}"
     );
-    let raw: Extracted = models.ask_json_with_limit("extract", &policy, system, &user, limit).await?;
+    let raw: Extracted = models.ask_structured_with_limit("extract", &policy, system, &user, &extract_schema(), limit).await?;
 
     let now = Utc::now();
     let mut out = ExtractOutcome { messages: msgs.len(), ..Default::default() };

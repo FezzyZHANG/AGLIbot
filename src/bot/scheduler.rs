@@ -1,7 +1,8 @@
 use anyhow::Result;
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 use super::{Bot, ChatCtx, report_error};
@@ -21,6 +22,8 @@ pub(super) struct OvernightChat {
 }
 
 pub(super) const OVERNIGHT_CHATS: &str = "overnight_chats";
+const NIGHTLY_ATTEMPTS: u8 = 3;
+const NIGHTLY_BACKOFF: Duration = Duration::minutes(30);
 
 impl Bot {
     pub(super) async fn overnight_chats(&self) -> Result<Vec<OvernightChat>> {
@@ -51,7 +54,7 @@ impl Bot {
             platform, chat_id: chat.chat_id.clone(), sender_id: chat.sender_id.clone(), sender_name: String::new(),
             sender_is_bot: chat.is_agent, is_group: false, mentions_me: false, text: String::new(), message_id: None, arrived: None,
         };
-        let mut who = self.runtime_identity(&env).await?;
+        let mut who = self.runtime_identity(&env);
         if who.is_owner {
             return Ok(None);
         }
@@ -106,45 +109,45 @@ impl Bot {
     }
 
     pub(super) async fn on_tick(&mut self) -> Result<()> {
-        let now = Utc::now();
+        self.on_tick_at(Utc::now()).await
+    }
+
+    pub(super) async fn on_tick_at(&mut self, now: DateTime<Utc>) -> Result<()> {
         let changes = self.state.tick(now, &self.cfg.runtime.routine);
         self.push_urgent().await?;
-        self.appraisals.apply(&self.models, &mut self.state).await;
-        for c in &changes {
-            match c {
-                Change::FellAsleep => self.nightly().await?,
-                Change::WokeUp => {
-                    self.catch_up_overnight().await?;
-                    for o in std::mem::take(&mut self.deliveries) {
-                        self.deliver(o).await?;
-                    }
-                }
-                Change::DriveHigh(d) => info!("drive `{d}` is high"),
+        if self.state.asleep {
+            return self.maybe_nightly(now).await;
+        }
+        if changes.contains(&Change::WokeUp) {
+            self.catch_up_overnight().await?;
+            for o in std::mem::take(&mut self.deliveries) {
+                self.deliver(o).await?;
             }
         }
-        if !self.state.energy.asleep {
-            self.maybe_digest(now).await?;
-            self.extract_due().await?;
-        }
+        self.maybe_digest(now).await?;
+        self.extract_due().await?;
         let revisit = self.state.revisit_at.is_some_and(|t| t <= now);
-        let drive = changes.iter().any(|c| matches!(c, Change::DriveHigh(_)));
-        if !self.state.energy.asleep && !self.frozen() && (revisit || drive || self.wake_decide) {
+        if !self.frozen() && (revisit || self.proactive_due(now) || self.wake_decide) {
             self.wake_decide = false;
             self.state.revisit_at = None;
-            self.think(now).await?;
+            self.think(now, revisit).await?;
         }
         Ok(())
     }
 
     pub(super) async fn maybe_digest(&mut self, now: DateTime<Utc>) -> Result<()> {
+        let Some(ctx) = self.owner_ctx().await else { return Ok(()) };
         let local = now.with_timezone(&Local);
         if local.time() < self.cfg.runtime.judge.digest_at || self.state.last_digest == Some(local.date_naive()) {
             return Ok(());
         }
-        self.state.last_digest = Some(local.date_naive());
-        if let (Some(text), Some(ctx)) = (judge::digest(&self.store).await?, self.owner_ctx().await) {
-            let outcome = match self.outlets.send(ctx.platform, &ctx.chat_id, &text).await {
-                Ok(()) => Outcome::Sent,
+        if let Some((text, ids)) = judge::build_digest(&self.store).await? {
+            let outcome = match self.send_plain(&ctx, &text).await {
+                Ok(()) => {
+                    judge::mark_notified(&self.store, &ids).await?;
+                    self.state.last_digest = Some(local.date_naive());
+                    Outcome::Sent
+                }
                 Err(e) => {
                     report(Fault::Delivery);
                     error!("digest send failed: {e:#}");
@@ -158,7 +161,7 @@ impl Bot {
 
     pub(super) async fn push_urgent(&self) -> Result<()> {
         let Some(ctx) = self.owner_ctx().await else { return Ok(()) };
-        while let Some(mut item) = judge::claim_urgent(&self.store, self.state.energy.asleep).await? {
+        while let Some(mut item) = judge::claim_urgent(&self.store, self.state.asleep).await? {
             let outcome = match self.send_plain(&ctx, &judge::urgent_message(&item)).await {
                 Ok(()) => {
                     item.pushed = true;
@@ -199,15 +202,29 @@ impl Bot {
         Ok(n)
     }
 
-    pub(super) async fn nightly(&mut self) -> Result<()> {
-        let date = reflect::diary_day(Local::now());
+    async fn maybe_nightly(&mut self, now: DateTime<Utc>) -> Result<()> {
+        let date = reflect::diary_day(now.with_timezone(&Local));
         if self.state.last_reflect == Some(date) {
             return Ok(());
         }
+        let mut attempts = 0;
+        if let Some((day, count, retry_at)) = self.nightly_retry && day == date {
+            if count >= NIGHTLY_ATTEMPTS || now < retry_at {
+                return Ok(());
+            }
+            attempts = count;
+        }
+        let start = Instant::now();
+        let result = self.nightly(date, now).await;
+        self.nightly_retry = result.is_err().then(|| (date, attempts + 1, now + start.elapsed() + NIGHTLY_BACKOFF));
+        result
+    }
+
+    async fn nightly(&mut self, date: NaiveDate, now: DateTime<Utc>) -> Result<()> {
         info!("going to sleep: reflecting on {date}");
-        self.extract_all(chrono::Duration::days(2)).await?;
+        self.extract_all(Duration::days(2)).await?;
         reflect::read_only_nightly(&self.models, &self.store, &mut self.people, &self.cfg.social, date,
-            Utc::now() - chrono::Duration::days(2)).await?;
+            now - Duration::days(2)).await?;
         let dir = self.cfg.mind_dir().join("life").join("journal");
         if let Some(path) = reflect::write_journal(&self.models, &self.store, self.speaker.l1(), dir, date).await? {
             info!("journal written: {}", path.display());
@@ -217,18 +234,25 @@ impl Bot {
         Ok(())
     }
 
-    pub(super) async fn think(&mut self, now: DateTime<Utc>) -> Result<()> {
-        let gap = chrono::Duration::hours(self.cfg.runtime.heartbeat.proactive_gap_hours);
-        let owner_known = self.owner_ctx().await.is_some();
-        let quiet_since_owner = self.state.last_owner_contact.is_none_or(|t| now - t >= chrono::Duration::hours(1));
-        let may_message_owner = owner_known && quiet_since_owner && self.state.last_proactive.is_none_or(|t| now - t >= gap);
+    fn proactive_due(&self, now: DateTime<Utc>) -> bool {
+        let gap = Duration::hours(self.cfg.runtime.heartbeat.proactive_gap_hours);
+        [self.state.last_owner_contact, self.state.last_proactive, self.last_proactive_check]
+            .into_iter().flatten().all(|t| now - t >= gap)
+    }
+
+    async fn think(&mut self, now: DateTime<Utc>, revisit: bool) -> Result<()> {
+        let may_message_owner = if self.proactive_due(now) {
+            self.last_proactive_check = Some(now);
+            self.owner_ctx().await.is_some()
+        } else {
+            false
+        };
         let startable: Vec<String> = if self.control.jobs().len() >= self.cfg.runtime.hands.max_jobs {
             Vec::new()
         } else {
             self.board().tasks().iter().filter(|t| t.status == TaskStatus::Inbox).map(|t| t.id.clone()).collect()
         };
-        if !may_message_owner && startable.is_empty() && self.state.revisit_at.is_none() {
-            // Nothing he could do anyway; don't spend a call.
+        if !may_message_owner && startable.is_empty() && !revisit {
             return Ok(());
         }
         let s = &self.state;
@@ -238,23 +262,16 @@ impl Bot {
             .map(|t| format!("{} 小时前", (now - t).num_hours()))
             .unwrap_or_else(|| "还没聊过".into());
         let text = format!(
-            "{}\n\n上次和主人说话：{since_owner}\n驱力：社交 {:.2}，好奇 {:.2}，成就感需求 {:.2}，疲惫 {:.2}\n\
+            "{}\n\n上次和主人说话：{since_owner}\n\
              今天花费 ${spent:.3} / ${limit:.2}\n正在做：{}\n\n## 看板\n{}",
-            tail(now.with_timezone(&Local), &s.snapshot(), None, &[]),
-            s.drives.social,
-            s.drives.curiosity,
-            s.drives.competence,
-            s.drives.rest,
+            tail(now.with_timezone(&Local), s.asleep, None, &[]),
             self.running_jobs(),
             self.board().summary(),
         );
         let situation = Situation { text, startable, may_message_owner };
         let d = decide::decide(&self.models, &ProcessingPolicy::Any, self.speaker.l1(), &situation).await?;
         if self.frozen() { return Ok(()) }
-        info!("decide: {} {:?} — {} (deferred: {:?})", d.action, d.target, d.reason, d.deferred);
-        if let Some(m) = &d.mood {
-            self.state.appraise(m.pleasure, m.arousal, m.dominance);
-        }
+        info!("decide: {} {:?} — {}", d.action, d.target, d.reason);
         self.state.revisit_at = decide::parse_revisit(d.revisit_when.as_deref(), now);
         match decide::validate(&d, &situation) {
             Action::Nothing => {}
@@ -262,16 +279,16 @@ impl Bot {
                 let msg = self.start_job(&task_id).await?;
                 info!("{msg}");
             }
-            Action::MessageOwner { reason } => self.reach_out(&reason).await?,
+            Action::MessageOwner => self.reach_out(now, &d.reason).await?,
         }
         Ok(())
     }
 
-    pub(super) async fn reach_out(&mut self, reason: &str) -> Result<()> {
+    async fn reach_out(&mut self, now: DateTime<Utc>, reason: &str) -> Result<()> {
         let Some(ctx) = self.owner_ctx().await else { return Ok(()) };
-        self.state.last_proactive = Some(Utc::now());
-        let body = format!("（没有新消息。你决定主动找主人聊几句，因为：{reason}。自然地开个头；改主意了就只回复 [不发]。）");
-        self.converse_with_options(&ctx, body, 0, false, true).await?;
+        self.state.last_proactive = Some(now);
+        let body = "（没有新消息。现在有空，你想主动找主人聊几句。根据你们最近的聊天和记忆自然地开个头；改主意了就只回复 [不发]。）";
+        self.converse_with_options(&ctx, body.into(), 0, false, true).await?;
         self.audit("me", "reach_out_owner", true, reason, Outcome::Sent).await?;
         Ok(())
     }

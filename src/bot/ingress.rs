@@ -13,7 +13,7 @@ use crate::config::{AclCfg, Config, SessionCfg};
 use crate::control::ControlPlane;
 use crate::error_report::{Fault, OwnerState, notify_state, report};
 use crate::ns::{Audience, Namespace, Scope};
-use crate::social::{bot_flags, floor::FloorDecision, identity::{Who, identify}, skill_lines};
+use crate::social::{floor::FloorDecision, identity::{Who, identify}, skill_lines};
 use crate::store::{MessageRecord, Store};
 use crate::work::research;
 
@@ -304,7 +304,7 @@ impl Bot {
 
     pub(super) async fn on_message(&mut self, mut env: Envelope, batch: &mut ReplyBatch) -> Result<()> {
         let now = Utc::now();
-        let who = self.runtime_identity(&env).await?;
+        let who = self.runtime_identity(&env);
         let group_key = env.group_key();
         if let Some(g) = &group_key {
             if self.cfg.social.ignored_groups.contains(g) {
@@ -326,7 +326,7 @@ impl Bot {
         self.people.observe(&self.store, &env, &who, now).await?;
         self.check_qq_groups(&env, &who).await?;
         let observed_at = env.arrived.and_then(|t| chrono::Duration::from_std(t.elapsed()).ok()).map_or(now, |age| now - age);
-        if !env.notice && let Err(e) = bot_flags::observe(&self.store, &env, &who, observed_at).await {
+        if let Err(e) = self.bot_flags.observe(&self.store, &env, &who, observed_at).await {
             warn!("QQ agent heuristic failed: {e:#}");
         }
 
@@ -382,15 +382,20 @@ impl Bot {
             return Ok(());
         }
 
+        if who.is_owner && !env.is_group {
+            self.store.kv_set("owner_last_chat", json!({"platform": env.platform, "chat_id": env.chat_id})).await?;
+            self.state.talked_with_owner(now);
+        }
+
         // A skill request gets its canned voice line, for anyone, before owner commands or the model.
         // In groups only when he is @'d (or the request replies to him).
-        if (env.mentions_me || !env.is_group) && (who.is_owner || !self.state.energy.asleep)
+        if (env.mentions_me || !env.is_group) && (who.is_owner || !self.state.asleep)
             && let Some(name) = skill_lines::requested(&env.text) {
             if !self.floor.allow_reply(&self.cfg.social, &ctx.key, &who.person_id, who.is_agent, now) {
                 info!("reply cap reached for {} in {}", who.person_id, ctx.key);
                 return Ok(());
             }
-            let reply = skill_lines::reply(&name, now.timestamp_subsec_nanos() as usize);
+            let reply = self.skill_lines.reply(&name, now.timestamp_subsec_nanos() as usize);
             if ctx.is_group {
                 self.floor.spoke(&ctx.key, false, now);
             }
@@ -414,17 +419,13 @@ impl Bot {
             crate::mind::vision::remember(waiting, env.platform, &sender, &env.attachments, tokio::time::Instant::now());
         }
 
-        if who.is_owner && !env.is_group {
-            self.store.kv_set("owner_last_chat", json!({"platform": env.platform, "chat_id": env.chat_id})).await?;
-            self.state.talked_with_owner(now);
-            if owner_command(&self.cfg.acl, &env) {
-                let line = if env.authored_text.trim_start().starts_with('/') { env.authored_text.trim() } else { env.text.trim() };
-                let reply = self.command(line, &ctx, &env).await;
-                return self.send_plain(&ctx, &reply).await;
-            }
+        if who.is_owner && owner_command(&self.cfg.acl, &env) {
+            let line = if env.authored_text.trim_start().starts_with('/') { env.authored_text.trim() } else { env.text.trim() };
+            let reply = self.command(line, &ctx, &env).await;
+            return self.send_plain(&ctx, &reply).await;
         }
 
-        let asleep = self.state.energy.asleep;
+        let asleep = self.state.asleep;
         let line = format!("{}：{spoken}", self.speaker_label(env.platform, &who.person_id, &env.sender_name));
 
         // Store and account for each message first; reply once using the last message's thread.

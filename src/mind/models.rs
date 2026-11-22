@@ -22,7 +22,6 @@ pub struct Models {
     llm: LlmClient,
     store: Store,
     budget: Mutex<Budget>,
-    has_local: bool,
     #[cfg(test)]
     stub: Option<Mutex<Stub>>,
 }
@@ -94,7 +93,6 @@ impl Models {
                 usable.push(m.clone());
             }
         }
-        let has_local = usable.iter().any(|m| m.local);
         let router = Router::new(usable, cfg.scenarios.clone());
         router
             .select("chat", &ProcessingPolicy::Any, false)
@@ -102,7 +100,7 @@ impl Models {
         let budget = Budget::new(cfg.models.daily_budget_usd, store.spent_since(local_midnight_utc()).await?);
         Ok(Models {
             sticker_embedding: cfg.models.sticker_embedding.clone().filter(|e| e.validate().is_ok()),
-            router, llm, store, budget: Mutex::new(budget), has_local,
+            router, llm, store, budget: Mutex::new(budget),
             #[cfg(test)]
             stub: None,
         })
@@ -114,7 +112,7 @@ impl Models {
             sticker_embedding: None,
             router: Router::new(vec![], Default::default()),
             llm: LlmClient::new(Default::default()).unwrap(), store,
-            budget: Mutex::new(Budget::new(1.0, 0.0)), has_local: false,
+            budget: Mutex::new(Budget::new(1.0, 0.0)),
             stub: Some(Mutex::new(Stub { replies: replies.into(), prompts: vec![], cost_usd: 0.0 })),
         }
     }
@@ -153,7 +151,8 @@ impl Models {
         let model = self.pick("caption", policy)?;
         let turns = [Turn::UserParts(super::media::caption_parts(frames))];
         let effort = self.effort("caption");
-        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref(), schema: None };
+        let schema = super::media::caption_schema();
+        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref(), schema: Some(&schema) };
         Ok(self.call_once("caption", &model, &prompt, "caption", None).await?.text)
     }
 
@@ -186,11 +185,6 @@ impl Models {
 
     pub fn router(&self) -> &Router {
         &self.router
-    }
-
-    /// Whether any local model is available.
-    pub fn has_local(&self) -> bool {
-        self.has_local
     }
 
     fn budget(&self) -> std::sync::MutexGuard<'_, Budget> {
@@ -292,17 +286,6 @@ impl Models {
         }
     }
 
-    /// A cheap side call with no retry/escalation; the caller owns the fallback.
-    pub async fn ask_once(&self, scenario: &str, policy: &ProcessingPolicy, system: &str, user: &str) -> Result<String> {
-        #[cfg(test)]
-        if self.stub.is_some() { return self.stub_reply(scenario, policy, user).await }
-        let model = self.pick(scenario, policy)?;
-        let turns = [Turn::User(user.to_string())];
-        let effort = self.effort(scenario);
-        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref(), schema: None };
-        Ok(self.call_once(scenario, &model, &prompt, scenario, None).await?.text)
-    }
-
     /// One-shot call: `system` is the stable prefix (usually L1), `user` the task.
     pub async fn ask(&self, scenario: &str, policy: &ProcessingPolicy, system: &str, user: &str) -> Result<String> {
         #[cfg(test)]
@@ -352,56 +335,6 @@ impl Models {
         parse(&reply.text)
     }
 
-    /// Like `ask`, but the reply must contain a JSON object of shape `T`. A reply that fails the
-    /// check is redone once by the next stronger model.
-    pub async fn ask_json<T: DeserializeOwned>(
-        &self,
-        scenario: &str,
-        policy: &ProcessingPolicy,
-        system: &str,
-        user: &str,
-    ) -> Result<T> {
-        self.ask_json_with_limit(scenario, policy, system, user, None).await
-    }
-
-    /// Limited background calls never retry or escalate outside the caller's spend check.
-    pub async fn ask_json_with_limit<T: DeserializeOwned>(
-        &self,
-        scenario: &str,
-        policy: &ProcessingPolicy,
-        system: &str,
-        user: &str,
-        limit: Option<SpendLimit>,
-    ) -> Result<T> {
-        if let Some(limit) = limit && limit.exhausted(&self.store).await? {
-            return Err(super::router::BudgetDenied("read-only reflection cost budget exhausted".into()).into());
-        }
-        #[cfg(test)]
-        if self.stub.is_some() {
-            return extract_json(&self.stub_reply(scenario, policy, user).await?);
-        }
-        if limit.is_some() {
-            return extract_json(&self.ask_once(scenario, policy, system, user).await?);
-        }
-        let model = self.pick(scenario, policy)?;
-        let turns = [Turn::User(user.to_string())];
-        let effort = self.effort(scenario);
-        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref(), schema: None };
-        let (reply, used) = self.run(scenario, policy, &model.id, &prompt, scenario).await?;
-        match extract_json(&reply.text) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                let next = self
-                    .router
-                    .next_stronger(scenario, policy, &used)
-                    .cloned()
-                    .ok_or_else(|| e.context(format!("`{used}` returned unusable JSON and nothing stronger is available")))?;
-                warn!("`{used}` returned unusable JSON; redoing with `{}`", next.id);
-                let reply = self.call_once(scenario, &next, &prompt, scenario, Some(&used)).await?;
-                extract_json(&reply.text)
-            }
-        }
-    }
 }
 
 #[cfg(test)]

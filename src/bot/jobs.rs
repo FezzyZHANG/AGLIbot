@@ -94,12 +94,11 @@ impl Bot {
         } else if o.clarification.is_some() { "等待主人澄清" } else if o.ok { "" } else { "出错，等主人看" };
         self.board().set_status(&o.task_id, status, note)?;
         self.audit("owner", "delegate_result", true, &o.task_id, if o.ok { Outcome::Sent } else { Outcome::Failed }).await?;
-        self.state.finished_work();
         reflect::note_today(&self.store, &format!("做了 {elapsed_minutes} 分钟：{}（{}）", o.title, if o.status() == TaskStatus::Done { "完成" } else { "没做完" })).await?;
         self.push_urgent().await?;
         // A watchdog pause has its own persisted review alert, including the reason and id.
         if o.ok || o.paused.is_none() || o.verdict.is_none() {
-            if self.state.energy.asleep {
+            if self.state.asleep {
                 self.deliveries.push(o);
             } else {
                 self.deliver(o).await?;

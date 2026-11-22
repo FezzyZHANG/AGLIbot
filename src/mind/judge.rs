@@ -8,8 +8,9 @@
 use anyhow::Result;
 use chrono::Utc;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use super::llm::JsonSchema;
 use super::models::{Models, SpendLimit};
 use crate::ns::ProcessingPolicy;
 use crate::store::{NewReview, ReviewCategory, ReviewItem, ReviewStatus, Store};
@@ -62,6 +63,23 @@ struct Raw {
     urgent: bool,
 }
 
+fn judge_schema() -> JsonSchema {
+    JsonSchema {
+        name: "judgement",
+        schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["verdict", "reasons", "fixes", "urgent"],
+            "properties": {
+                "verdict": {"type": "string", "enum": ["通过", "修改后再审", "暂缓", "转交主人"]},
+                "reasons": {"type": "string"},
+                "fixes": {"type": "string"},
+                "urgent": {"type": "boolean"}
+            }
+        }),
+    }
+}
+
 fn checklist(category: ReviewCategory) -> &'static str {
     match category {
         ReviewCategory::Verify => {
@@ -75,18 +93,6 @@ fn checklist(category: ReviewCategory) -> &'static str {
         }
         ReviewCategory::Evolve => "修改影响：改了什么、为什么、测试证据是否充分、能否回滚；是否触碰边界或权限配置。",
     }
-}
-
-/// Ask the reviewer model. `evidence` should already contain rule/test/execution results.
-#[allow(dead_code)] // Phase 2/3 cleanup
-pub async fn review(models: &Models, category: ReviewCategory, subject: &str, evidence: &str) -> Result<Judgement> {
-    review_with_limit(models, category, subject, evidence, None).await
-}
-
-#[allow(dead_code)] // Phase 2/3 cleanup
-pub async fn review_with_limit(models: &Models, category: ReviewCategory, subject: &str, evidence: &str, limit: Option<SpendLimit>) -> Result<Judgement> {
-    let scenario = if category == ReviewCategory::Evolve { "evolve" } else { "verify" };
-    review_scenario(models, scenario, category, subject, evidence, limit).await
 }
 
 /// Background work has a separately pinned reviewer and shares the ordinary budget.
@@ -107,7 +113,7 @@ async fn review_scenario(models: &Models, scenario: &str, category: ReviewCatego
         checklist(category)
     );
     // If no reviewer is available or it fails, the item goes to the owner instead of through.
-    match models.ask_json_with_limit::<Raw>(scenario, &ProcessingPolicy::Any, system, &user, limit).await {
+    match models.ask_structured_with_limit::<Raw>(scenario, &ProcessingPolicy::Any, system, &user, &judge_schema(), limit).await {
         Ok(raw) => Ok(Judgement { verdict: Verdict::parse(&raw.verdict), reasons: raw.reasons, fixes: raw.fixes, urgent: raw.urgent }),
         Err(e) => {
             if !e.is::<super::router::BudgetDenied>() {
@@ -191,15 +197,15 @@ pub fn deadline_today(text: &str, today: chrono::NaiveDate) -> bool {
     day && deadline
 }
 
-/// Pending items plus urgent alerts (even if already resolved); marks them digest-notified.
-pub async fn digest(store: &Store) -> Result<Option<String>> {
-    let mut fresh: Vec<ReviewItem> =
+/// Pending items plus urgent alerts (even if already resolved).
+pub async fn build_digest(store: &Store) -> Result<Option<(String, Vec<u64>)>> {
+    let fresh: Vec<ReviewItem> =
         store.reviews().await?.into_iter().filter(|r| !r.notified && (r.status == ReviewStatus::Open || r.pushed)).collect();
     if fresh.is_empty() {
         return Ok(None);
     }
     let mut out = String::from("今天的待决事项与已发提醒：\n");
-    for r in &mut fresh {
+    for r in &fresh {
         let sent = if r.pushed { "（已单独推送）" } else { "" };
         let status = match r.status {
             ReviewStatus::Approved => "（已批准）",
@@ -208,11 +214,13 @@ pub async fn digest(store: &Store) -> Result<Option<String>> {
             ReviewStatus::Open => "",
         };
         out.push_str(&format!("\n#{} [{:?}] {}{}{}\n  {}\n  审查：{}\n", r.id, r.category, r.subject, sent, status, r.detail, r.verdict));
-        r.notified = true;
-        store.save_review(r).await?;
     }
     out.push_str("\n未决事项回复 /approve 编号 或 /reject 编号 理由。");
-    Ok(Some(out))
+    Ok(Some((out, fresh.into_iter().map(|r| r.id).collect())))
+}
+
+pub async fn mark_notified(store: &Store, ids: &[u64]) -> Result<()> {
+    store.mark_reviews_notified(ids).await
 }
 
 #[cfg(test)]
@@ -248,7 +256,7 @@ mod tests {
             assert_eq!(faults, expected);
         }
         let limit = SpendLimit::start(&store, 0.0).await.unwrap();
-        let (j, faults) = capture(review_with_limit(&models, ReviewCategory::Verify, "subject", "evidence", Some(limit))).await;
+        let (j, faults) = capture(review_scenario(&models, "verify", ReviewCategory::Verify, "subject", "evidence", Some(limit))).await;
         assert_eq!(j.unwrap().verdict, Verdict::Owner);
         assert!(faults.is_empty());
     }
@@ -261,7 +269,7 @@ mod tests {
             r#"{"verdict":"转交主人"}"#.into(),
         ]);
         for expected in [true, false] {
-            let j = review(&models, ReviewCategory::Act, "subject", "evidence").await.unwrap();
+            let j = review_scenario(&models, "verify", ReviewCategory::Act, "subject", "evidence", None).await.unwrap();
             let item = file(&store, ReviewCategory::Act, "subject", "detail", &j, false, Value::Null).await.unwrap();
             assert_eq!(item.urgent, expected);
             assert!(!item.pushed && !item.notified);
@@ -275,11 +283,13 @@ mod tests {
         item.pushed = true;
         item.status = ReviewStatus::Approved;
         reopened.save_review(&item).await.unwrap();
-        let digest = digest(&reopened).await.unwrap().unwrap();
+        let (digest, ids) = build_digest(&reopened).await.unwrap().unwrap();
         assert!(digest.contains("#1 [Act] subject（已单独推送）"));
         assert!(digest.contains("（已批准）"));
         assert!(digest.contains("#2 [Act] subject\n"));
-        assert!(super::digest(&reopened).await.unwrap().is_none());
+        assert_eq!(build_digest(&reopened).await.unwrap(), Some((digest, ids.clone())));
+        mark_notified(&reopened, &ids).await.unwrap();
+        assert!(build_digest(&reopened).await.unwrap().is_none());
         let mut legacy = serde_json::to_value(&item).unwrap();
         legacy.as_object_mut().unwrap().remove("urgent");
         legacy.as_object_mut().unwrap().remove("pushed");

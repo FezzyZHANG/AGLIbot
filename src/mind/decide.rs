@@ -5,19 +5,11 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, Local, NaiveTime, TimeZone, Utc};
 use serde::Deserialize;
+use serde_json::json;
 
+use super::llm::JsonSchema;
 use super::models::Models;
 use crate::ns::ProcessingPolicy;
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MoodShift {
-    #[serde(default)]
-    pub pleasure: f64,
-    #[serde(default)]
-    pub arousal: f64,
-    #[serde(default)]
-    pub dominance: f64,
-}
 
 /// The few checkable fields `decide` may return.
 #[derive(Debug, Clone, Deserialize)]
@@ -27,20 +19,15 @@ pub struct Decision {
     pub target: Option<String>,
     #[serde(default)]
     pub reason: String,
-    #[serde(default)]
-    pub deferred: Vec<String>,
     /// Minutes from now (`"90"`) or a local clock time (`"21:30"`).
     #[serde(default)]
     pub revisit_when: Option<String>,
-    /// Optional appraisal of how the situation makes him feel.
-    #[serde(default)]
-    pub mood: Option<MoodShift>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Nothing,
-    MessageOwner { reason: String },
+    MessageOwner,
     Work { task_id: String },
 }
 
@@ -78,6 +65,38 @@ pub struct Reflection {
     pub reason: String,
 }
 
+fn decide_schema() -> JsonSchema {
+    JsonSchema {
+        name: "decision",
+        schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "target", "reason", "revisit_when"],
+            "properties": {
+                "action": {"type": "string", "enum": ["nothing", "message", "work"]},
+                "target": {"type": ["string", "null"]},
+                "reason": {"type": "string"},
+                "revisit_when": {"type": ["string", "null"]}
+            }
+        }),
+    }
+}
+
+fn reflect_schema() -> JsonSchema {
+    JsonSchema {
+        name: "reflection",
+        schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "reason"],
+            "properties": {
+                "action": {"type": "string", "enum": ["continue", "merge", "switch", "exit"]},
+                "reason": {"type": "string"}
+            }
+        }),
+    }
+}
+
 /// A side call using the same cheap routing and JSON validation as action selection.
 pub async fn reflect(models: &Models, policy: &ProcessingPolicy, l1: &str, situation: &str) -> Result<Reflection> {
     let user = format!(
@@ -87,7 +106,7 @@ pub async fn reflect(models: &Models, policy: &ProcessingPolicy, l1: &str, situa
          主人补充是 urgent 输入，但不一定需要切换；根据内容选择。仅输出 JSON：\
          {{\"action\":\"continue|merge|switch|exit\",\"reason\":\"一句话理由\"}}"
     );
-    models.ask_json("triage", policy, l1, &user).await
+    models.ask_structured("triage", policy, l1, &user, &reflect_schema()).await
 }
 
 pub async fn decide(models: &Models, policy: &ProcessingPolicy, l1: &str, s: &Situation) -> Result<Decision> {
@@ -101,19 +120,18 @@ pub async fn decide(models: &Models, policy: &ProcessingPolicy, l1: &str, s: &Si
     let user = format!(
         "（这不是聊天消息，是你自己在想接下来做什么。）\n\n{}\n\n## 可选的行动\n{}\n\n\
          像一个真实的人那样选：不必每次都做点什么，也可以推迟。\
-         只输出一个 JSON 对象：{{\"action\": \"...\", \"target\": \"...或 null\", \"reason\": \"一句话\", \
-         \"deferred\": [\"暂时放下的事\"], \"revisit_when\": \"多少分钟后再想，或 HH:MM，或 null\", \
-         \"mood\": {{\"pleasure\": 0, \"arousal\": 0, \"dominance\": 0}}}}。mood 是这些情况让你心情变化的幅度（-0.3 到 0.3）。",
+         只输出一个 JSON 对象：{{\"action\": \"...\", \"target\": null, \"reason\": \"一句话\", \"revisit_when\": null}}。\
+         没有行动目标时 target 为 null。revisit_when 用字符串写多少分钟后再想或本地时间 HH:MM，无需再想就用 null。",
         s.text,
         options.iter().map(|o| format!("- {o}")).collect::<Vec<_>>().join("\n")
     );
-    models.ask_json("triage", policy, l1, &user).await
+    models.ask_structured("triage", policy, l1, &user, &decide_schema()).await
 }
 
 /// Turn the model's choice into something the runtime is willing to do.
 pub fn validate(d: &Decision, s: &Situation) -> Action {
     match d.action.trim() {
-        "message" if s.may_message_owner => Action::MessageOwner { reason: d.reason.clone() },
+        "message" if s.may_message_owner => Action::MessageOwner,
         "work" => match d.target.as_deref().map(str::trim) {
             Some(t) if s.startable.iter().any(|id| id == t) => Action::Work { task_id: t.to_string() },
             _ => Action::Nothing,
@@ -145,9 +163,7 @@ mod tests {
             action: action.into(),
             target: target.map(String::from),
             reason: "r".into(),
-            deferred: vec![],
             revisit_when: None,
-            mood: None,
         }
     }
 
@@ -159,7 +175,7 @@ mod tests {
         assert_eq!(validate(&decision("work", Some("t1")), &s), Action::Work { task_id: "t1".into() });
         assert_eq!(validate(&decision("launch rockets", None), &s), Action::Nothing);
         let s = Situation { may_message_owner: true, ..s };
-        assert!(matches!(validate(&decision("message", Some("owner")), &s), Action::MessageOwner { .. }));
+        assert_eq!(validate(&decision("message", Some("owner")), &s), Action::MessageOwner);
     }
 
     #[test]

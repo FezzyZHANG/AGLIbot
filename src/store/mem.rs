@@ -202,6 +202,16 @@ impl MemStore {
         Ok(())
     }
 
+    pub fn mark_reviews_notified(&self, ids: &[u64]) -> Result<()> {
+        let mut data = self.write()?;
+        for id in ids {
+            if let Some(review) = data.reviews.get_mut(id) {
+                review.notified = true;
+            }
+        }
+        Ok(())
+    }
+
     pub fn kv_get(&self, key: &str) -> Result<Option<Value>> {
         Ok(self.read()?.kv.get(key).cloned())
     }
@@ -209,6 +219,10 @@ impl MemStore {
     pub fn kv_set(&self, key: &str, value: Value) -> Result<()> {
         self.write()?.kv.insert(key.into(), value);
         Ok(())
+    }
+
+    pub fn kv_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self.read()?.kv.keys().filter(|key| key.starts_with(prefix)).cloned().collect())
     }
 
     pub fn lexicon(&self) -> Result<Vec<Value>> {

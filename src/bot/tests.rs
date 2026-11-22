@@ -6,7 +6,7 @@ use crate::config::{AclCfg, SessionCfg};
 use crate::error_report::OwnerState;
 use crate::mind::{judge, reflect, speak::SayTurn};
 use crate::store::{MessageRecord, ReviewCategory, ReviewStatus};
-use chrono::DateTime;
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone};
 use crate::work::{board::{TaskKind, TaskStatus, ThreadRef}, research::Job};
 use serde_json::{Value, json};
 use super::commands::attach_followups;
@@ -395,7 +395,7 @@ impl TestBot {
         let models = Arc::new(Models::new(&cfg, store.clone()).await.unwrap());
         let (tx, _) = mpsc::channel(16);
         let mut bot = Bot::new_with_default_control(Arc::new(cfg), store, models, Outlets::default(), tx).await.unwrap();
-        bot.state.energy.asleep = false;
+        bot.state.asleep = false;
         Self { bot, dir }
     }
 }
@@ -438,7 +438,7 @@ async fn qq_candidate_approval_applies_agent_routing_and_rejection_is_durable() 
     let text = a.run_command("/approve", &approved.to_string(), &ctx).await.unwrap();
     assert!(text.contains("config/acl.yaml") && text.contains("known_agents"));
     a.run_command("/reject", &format!("{rejected} 是人"), &ctx).await.unwrap();
-    assert!(a.runtime_identity(&group("7")).await.unwrap().is_agent);
+    assert!(a.runtime_identity(&group("7")).is_agent);
     a.test_chat = Some(TestChat::new(&["你好"], &[Outcome::Sent]));
     for _ in 0..2 {
         let mut env = group("7"); env.mentions_me = true;
@@ -447,7 +447,7 @@ async fn qq_candidate_approval_applies_agent_routing_and_rejection_is_durable() 
     assert_eq!(a.test_chat.as_ref().unwrap().turns.len(), 1);
     let reopened = a.store.clone();
     let mut restarted = Bot::new_with_default_control(a.cfg.clone(), reopened, a.models.clone(), Outlets::default(), a.events.clone()).await.unwrap();
-    assert!(restarted.runtime_identity(&group("7")).await.unwrap().is_agent);
+    assert!(restarted.runtime_identity(&group("7")).is_agent);
     for _ in 0..8 {
         let mut env = group("8"); env.chat_id = "group:readonly".into();
         restarted.on_messages(vec![env]).await.unwrap();
@@ -764,6 +764,9 @@ async fn parallel_slots_owner_extra_and_commands() {
     assert!(a.start_job_with_owner_slot("fourth", true).await.unwrap().contains("槽位已满"));
     let status = a.run_command("/status", "", &ctx).await.unwrap();
     for id in [&first.id, &second.id, &next.id] { assert!(status.contains(id)); }
+    assert!(status.starts_with("状态：清醒\n今日花费"));
+    a.state.asleep = true;
+    assert!(a.run_command("/status", "", &ctx).await.unwrap().starts_with("状态：睡觉中\n"));
     a.stop_jobs().await;
 }
 
@@ -772,7 +775,7 @@ async fn owner_extra_slot_stays_available_after_a_job_finishes() {
     let mut test = TestBot::new("slots-after-completion").await;
     let a = &mut test.bot;
     Arc::get_mut(&mut a.cfg).unwrap().runtime.hands.max_jobs = 2;
-    a.state.energy.asleep = true;
+    a.state.asleep = true;
     let first = start_slot(a, false).await;
     let background = start_slot(a, false).await;
     a.control.jobs().stop_one(&first.id).await.unwrap();
@@ -811,7 +814,7 @@ async fn parallel_completions_remove_their_own_jobs_and_deliver_once() {
         let mut test = TestBot::new(&format!("slots-complete-{background_first}")).await;
         let a = &mut test.bot;
         Arc::get_mut(&mut a.cfg).unwrap().runtime.hands.max_jobs = 2;
-        a.state.energy.asleep = true;
+        a.state.asleep = true;
         let first = start_slot(a, false).await;
         let second = start_slot(a, false).await;
         let order = if background_first { [&second, &first] } else { [&first, &second] };
@@ -844,7 +847,7 @@ async fn parallel_watchdog_times_out_jobs_individually() {
     let mut test = TestBot::new("slots-watchdog").await;
     let a = &mut test.bot;
     Arc::get_mut(&mut a.cfg).unwrap().runtime.hands.max_jobs = 2;
-    a.state.energy.asleep = true;
+    a.state.asleep = true;
     let first = start_slot(a, false).await;
     tokio::time::advance(Duration::from_secs(10 * 60)).await;
     let second = start_slot(a, false).await;
@@ -870,7 +873,7 @@ fn spawn_test_job(
 fn fake_job(a: &mut Bot) -> crate::work::board::Task {
     let task = a.board().add("watchdog", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
     spawn_test_job(a, &task, a.events.clone(), std::future::pending());
-    a.state.energy.asleep = true;
+    a.state.asleep = true;
     task
 }
 
@@ -879,7 +882,7 @@ async fn work_review_verdicts_and_late_followups_survive_completion_and_reload()
     use crate::store::ReviewStatus;
     let mut test = TestBot::new("review-completion").await;
     let a = &mut test.bot;
-    a.state.energy.asleep = true;
+    a.state.asleep = true;
     for kind in [TaskKind::Research, TaskKind::Code] {
         for case in ["pass", "revise", "defer", "owner", "late-followup"] {
             let title = format!("{kind:?}-{case}");
@@ -924,7 +927,7 @@ async fn work_review_verdicts_and_late_followups_survive_completion_and_reload()
             if expected == TaskStatus::Waiting {
                 assert_eq!(last.status, ReviewStatus::Open);
                 assert!(saved.note.contains("/run") && saved.note.contains("具体修改意见"));
-                assert!(judge::digest(&store).await.unwrap().unwrap().contains(&title));
+                assert!(judge::build_digest(&store).await.unwrap().unwrap().0.contains(&title));
             } else {
                 assert_eq!(last.status, ReviewStatus::Closed);
             }
@@ -943,7 +946,7 @@ async fn resumed_passing_work_settles_only_its_automatic_revision_requests() {
     use crate::store::ReviewStatus;
     let mut test = TestBot::new("superseded-work-review").await;
     let a = &mut test.bot;
-    a.state.energy.asleep = true;
+    a.state.asleep = true;
     Arc::get_mut(&mut a.cfg).unwrap().runtime.hands.research = crate::config::DelegateTool::Off;
     let task = a.board().add("revised report", TaskKind::Research, "owner", TaskStatus::Waiting, None).unwrap();
     let mut old = Vec::new();
@@ -976,7 +979,7 @@ async fn resumed_passing_work_settles_only_its_automatic_revision_requests() {
             assert_eq!(saved.status, ReviewStatus::Open);
         }
     }
-    let digest = judge::digest(&store).await.unwrap().unwrap();
+    let (digest, _) = judge::build_digest(&store).await.unwrap().unwrap();
     assert!(!digest.contains(&format!("#{} [", old[0].id)) && !digest.contains(&format!("#{} [", old[1].id)));
     assert!(digest.contains(&format!("#{} [", old[2].id)) && digest.contains(&format!("#{} [", old[3].id)));
 }
@@ -1104,7 +1107,7 @@ async fn watchdog_leaves_completed_and_pending_completion_events_alone() {
         assert!(a.deliveries.is_empty());
         if blocked_send { assert!(matches!(rx.recv().await, Some(Event::Tick))) }
         let Some(Event::JobDone(o)) = rx.recv().await else { panic!("lost completion") };
-        a.state.energy.asleep = true;
+        a.state.asleep = true;
         a.on_job_done(o).await.unwrap();
         a.watchdog().await.unwrap();
         assert!(a.control.jobs().is_empty());
@@ -1151,13 +1154,13 @@ async fn wake(a: &mut Bot) {
     cfg.runtime.routine.sleep_at = (now + chrono::Duration::hours(2)).with_timezone(&Local).time();
     cfg.runtime.routine.wake_at = (now + chrono::Duration::hours(3)).with_timezone(&Local).time();
     cfg.runtime.memory.extract_after = usize::MAX;
-    a.state.energy.asleep = true;
+    a.state.asleep = true;
     a.state.last_tick = Some(now);
     a.state.last_digest = Some(now.with_timezone(&Local).date_naive());
     a.state.revisit_at = None;
     a.wake_decide = false;
     a.on_tick().await.unwrap();
-    assert!(!a.state.energy.asleep);
+    assert!(!a.state.asleep);
 }
 
 #[tokio::test]
@@ -1176,7 +1179,7 @@ async fn urgent_relay_pushes_immediately_while_frozen_and_only_once() {
     assert_eq!(sent.len(), 2); // One owner alert, one reply to the sender; no tick needed.
     assert!(sent[0].contains("有件急事") && sent[0].contains("#1"));
     assert_eq!(sent[1], "收到。");
-    assert!(judge::digest(&a.store).await.unwrap().unwrap().contains("已单独推送"));
+    assert!(judge::build_digest(&a.store).await.unwrap().unwrap().0.contains("已单独推送"));
     a.relay_request("telegram:7", "下周截止").await.unwrap();
     assert!(!a.store.reviews().await.unwrap()[1].urgent);
 }
@@ -1189,7 +1192,7 @@ async fn urgent_alerts_wait_for_owner_route_and_wake_and_do_not_retry_failed_sen
     a.push_urgent().await.unwrap(); // No route: do not claim the item.
     a.store.kv_set("owner_last_chat", json!({"platform":"telegram", "chat_id":"42"})).await.unwrap();
     a.control.set_frozen(&a.store, true).await.unwrap();
-    a.state.energy.asleep = true;
+    a.state.asleep = true;
     a.test_chat = Some(TestChat::new(&[], &[Outcome::Sent, Outcome::Unknown]));
     a.push_urgent().await.unwrap();
     assert!(!a.store.reviews().await.unwrap()[0].pushed);
@@ -1205,49 +1208,111 @@ async fn urgent_alerts_wait_for_owner_route_and_wake_and_do_not_retry_failed_sen
     let items = reopened.reviews().await.unwrap();
     assert!(items[0].pushed && !items[1].pushed);
     assert_eq!(a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().len(), 2);
-    let digest = judge::digest(&reopened).await.unwrap().unwrap();
+    let (digest, _) = judge::build_digest(&reopened).await.unwrap().unwrap();
     assert!(digest.contains("#1") && digest.contains("#2"));
     assert_eq!(digest.matches("已单独推送").count(), 1);
 }
 
 #[tokio::test]
-async fn replied_conversations_appraise_once_per_tick_and_skip_read_only_groups() {
-    let mut test = TestBot::new("appraisal-tick").await;
+async fn proactive_checks_wait_for_the_gap_and_keep_decision_reason_out_of_chat() {
+    let mut test = TestBot::new("proactive-tick").await;
     let a = &mut test.bot;
+    let canary = "internal-decision-reason-canary";
     a.models = Arc::new(Models::stub(a.store.clone(), vec![
-        r#"{"dp":0.03,"da":0.02,"dd":-0.01,"why":"friendly conversation"}"#.into(),
+        json!({"action":"nothing","target":null,"reason":"quiet","revisit_when":null}).to_string(),
+        json!({"action":"message","target":"owner","reason":canary,"revisit_when":null}).to_string(),
     ]));
-    a.test_chat = Some(TestChat::new(&["hello", "hi", "[沉默]", "failed"], &[Outcome::Sent, Outcome::Sent, Outcome::Failed]));
-    a.control.set_frozen(&a.store, true).await.unwrap();
-    let before = (a.state.mood.pleasure, a.state.mood.arousal, a.state.mood.dominance);
-    a.on_messages(vec![private_message("7", "private input")]).await.unwrap();
-    a.on_messages(group_messages(&["allowed input"], true)).await.unwrap();
-    a.on_messages(vec![private_message("8", "silent input")]).await.unwrap();
-    assert!(a.on_messages(vec![private_message("9", "failed input")]).await.is_err());
-    let mut readonly = group_messages(&["readonly input"], true);
-    readonly[0].chat_id = "-8".into();
-    a.on_messages(readonly).await.unwrap();
+    a.test_chat = Some(TestChat::new(&["你好。"], &[Outcome::Sent]));
+    Arc::make_mut(&mut a.cfg).runtime.heartbeat.proactive_gap_hours = 1;
+    a.store.kv_set("owner_last_chat", json!({"platform":"telegram","chat_id":"42"})).await.unwrap();
+    let now = Local.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap().with_timezone(&Utc);
+    a.state.talked_with_owner(now);
+    a.on_tick_at(now + ChronoDuration::minutes(59)).await.unwrap();
     assert!(a.models.stub_prompts().is_empty());
-    wake(a).await;
-    let prompts = a.models.stub_prompts();
-    assert_eq!(prompts.len(), 1);
-    assert_eq!(prompts[0].0, "triage");
-    assert!(prompts[0].2.contains("private input") && prompts[0].2.contains("allowed input"));
-    for excluded in ["readonly input", "silent input", "failed input"] {
-        assert!(!prompts[0].2.contains(excluded));
-    }
-    assert!((a.state.mood.pleasure - before.0 - 0.03).abs() < 1e-6);
-    assert!((a.state.mood.arousal - before.1 - 0.02).abs() < 1e-6);
-    assert!((a.state.mood.dominance - before.2 + 0.01).abs() < 1e-6);
-    wake(a).await;
+    a.on_tick_at(now + ChronoDuration::hours(1)).await.unwrap();
+    a.on_tick_at(now + ChronoDuration::minutes(61)).await.unwrap();
     assert_eq!(a.models.stub_prompts().len(), 1);
+    let proactive_at = now + ChronoDuration::hours(2);
+    a.on_tick_at(proactive_at).await.unwrap();
+    assert_eq!(a.models.stub_prompts().len(), 2);
+    assert_eq!(a.state.last_proactive, Some(proactive_at));
+    let chat = a.test_chat.as_ref().unwrap();
+    assert_eq!(chat.turns.len(), 1);
+    let (key, prompt, frame) = &chat.turns[0];
+    assert_eq!(key, "telegram:42");
+    assert!(prompt.contains("根据你们最近的聊天和记忆自然地开个头"));
+    assert!(!prompt.contains(canary) && !frame.contains(canary));
+    assert_eq!(*chat.sent_texts.lock().unwrap(), ["你好。"]);
+    assert!(a.store.audits().await.unwrap().iter().any(|record| record.tool == "reach_out_owner" && record.reason == canary));
+    a.last_proactive_check = None;
+    a.on_tick_at(proactive_at + ChronoDuration::minutes(1)).await.unwrap();
+    assert_eq!(a.models.stub_prompts().len(), 2);
+}
+
+#[tokio::test]
+async fn daily_digest_preserves_pending_items_until_delivered() {
+    let mut test = TestBot::new("digest-retry").await;
+    let a = &mut test.bot;
+    a.relay_request("telegram:7", "请审查这项请求。").await.unwrap();
+    let now = Local.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap().with_timezone(&Utc);
+    Arc::make_mut(&mut a.cfg).runtime.judge.digest_at = now.with_timezone(&Local).time();
+    a.maybe_digest(now).await.unwrap();
+    assert_eq!(a.state.last_digest, None);
+    assert!(!a.store.reviews().await.unwrap()[0].notified);
+
+    a.store.kv_set("owner_last_chat", json!({"platform":"telegram","chat_id":"42"})).await.unwrap();
+    a.maybe_digest(now).await.unwrap(); // No outlet is connected.
+    assert_eq!(a.state.last_digest, None);
+    assert!(!a.store.reviews().await.unwrap()[0].notified);
+
+    a.test_chat = Some(TestChat::new(&[], &[Outcome::Sent]));
+    a.maybe_digest(now).await.unwrap();
+    a.maybe_digest(now).await.unwrap();
+    assert_eq!(a.state.last_digest, Some(now.with_timezone(&Local).date_naive()));
+    assert!(a.store.reviews().await.unwrap()[0].notified);
+    let chat = a.test_chat.as_ref().unwrap();
+    let sent = chat.sent_texts.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].contains("请审查这项请求。"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn nightly_reflection_retries_on_later_sleep_ticks_at_most_three_times_per_diary_day() {
+    let mut test = TestBot::new("nightly-retry").await;
+    let a = &mut test.bot;
+    let now = Local.with_ymd_and_hms(2026, 11, 2, 2, 0, 0).unwrap().with_timezone(&Utc);
+    let day = reflect::diary_day(now.with_timezone(&Local));
+    let key = format!("read_only_reflect:{day}");
+    a.store.kv_set(&key, json!("cannot decode nightly usage")).await.unwrap();
+    assert!(a.on_tick_at(now).await.is_err());
+    assert!(a.state.asleep);
+    assert_eq!(a.state.last_reflect, None);
+
+    let empty_usage = json!({"messages":0,"cost_usd":0.0});
+    a.store.kv_set(&key, empty_usage.clone()).await.unwrap();
+    a.on_tick_at(now + ChronoDuration::minutes(29)).await.unwrap();
+    assert_eq!(a.state.last_reflect, None);
+    a.on_tick_at(now + ChronoDuration::minutes(30)).await.unwrap();
+    assert_eq!(a.state.last_reflect, Some(day));
+    assert_eq!(a.nightly_retry, None);
+
+    let next = now + ChronoDuration::days(1);
+    let next_day = reflect::diary_day(next.with_timezone(&Local));
+    let key = format!("read_only_reflect:{next_day}");
+    a.store.kv_set(&key, json!("cannot decode nightly usage")).await.unwrap();
+    for minutes in [0, 30, 60] {
+        assert!(a.on_tick_at(next + ChronoDuration::minutes(minutes)).await.is_err());
+    }
+    a.store.kv_set(&key, empty_usage).await.unwrap();
+    a.on_tick_at(next + ChronoDuration::minutes(90)).await.unwrap();
+    assert_eq!(a.state.last_reflect, Some(day));
 }
 
 #[tokio::test]
 async fn overnight_list_survives_restart_in_first_message_order() {
     let mut test = TestBot::new("overnight-restart").await;
     let a = &mut test.bot;
-    a.state.energy.asleep = true;
+    a.state.asleep = true;
     for sender in ["8", "7", "8"] {
         assert!(!a.prepare_messages(vec![private_message(sender, "overnight")]).await.speak);
     }
@@ -1263,7 +1328,7 @@ async fn overnight_list_survives_restart_in_first_message_order() {
     let (tx, _) = mpsc::channel(16);
     test.bot = Bot::new_with_default_control(cfg, store, models, Outlets::default(), tx).await.unwrap();
     let a = &mut test.bot;
-    assert!(a.state.energy.asleep);
+    assert!(a.state.asleep);
     let chats = a.overnight_chats().await.unwrap();
     assert_eq!(chats.iter().map(|c| c.chat_id.as_str()).collect::<Vec<_>>(), ["8", "7", "9"]);
     assert!(chats[2].is_agent);
@@ -1286,7 +1351,7 @@ async fn overnight_wake_selects_unanswered_chat_messages_with_original_privacy()
     for (text, outgoing) in [("old question", false), ("last answer", true), ("unanswered before sleep", false)] {
         a.store.append_message(&private_record("7", "7", text, outgoing)).await.unwrap();
     }
-    a.state.energy.asleep = true;
+    a.state.asleep = true;
     for i in 0..12 {
         a.prepare_messages(vec![private_message("7", &format!("night-{i}"))]).await;
     }
@@ -1326,7 +1391,7 @@ async fn overnight_wake_selects_unanswered_chat_messages_with_original_privacy()
 async fn overnight_frozen_and_disabled_private_chats_keep_the_list() {
     let mut test = TestBot::new("overnight-frozen").await;
     let a = &mut test.bot;
-    a.state.energy.asleep = true;
+    a.state.asleep = true;
     a.prepare_messages(vec![private_message("7", "pending")]).await;
     let saved = a.store.kv_get(OVERNIGHT_CHATS).await.unwrap();
     a.test_chat = Some(TestChat::new(&["[沉默]"], &[]));
@@ -1348,7 +1413,7 @@ async fn overnight_frozen_and_disabled_private_chats_keep_the_list() {
 async fn overnight_respects_human_and_agent_caps_and_current_owner_identity() {
     let mut test = TestBot::new("overnight-caps").await;
     let a = &mut test.bot;
-    a.state.energy.asleep = true;
+    a.state.asleep = true;
     for sender in ["7", "8", "9", "10"] {
         let mut env = private_message(sender, "pending");
         env.sender_is_bot = sender == "8";
@@ -1375,7 +1440,7 @@ async fn overnight_respects_human_and_agent_caps_and_current_owner_identity() {
 async fn overnight_clears_only_completed_turns_and_retries_failures_next_wake() {
     let mut test = TestBot::new("overnight-completion").await;
     let a = &mut test.bot;
-    a.state.energy.asleep = true;
+    a.state.asleep = true;
     for sender in ["6", "7", "8", "9", "10"] {
         a.prepare_messages(vec![private_message(sender, "pending question")]).await;
     }
@@ -1402,7 +1467,7 @@ async fn overnight_clears_only_completed_turns_and_retries_failures_next_wake() 
 async fn reflection_switch_parks_work_and_wakes_the_mind_without_failure() {
     let mut test = TestBot::new("reflection-switch").await;
     let a = &mut test.bot;
-    a.state.energy.asleep = true; // Queue delivery without a model or network call.
+    a.state.asleep = true; // Queue delivery without a model or network call.
     let task = a.board().add("研究版本", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
     spawn_test_job(a, &task, a.events.clone(), std::future::pending());
     let reason = "先处理主人的紧急事务";
@@ -1428,7 +1493,7 @@ async fn reflection_switch_parks_work_and_wakes_the_mind_without_failure() {
 async fn clarification_completion_waits_without_failure_or_judge_review() {
     let mut test = TestBot::new("clarification").await;
     let a = &mut test.bot;
-    a.state.energy.asleep = true; // Queue delivery without a model or network call.
+    a.state.asleep = true; // Queue delivery without a model or network call.
     let task = a.board().add("研究版本", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
     spawn_test_job(a, &task, a.events.clone(), std::future::pending());
     let questions = "研究 A 还是 B？";
@@ -1520,9 +1585,8 @@ async fn notices_respect_read_only_groups_and_do_not_advance_floor_or_bot_sample
         assert!(batch.ctx.is_none() && !batch.speak && !batch.consider);
     }
     assert_eq!(a.store.messages_after(&Namespace::Group("qq:34".into()), DateTime::<Utc>::MIN_UTC).await.unwrap().len(), 2);
-    let sample_key = format!("qq_bot_samples:{}", env.sender_key());
-    let samples = a.store.kv_get(&sample_key).await.unwrap();
-    assert!(samples.is_some());
+    let sender = env.sender_key();
+    assert_eq!(a.bot_flags.sample_count(&sender), 1);
     Arc::make_mut(&mut a.cfg).social.groups.push("qq:34".into());
     env.notice = true;
     let batch = a.prepare_messages(vec![env.clone()]).await;
@@ -1532,7 +1596,7 @@ async fn notices_respect_read_only_groups_and_do_not_advance_floor_or_bot_sample
         let batch = a.prepare_messages(vec![env.clone()]).await;
         assert!(!batch.speak && !batch.consider);
     }
-    assert_eq!(a.store.kv_get(&sample_key).await.unwrap(), samples);
+    assert_eq!(a.bot_flags.sample_count(&sender), 1);
     env.notice = false;
     for expected in [false, false, true] {
         assert_eq!(a.prepare_messages(vec![env.clone()]).await.consider, expected);
@@ -1722,7 +1786,7 @@ async fn images_queue_on_arrival_and_collect_only_from_groups_and_the_owner() {
 
     // Someone else's private chat: described for that chat, never collected.
     let private = Envelope { is_group: false, mentions_me: true, chat_id: "55".into(), sender_id: "55".into(), ..with_image(group_messages(&["[图片]"], false).remove(0)) };
-    let who = a.runtime_identity(&private).await.unwrap();
+    let who = a.runtime_identity(&private);
     assert!(!who.is_owner);
     let ctx = ChatCtx {
         key: "telegram:55".into(), platform: "telegram", chat_id: "55".into(), message_id: None,
@@ -1781,6 +1845,61 @@ fn offer(id: &str) -> crate::mind::expression::Offer {
         tags: vec![], scope: crate::store::StickerScope::Any, scope_reason: String::new(), origin: "telegram:-7".into(),
         first_seen: now, last_seen: now, sightings: 1, sent_count: 0, last_sent: None,
     } }
+}
+
+#[tokio::test]
+async fn delivery_skips_stickers_removed_disabled_or_restricted_after_offer() {
+    use crate::store::{MediaStatus, StickerScope};
+
+    let mut test = TestBot::new("stale-sticker").await;
+    let a = &mut test.bot;
+    Arc::make_mut(&mut a.cfg).social.groups.push("qq:9".into());
+    let mut offered = offer("ab12cd34");
+    offered.record.origin = "qq:group:8".into();
+    a.store.save_media(&offered.record).await.unwrap();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(4, 4).write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let dir = crate::mind::media::media_dir(&a.cfg);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = crate::mind::media::file_path(&dir, &offered.record.hash, &offered.record.ext);
+    std::fs::write(path, png.into_inner()).unwrap();
+
+    let mut chat = TestChat::new(&["<找表情包>瞪眼</找表情包>"; 4], &[]);
+    chat.offers.push(offered.clone());
+    for _ in 0..4 {
+        chat.steps.lock().unwrap().push_back(Ok("<表情包>ab12cd34</表情包>".into()));
+    }
+    a.test_chat = Some(chat);
+    let mut env = group_messages(&["离谱"], true).remove(0);
+    env.platform = "qq";
+    env.chat_id = "group:9".into();
+    let ns = Namespace::Group("qq:9".into());
+    let mut fresh = offered.record.clone();
+    for (status, scope) in [
+        (Some(MediaStatus::Disabled), StickerScope::Any),
+        (Some(MediaStatus::Rejected), StickerScope::Any),
+        (Some(MediaStatus::Active), StickerScope::Origin),
+        (None, StickerScope::Any),
+    ] {
+        if let Some(status) = status {
+            fresh.status = status;
+            fresh.scope = scope;
+            a.store.save_media(&fresh).await.unwrap();
+        } else {
+            a.store.delete_media(&fresh.hash).await.unwrap();
+        }
+        a.on_messages(vec![env.clone()]).await.unwrap();
+        if let Some(record) = a.store.media(&fresh.hash).await.unwrap() {
+            assert_eq!(record.sent_count, 0);
+            assert!(record.last_sent.is_none());
+        }
+    }
+    let chat = a.test_chat.as_ref().unwrap();
+    assert_eq!(chat.step_prompts.lock().unwrap().len(), 4);
+    assert!(chat.sent_texts.lock().unwrap().is_empty());
+    let messages = a.store.messages_after(&ns, DateTime::<Utc>::MIN_UTC).await.unwrap();
+    assert_eq!(messages.len(), 4);
+    assert!(messages.iter().all(|message| !message.outgoing));
 }
 
 #[tokio::test]

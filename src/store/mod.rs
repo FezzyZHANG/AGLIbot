@@ -383,8 +383,10 @@ impl Store {
         fn reviews() -> Vec<ReviewItem>;
         fn create_review(new: NewReview) -> ReviewItem;
         fn save_review(r: &ReviewItem) -> ();
+        fn mark_reviews_notified(ids: &[u64]) -> ();
         fn kv_get(key: &str) -> Option<Value>;
         fn kv_set(key: &str, value: Value) -> ();
+        fn kv_keys_with_prefix(prefix: &str) -> Vec<String>;
         fn lexicon() -> Vec<Value>;
         fn insert_lexicon(docs: &[Value]) -> ();
         fn media(hash: &str) -> Option<MediaRecord>;
