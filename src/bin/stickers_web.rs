@@ -1,9 +1,8 @@
-//! `aglibot stickers-web`: the owner's page for reviewing collected stickers. A separate process so
+//! `stickers-web`: the owner's page for reviewing collected stickers. A separate process so
 //! it stays up while the bot restarts, open to the local network with no login. Edits reach the bot through
 //! the store; changed text makes the worker rebuild that sticker's vector.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,14 +17,14 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::Config;
-use crate::mind::embedding::{EmbeddingCfg, cosine};
-use crate::mind::llm::LlmClient;
-use crate::mind::media::{file_path, media_dir};
-use crate::store::{MediaEditPatch, MediaRecord, MediaStatus, StickerScope, Store};
+use aglibot::config::Config;
+use aglibot::mind::embedding::{EmbeddingCfg, cosine};
+use aglibot::mind::llm::LlmClient;
+use aglibot::mind::media::{file_path, media_dir};
+use aglibot::store::{MediaEditPatch, MediaRecord, MediaStatus, StickerScope, Store};
 
 const DEFAULT_PORT: u16 = 8790;
-const PAGE: &str = include_str!("stickers_web.html");
+const PAGE: &str = include_str!("../stickers_web.html");
 /// Stops other sites' scripts from driving this page: a custom header forces a CORS preflight,
 /// which nothing here answers.
 const UI_HEADER: &str = "x-stickers-ui";
@@ -42,12 +41,17 @@ struct App {
 
 type Shared = Arc<App>;
 
-pub async fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
-    let args: Vec<String> = args.map(|a| a.to_string_lossy().into_owned()).collect();
+#[tokio::main]
+async fn main() -> Result<()> {
+    if let Some(root) = std::env::var_os("AGLI_ROOT") {
+        dotenvy::from_path(PathBuf::from(root).join(".env")).ok();
+    }
+    dotenvy::dotenv().ok();
+    let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     let port = match args.as_slice() {
         [] => DEFAULT_PORT,
         [flag, value] if flag == "--port" => value.parse().context("--port needs a number")?,
-        _ => anyhow::bail!("usage: aglibot stickers-web [--port N]"),
+        _ => anyhow::bail!("usage: stickers-web [--port N]"),
     };
     let root = std::env::var_os("AGLI_ROOT").map(PathBuf::from).unwrap_or(std::env::current_dir()?);
     let cfg = Config::load(&root)?;
@@ -353,7 +357,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::mind::media::sticker_text;
+    use aglibot::mind::media::sticker_text;
 
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const PRIVATE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

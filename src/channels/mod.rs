@@ -6,10 +6,8 @@ mod urls;
 pub(crate) use urls::public_url;
 
 use std::borrow::Cow;
-use std::sync::LazyLock;
-use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 /// Explicit reply markup only; ordinary prose and CQ codes always remain text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,17 +85,6 @@ impl std::fmt::Display for TooLarge {
 
 impl std::error::Error for TooLarge {}
 
-/// QQ CDN downloads connect directly: without `no_proxy` reqwest would use HTTP(S)_PROXY or the system proxy.
-static MEDIA_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(3))
-        .no_proxy()
-        .build()
-        .unwrap_or_default()
-});
-
 /// Read a response body, stopping as soon as it passes `max` bytes. Errors never carry the URL.
 pub(crate) async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>> {
     if response.content_length().is_some_and(|length| length > max as u64) {
@@ -109,16 +96,6 @@ pub(crate) async fn read_capped(mut response: reqwest::Response, max: usize) -> 
         body.extend_from_slice(&chunk);
     }
     Ok(body)
-}
-
-/// Locators come from the channel, never from message text or a model.
-async fn fetch_url(url: &str, max: usize) -> Result<Vec<u8>> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        bail!("media locator is not an HTTP URL");
-    }
-    let response = MEDIA_HTTP.get(url).send().await.map_err(reqwest::Error::without_url)?
-        .error_for_status().map_err(reqwest::Error::without_url)?;
-    read_capped(response, max).await
 }
 
 #[derive(Debug, Clone)]
@@ -169,25 +146,39 @@ pub struct Outlets {
 
 impl Outlets {
     /// Channel file references can expire. Resolve QQ ids using the originating chat.
-    pub(crate) async fn download_file(&self, platform: &str, chat_id: &str, a: &Attachment, max: usize) -> Result<Vec<u8>> {
-        if a.size.is_some_and(|n| n > max as u64) { return Err(TooLarge.into()); }
-        if platform == "telegram" { return self.fetch_media(platform, a, max).await; }
-        anyhow::ensure!(platform == "qq", "unknown file platform");
-        if let Some(url) = &a.url {
-            match urls::download(url, max).await {
-                Ok(bytes) => return Ok(bytes),
-                Err(e) if e.is::<TooLarge>() => return Err(e),
-                Err(_) => {}
-            }
+    pub async fn fetch_attachment(&self, platform: &str, chat_id: &str, attachment: &Attachment, max: usize) -> Result<Vec<u8>> {
+        if attachment.size.is_some_and(|size| size > max as u64) {
+            return Err(TooLarge.into());
         }
-        let qq = self.qq.as_ref().ok_or_else(|| anyhow::anyhow!("QQ 未连接"))?;
-        let file = a.file_id.as_deref().ok_or_else(|| anyhow::anyhow!("附件缺少文件编号"))?;
-        let url = if matches!(a.kind, AttachmentKind::Image | AttachmentKind::Sticker) {
-            qq.image_url(file).await?
-        } else {
-            qq.file_url(chat_id, file).await?
-        };
-        urls::download(&url, max).await
+        match platform {
+            "telegram" => {
+                let (Some(telegram), Some(file_id)) = (&self.telegram, &attachment.file_id) else {
+                    bail!("telegram attachment is not retrievable");
+                };
+                telegram.fetch_file(file_id, max).await
+            }
+            "qq" => {
+                let error = if let Some(url) = &attachment.url {
+                    match urls::download(url, max).await {
+                        Ok(bytes) => return Ok(bytes),
+                        Err(e) if e.is::<TooLarge>() => return Err(e),
+                        Err(e) => e,
+                    }
+                } else {
+                    anyhow!("附件缺少下载链接")
+                };
+                let (Some(qq), Some(file)) = (&self.qq, &attachment.file_id) else {
+                    return Err(error);
+                };
+                let url = if matches!(attachment.kind, AttachmentKind::Image | AttachmentKind::Sticker) {
+                    qq.image_url(file).await?
+                } else {
+                    qq.file_url(chat_id, file).await?
+                };
+                urls::download(&url, max).await
+            }
+            other => bail!("unknown platform {other}"),
+        }
     }
     pub async fn send(&self, platform: &str, chat_id: &str, text: &str) -> Result<()> {
         if let ("qq", Some(qq)) = (platform, &self.qq) {
@@ -212,32 +203,6 @@ impl Outlets {
         }
     }
 
-    /// The attachment's bytes. QQ URLs expire, so a failed one is refreshed through NapCat once.
-    pub async fn fetch_media(&self, platform: &str, attachment: &Attachment, max: usize) -> Result<Vec<u8>> {
-        match platform {
-            "telegram" => {
-                let (Some(telegram), Some(file_id)) = (&self.telegram, &attachment.file_id) else {
-                    bail!("telegram media is not retrievable");
-                };
-                telegram.fetch_file(file_id, max).await
-            }
-            "qq" => {
-                let first = match &attachment.url {
-                    Some(url) => fetch_url(url, max).await,
-                    None => Err(anyhow::anyhow!("segment has no url")),
-                };
-                let error = match first {
-                    Ok(bytes) => return Ok(bytes),
-                    Err(e) if e.downcast_ref::<TooLarge>().is_some() => return Err(e),
-                    Err(e) => e,
-                };
-                let (Some(qq), Some(file)) = (&self.qq, &attachment.file_id) else { return Err(error) };
-                fetch_url(&qq.image_url(file).await?, max).await
-            }
-            other => bail!("unknown platform {other}"),
-        }
-    }
-
     /// Telegram currently ignores the optional reply target.
     pub async fn send_reply(&self, platform: &str, chat_id: &str, pieces: &[ReplyPiece], reply_to: Option<&str>) -> Result<()> {
         match platform {
@@ -256,43 +221,41 @@ impl Outlets {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-
     use super::*;
 
-    fn serve_once(status: &str, body: Vec<u8>) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/secret-token", listener.local_addr().unwrap());
-        let status = status.to_string();
-        std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                socket.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
-            }
-            write!(socket, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-            socket.write_all(&body).unwrap();
-        });
-        url
+    #[tokio::test]
+    async fn attachments_share_size_and_destination_checks() {
+        let outlets = Outlets::default();
+        for kind in [AttachmentKind::Image, AttachmentKind::Sticker, AttachmentKind::File] {
+            let mut attachment = Attachment {
+                kind, url: Some("http://127.0.0.1/secret-token".into()), size: Some(9),
+                file_id: None, name: None, quoted_from: None, media_id: None,
+            };
+            let error = outlets.fetch_attachment("qq", "group:34", &attachment, 8).await.unwrap_err();
+            assert!(error.is::<TooLarge>());
+            attachment.size = None;
+            let error = outlets.fetch_attachment("qq", "group:34", &attachment, 8).await.unwrap_err();
+            assert!(error.to_string().contains("公网"));
+            assert!(!format!("{error:#}").contains("secret-token"));
+        }
     }
 
     #[tokio::test]
-    async fn downloads_stop_at_the_limit_and_errors_hide_the_url() {
-        assert_eq!(fetch_url(&serve_once("200 OK", vec![7; 8]), 8).await.unwrap(), vec![7; 8]);
-        assert!(fetch_url(&serve_once("200 OK", vec![7; 9]), 8).await.unwrap_err().downcast_ref::<TooLarge>().is_some());
-        let error = fetch_url(&serve_once("403 Forbidden", vec![]), 8).await.unwrap_err();
-        assert!(!format!("{error:#}").contains("secret-token"), "{error:#}");
-        assert!(fetch_url("file:///C:/Windows/win.ini", 8).await.is_err());
-        assert!(fetch_url("C:/Windows/win.ini", 8).await.is_err());
-    }
-
-    /// Whether this TLS stack can talk to QQ's image CDN at all; a 4xx still proves the handshake.
-    #[tokio::test]
-    #[ignore = "requires network"]
-    async fn live_qq_cdn_handshake() {
-        let response = MEDIA_HTTP.get("https://multimedia.nt.qq.com.cn/download?appid=1407").send().await.unwrap();
-        println!("status {}", response.status());
+    async fn telegram_file_resolution_uses_the_same_destination_check() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let telegram = telegram::Telegram::fixture(format!("http://{}/botSECRET", listener.local_addr().unwrap()));
+        let app = axum::Router::new().route("/botSECRET/getFile", axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"ok":true,"result":{"file_path":"photos/test.jpg"}}))
+        }));
+        let server = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+        let outlets = Outlets { telegram: Some(telegram), qq: None };
+        let attachment = Attachment {
+            kind: AttachmentKind::Image, url: None, file_id: Some("photo-id".into()),
+            name: None, size: None, quoted_from: None, media_id: None,
+        };
+        let error = outlets.fetch_attachment("telegram", "34", &attachment, 8).await.unwrap_err();
+        assert!(error.to_string().contains("公网"));
+        assert!(!format!("{error:#}").contains("SECRET"));
+        server.abort();
     }
 }

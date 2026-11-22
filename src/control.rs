@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
-use crate::Result;
+use anyhow::Result;
 use crate::bot::Event;
 use crate::config::{Config, HandsCfg};
 use crate::store::Store;

@@ -1,18 +1,3 @@
-mod bot;
-mod channels;
-mod config;
-mod config_watch;
-mod control;
-mod error_report;
-mod evolution;
-mod hands;
-mod mind;
-mod ns;
-mod social;
-mod store;
-mod stickers_web;
-mod work;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,36 +7,14 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
 
-use bot::{Bot, Event};
-use bot::ingress::{WorkItem, WorkQueue, next_work, try_handle_fast_control};
-use channels::Outlets;
-use channels::telegram::Telegram;
-use config::Config;
-use error_report::{Fault, Reporter, report};
-use mind::models::Models;
-
-async fn recv_work(events: &mut mpsc::Receiver<Event>, queued: &mut WorkQueue, acl: &config::AclCfg, session: &config::SessionCfg) -> Option<WorkItem> {
-    if queued.is_empty() {
-        queued.push(events.recv().await?);
-    }
-    // Drain only the current backlog, so a busy producer cannot postpone Ctrl+C or the cap.
-    for _ in 0..events.len() {
-        if let Ok(ev) = events.try_recv() {
-            queued.push(ev);
-        }
-    }
-    while let Some(deadline) = queued.deadline(acl, session) {
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(deadline) => break,
-            ev = events.recv() => match ev {
-                Some(ev) => queued.push(ev),
-                None => break,
-            },
-        }
-    }
-    next_work(queued, acl, session)
-}
+use aglibot::bot::{Bot, Event};
+use aglibot::bot::ingress::{WorkQueue, recv_work, try_handle_fast_control};
+use aglibot::channels::Outlets;
+use aglibot::channels::telegram::Telegram;
+use aglibot::config::Config;
+use aglibot::error_report::{Fault, Reporter, report};
+use aglibot::mind::models::Models;
+use aglibot::{channels, config_watch, control, evolution, mind, store};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,9 +25,6 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("migrate-bson")) {
         return store::migrate::run(std::env::args_os().skip(2)).await;
-    }
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("stickers-web")) {
-        return stickers_web::run(std::env::args_os().skip(2)).await;
     }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("stickers-recaption")) {
         return mind::media::recaption_command(std::env::args_os().skip(2)).await;

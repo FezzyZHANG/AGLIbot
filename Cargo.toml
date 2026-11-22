@@ -32,3 +32,11 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[[bin]]
+name = "aglibot"
+path = "src/main.rs"
+
+[[bin]]
+name = "stickers-web"
+path = "src/bin/stickers_web.rs"

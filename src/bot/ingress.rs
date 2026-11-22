@@ -186,6 +186,29 @@ fn same_chat(first: &Envelope, next: &Envelope) -> bool {
     next.platform == first.platform && next.chat_id == first.chat_id && next.is_group == first.is_group
 }
 
+pub async fn recv_work(events: &mut mpsc::Receiver<Event>, queued: &mut WorkQueue, acl: &AclCfg, session: &SessionCfg) -> Option<WorkItem> {
+    if queued.is_empty() {
+        queued.push(events.recv().await?);
+    }
+    // Drain only the current backlog, so a busy producer cannot postpone Ctrl+C or the cap.
+    for _ in 0..events.len() {
+        if let Ok(ev) = events.try_recv() {
+            queued.push(ev);
+        }
+    }
+    while let Some(deadline) = queued.deadline(acl, session) {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => break,
+            ev = events.recv() => match ev {
+                Some(ev) => queued.push(ev),
+                None => break,
+            },
+        }
+    }
+    next_work(queued, acl, session)
+}
+
 /// Take the ready chat batch, preserving the arrival order of all deferred events.
 pub fn next_work(queue: &mut WorkQueue, acl: &AclCfg, session: &SessionCfg) -> Option<WorkItem> {
     let batch = queue.batch(acl, session);

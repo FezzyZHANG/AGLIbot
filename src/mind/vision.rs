@@ -174,12 +174,11 @@ fn normalize(bytes: &[u8], max_frames: usize) -> Result<Normalized, Failure> {
     }
 }
 
-async fn load(outlets: &Outlets, cache: &MediaHandle, media: &PendingMedia, max_frames: usize) -> Result<Normalized, Failure> {
+async fn load(outlets: &Outlets, cache: &MediaHandle, chat_id: &str, media: &PendingMedia, max_frames: usize) -> Result<Normalized, Failure> {
     let bytes = match cache.cached(&media.attachment).await {
         Some(bytes) => bytes,
         None => {
-            if media.attachment.size.is_some_and(|size| size > MAX_FILE_BYTES as u64) { return Err(Failure::TooBig); }
-            outlets.fetch_media(media.platform, &media.attachment, MAX_FILE_BYTES).await.map_err(|e| {
+            outlets.fetch_attachment(media.platform, chat_id, &media.attachment, MAX_FILE_BYTES).await.map_err(|e| {
                 if e.downcast_ref::<TooLarge>().is_some() { return Failure::TooBig; }
                 warn!("image download failed: {e:#}");
                 Failure::Download
@@ -212,7 +211,7 @@ pub struct Look {
 }
 
 /// Fetch and normalise the waiting images. A failure becomes an explicit note, never a failed reply.
-pub async fn look(outlets: &Outlets, cache: &MediaHandle, pending: Vec<PendingMedia>) -> Look {
+pub async fn look(outlets: &Outlets, cache: &MediaHandle, chat_id: &str, pending: Vec<PendingMedia>) -> Look {
     let now = Instant::now();
     let waiting = pending.len();
     let pending: Vec<PendingMedia> = pending.into_iter().filter(|m| now.duration_since(m.at) < PENDING_TTL).collect();
@@ -229,7 +228,7 @@ pub async fn look(outlets: &Outlets, cache: &MediaHandle, pending: Vec<PendingMe
             failures.push((number, media.sender, Failure::TooMany));
             continue;
         }
-        match load(outlets, cache, &media, MAX_FRAMES.min(room)).await {
+        match load(outlets, cache, chat_id, &media, MAX_FRAMES.min(room)).await {
             Ok(image) => {
                 with_pixels.extend(media.attachment.media_id);
                 room -= image.frames.len();
@@ -258,7 +257,6 @@ pub async fn look(outlets: &Outlets, cache: &MediaHandle, pending: Vec<PendingMe
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
 
     use image::codecs::gif::GifEncoder;
     use image::{Delay, Frame, Rgba, RgbaImage};
@@ -370,28 +368,28 @@ mod tests {
         assert_eq!(pending.iter().map(|m| m.sender.as_str()).collect::<Vec<_>>(), ["乙", "丙", "丁", "戊"]);
     }
 
-    /// Serves `bytes` to the given number of requests, then stops.
-    fn serve(bytes: Vec<u8>, requests: usize) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/image", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            for _ in 0..requests {
-                let (mut socket, _) = listener.accept().unwrap();
-                let mut request = Vec::new();
-                let mut byte = [0; 1];
-                while !request.ends_with(b"\r\n\r\n") {
-                    std::io::Read::read_exact(&mut socket, &mut byte).unwrap();
-                    request.push(byte[0]);
-                }
-                write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
-                socket.write_all(&bytes).unwrap();
-            }
-        });
-        url
-    }
-
     fn pending(sender: &str, url: Option<String>) -> PendingMedia {
         PendingMedia { platform: "qq", sender: sender.into(), attachment: attachment(AttachmentKind::Image, url), at: Instant::now() }
+    }
+
+    type ImageFixture<'a> = (&'a str, Option<(&'a str, &'a [u8])>);
+
+    async fn look_at_fixtures(name: &str, fixtures: &[ImageFixture<'_>]) -> Look {
+        let dir = std::env::temp_dir().join(format!("aglibot-test-vision-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = MediaHandle::disabled(dir.clone());
+        let media = fixtures.iter().enumerate().map(|(index, (sender, file))| {
+            let mut media = pending(sender, None);
+            if let Some((ext, bytes)) = file {
+                let id = index as u64 + 1;
+                media.attachment.media_id = Some(id);
+                cache.seed_file(id, &media.attachment, ext, bytes);
+            }
+            media
+        }).collect();
+        let result = look(&Outlets::default(), &cache, "group:1", media).await;
+        std::fs::remove_dir_all(dir).unwrap();
+        result
     }
 
     fn jpegs(parts: &[Part]) -> usize {
@@ -401,12 +399,7 @@ mod tests {
     #[tokio::test]
     async fn seen_and_unseen_images_are_both_stated() {
         let png = encoded(solid(16, 16, [10, 20, 30, 255]), ImageFormat::Png);
-        let media = vec![
-            pending("甲", Some(serve(png, 1))),
-            pending("乙", None),
-            pending("丙", Some(serve(b"junk".to_vec(), 1))),
-        ];
-        let look = look(&Outlets::default(), &MediaHandle::disabled(std::env::temp_dir()), media).await;
+        let look = look_at_fixtures("mixed", &[("甲", Some(("png", &png))), ("乙", None), ("丙", Some(("png", b"junk")))]).await;
         assert_eq!(jpegs(&look.parts), 1);
         assert!(look.parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("图片1（甲发的）"))));
         assert!(look.note.contains("图片2（乙发的）：下载失败") && look.note.contains("图片3（丙发的）：格式不支持"), "{}", look.note);
@@ -418,7 +411,7 @@ mod tests {
     #[tokio::test]
     async fn a_gif_reaches_the_turn_as_labelled_jpeg_frames() {
         let bytes = gif(&[[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [9, 9, 9, 255], [200, 200, 0, 255], [0, 200, 200, 255]]);
-        let look = look(&Outlets::default(), &MediaHandle::disabled(std::env::temp_dir()), vec![pending("甲", Some(serve(bytes, 1)))]).await;
+        let look = look_at_fixtures("gif", &[("甲", Some(("gif", &bytes)))]).await;
         assert!(look.parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("共 6 帧") && t.contains("抽了 4 帧"))));
         assert_eq!(jpegs(&look.parts), 4);
         let Some(Part::Jpeg(first)) = look.parts.iter().find(|p| matches!(p, Part::Jpeg(_))) else { panic!() };
@@ -430,7 +423,7 @@ mod tests {
     async fn expired_references_are_not_fetched_or_mentioned() {
         let mut media = pending("甲", Some("http://127.0.0.1:9/never".into()));
         media.at = Instant::now() - PENDING_TTL;
-        let look = look(&Outlets::default(), &MediaHandle::disabled(std::env::temp_dir()), vec![media]).await;
+        let look = look(&Outlets::default(), &MediaHandle::disabled(std::env::temp_dir()), "group:1", vec![media]).await;
         assert!(look.parts.is_empty() && look.note.is_empty() && look.note_without_parts.is_empty());
     }
 
@@ -450,7 +443,7 @@ mod tests {
         let models = Models::new(&cfg, crate::store::Store::memory()).await.unwrap();
         let policy = ProcessingPolicy::Any;
         let colours = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
-        let seen = look(&Outlets::default(), &MediaHandle::disabled(std::env::temp_dir()), vec![pending("甲", Some(serve(gif(&colours), 1)))]).await;
+        let seen = look_at_fixtures("live-gif", &[("甲", Some(("gif", &gif(&colours))))]).await;
         let mut speaker = Speaker::new("你在聊天，简短地回答。".into(), SessionCfg {
             max_turns: 20, idle_minutes: 30, recap_messages: 10, debounce: Default::default(),
         });

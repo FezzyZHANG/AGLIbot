@@ -397,6 +397,7 @@ impl Store {
         fn patch_media(hash: &str, patch: &MediaEditPatch) -> Option<MediaRecord>;
         fn all_media() -> Vec<MediaRecord>;
         fn delete_media(hash: &str) -> ();
+        fn delete_unused_media(hash: &str, cutoff: DateTime<Utc>) -> bool;
         fn sticker_vectors(model_id: &str) -> BTreeMap<String, StickerVector>;
         fn save_sticker_vector(vector: &StickerVector) -> ();
     }

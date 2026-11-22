@@ -461,7 +461,7 @@ pub struct Config {
 impl Config {
     /// Recover the owner's notification route if unrelated runtime configuration
     /// prevents startup. Use the same identity, proxy and environment rules as load().
-    pub(crate) fn owner_telegram(root: &Path) -> Result<(i64, TelegramCfg)> {
+    pub fn owner_telegram(root: &Path) -> Result<(i64, TelegramCfg)> {
         #[derive(Deserialize)]
         struct TelegramSection { telegram: TelegramCfg }
         let dir = root.join("config");

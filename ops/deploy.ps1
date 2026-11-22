@@ -34,7 +34,7 @@ if (Test-Path -LiteralPath $pointer) {
 
 # A throwaway worktree for the build. Its path stays fixed, and the target dir is shared across
 # deploys (in the source repo's ignored target\, outside the runtime root), so only changed
-# crates rebuild; the release itself is just the copied exe.
+# crates rebuild; the release itself is just the copied executables.
 $wt = Join-Path $env:TEMP 'aglibot-deploy'
 function Remove-Worktree {
     if (Test-Path -LiteralPath $wt) { Native git -C $src worktree remove --force $wt | Out-Null }
@@ -47,13 +47,15 @@ if ($LASTEXITCODE -ne 0) { throw "worktree add failed for $target" }
 try {
     Push-Location $wt
     try {
-        Native cargo build --locked --release --bin aglibot --target-dir (Join-Path $src 'target\deploy') | Select-Object -Last 3
+        Native cargo build --locked --offline --release --bin aglibot --bin stickers-web --target-dir (Join-Path $src 'target\deploy') | Select-Object -Last 3
         if ($LASTEXITCODE -ne 0) { throw 'build failed' }
     } finally { Pop-Location }
     $releaseDir = Join-Path $rt "data\releases\$target"
     New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
     $exe = Join-Path $releaseDir 'aglibot.exe'
+    $stickersExe = Join-Path $releaseDir 'stickers-web.exe'
     Copy-Item -Force -LiteralPath (Join-Path $src 'target\deploy\release\aglibot.exe') -Destination $exe
+    Copy-Item -Force -LiteralPath (Join-Path $src 'target\deploy\release\stickers-web.exe') -Destination $stickersExe
 
     # Runtime config is deliberately its own copy; show where it differs from this commit's defaults.
     "config differences (commit vs runtime):"
@@ -62,6 +64,7 @@ try {
 } finally { Remove-Worktree }
 
 $release = [ordered]@{ commit = $target; exe = $exe; exe_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLower()
+    stickers_web_exe = $stickersExe; stickers_web_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $stickersExe).Hash.ToLower()
     origin = 'manual'; at = (Get-Date).ToUniversalTime().ToString('o') }
 [IO.File]::WriteAllText($pointer, ($release | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
 & (Join-Path $PSScriptRoot 'start-bot.ps1') -Runtime $rt -Restart

@@ -5,11 +5,12 @@
 //! This never runs in the chat loop, which handles one turn at a time. Addressed turns still read
 //! pixels themselves (`vision`); descriptions only fill in for images a turn has no pixels for.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
@@ -41,6 +42,7 @@ const RECAPTION_AT_ONCE: usize = 10;
 const DESCRIPTION_CHARS: usize = 200;
 /// Files of images that did not become stickers are deleted this long after they were last seen.
 const UNUSED_FILE_DAYS: i64 = 7;
+const MEDIA_EXTENSIONS: [&str; 4] = ["jpg", "png", "gif", "webp"];
 const MAINTAIN_EVERY: Duration = Duration::from_secs(60);
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 /// Vectors built per maintenance pass.
@@ -188,7 +190,7 @@ pub fn media_dir(cfg: &Config) -> PathBuf {
     cfg.data_dir().join("media")
 }
 
-/// `extension.<sha256>` is the file name; a record whose file is gone falls back to downloading.
+/// `<sha256>.<extension>` is the file name.
 pub fn file_path(dir: &Path, hash: &str, ext: &str) -> PathBuf {
     dir.join(format!("{hash}.{ext}"))
 }
@@ -223,6 +225,13 @@ impl MediaHandle {
         self.index.lock().unwrap().remember(job.id, &job.attachment, seen);
     }
 
+    #[cfg(test)]
+    pub(super) fn seed_file(&self, id: u64, attachment: &Attachment, ext: &str, bytes: &[u8]) {
+        let hash = hash_of(bytes);
+        store_file(&self.dir, &hash, ext, bytes).unwrap();
+        self.index.lock().unwrap().remember(id, attachment, Seen { hash, description: None });
+    }
+
     pub fn next_id(&self) -> Option<u64> {
         self.tx.as_ref().map(|_| self.next.fetch_add(1, Ordering::Relaxed))
     }
@@ -243,7 +252,7 @@ impl MediaHandle {
         let hash = self.index.lock().unwrap_or_else(|e| e.into_inner()).hash_of(attachment)?;
         let dir = self.dir.clone();
         tokio::task::spawn_blocking(move || {
-            for ext in ["jpg", "png", "gif", "webp"] {
+            for ext in MEDIA_EXTENSIONS {
                 if let Ok(bytes) = std::fs::read(file_path(&dir, &hash, ext)) { return Some(bytes); }
             }
             None
@@ -326,7 +335,7 @@ async fn run(mut rx: mpsc::Receiver<MediaJob>, handle: MediaHandle, store: Store
 
 async fn fetch(job: &MediaJob, handle: &MediaHandle, outlets: &Outlets) -> Result<Vec<u8>> {
     if let Some(bytes) = handle.cached(&job.attachment).await { return Ok(bytes); }
-    outlets.fetch_media(job.platform, &job.attachment, MAX_FILE_BYTES).await
+    outlets.fetch_attachment(job.platform, &job.chat_id, &job.attachment, MAX_FILE_BYTES).await
 }
 
 fn store_file(dir: &Path, hash: &str, ext: &str, bytes: &[u8]) -> Result<()> {
@@ -545,10 +554,50 @@ async fn embed_stale(store: &Store, models: &Models) -> Result<usize> {
 
 async fn prune_files(store: &Store, dir: &Path) -> Result<()> {
     let cutoff = Utc::now() - chrono::Duration::days(UNUSED_FILE_DAYS);
+    let mut referenced = HashSet::new();
     for record in store.all_media().await? {
-        if matches!(record.status, MediaStatus::Seen | MediaStatus::Rejected) && record.last_seen < cutoff {
-            let path = file_path(dir, &record.hash, &record.ext);
-            if path.exists() { std::fs::remove_file(path)?; }
+        let expired = matches!(record.status, MediaStatus::Seen | MediaStatus::Rejected) && record.last_seen < cutoff;
+        // The review page can change the status between this scan and deletion.
+        if !expired || !store.delete_unused_media(&record.hash, cutoff).await? {
+            referenced.insert(record.hash.to_ascii_lowercase());
+        }
+    }
+    let dir = dir.to_owned();
+    tokio::task::spawn_blocking(move || prune_orphans(dir, &referenced, cutoff.into())).await?
+}
+
+fn prune_orphans(dir: PathBuf, referenced: &HashSet<String>, cutoff: SystemTime) -> Result<()> {
+    let mut dirs = vec![dir];
+    while let Some(dir) = dirs.pop() {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if kind.is_file() {
+                let name = entry.file_name();
+                let Some((hash, ext)) = name.to_str().and_then(|name| name.rsplit_once('.')) else { continue };
+                if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+                    || !MEDIA_EXTENSIONS.contains(&ext)
+                    || referenced.contains(&hash.to_ascii_lowercase())
+                { continue; }
+                let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
+                    Ok(modified) => modified,
+                    Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if modified < cutoff
+                    && let Err(e) = std::fs::remove_file(entry.path())
+                    && e.kind() != ErrorKind::NotFound
+                {
+                    return Err(e.into());
+                }
+            }
         }
     }
     Ok(())
@@ -808,15 +857,57 @@ rewritten 1, left alone";
         let dir = temp("prune");
         let store = Store::memory();
         let old = Utc::now() - chrono::Duration::days(UNUSED_FILE_DAYS + 1);
-        for (hash, status) in [("kept", MediaStatus::Active), ("gone", MediaStatus::Rejected), ("also", MediaStatus::Seen)] {
-            std::fs::write(file_path(&dir, hash, "png"), b"x").unwrap();
-            store.save_media(&MediaRecord { hash: hash.into(), ext: "png".into(), status, keep: false, description: String::new(),
+        let records = [('a', MediaStatus::Active, old), ('b', MediaStatus::Rejected, old),
+            ('c', MediaStatus::Seen, old), ('d', MediaStatus::Seen, Utc::now()), ('e', MediaStatus::Seen, old)];
+        for (digit, status, last_seen) in records {
+            let hash = digit.to_string().repeat(64);
+            let modified = if digit == 'e' { SystemTime::now() } else { old.into() };
+            write_aged_file(&file_path(&dir, &hash, "png"), modified);
+            store.save_media(&MediaRecord { hash, ext: "png".into(), status, keep: false, description: String::new(),
                 text: String::new(), use_when: String::new(), avoid: String::new(), tags: vec![], scope: StickerScope::Any,
-                scope_reason: String::new(), origin: String::new(), first_seen: old, last_seen: old, sightings: 1, sent_count: 0, last_sent: None }).await.unwrap();
+                scope_reason: String::new(), origin: String::new(), first_seen: old, last_seen, sightings: 1, sent_count: 0, last_sent: None }).await.unwrap();
         }
+        let cutoff = Utc::now() - chrono::Duration::days(UNUSED_FILE_DAYS);
+        assert!(!store.delete_unused_media(&"a".repeat(64), cutoff).await.unwrap());
+        assert!(!store.delete_unused_media(&"d".repeat(64), cutoff).await.unwrap());
         prune_files(&store, &dir).await.unwrap();
-        assert!(file_path(&dir, "kept", "png").exists());
-        assert!(!file_path(&dir, "gone", "png").exists());
-        assert!(!file_path(&dir, "also", "png").exists());
+        for (digit, keep_record, keep_file) in [
+            ('a', true, true), ('b', false, false), ('c', false, false), ('d', true, true), ('e', false, true),
+        ] {
+            let hash = digit.to_string().repeat(64);
+            assert_eq!(store.media(&hash).await.unwrap().is_some(), keep_record);
+            assert_eq!(file_path(&dir, &hash, "png").exists(), keep_file);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn write_aged_file(path: &Path, modified: SystemTime) {
+        let file = std::fs::File::create(path).unwrap();
+        file.set_modified(modified).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pruning_removes_only_aged_unrecorded_media_files() {
+        let dir = temp("prune-orphans");
+        let shard = dir.join("01").join("23");
+        std::fs::create_dir_all(&shard).unwrap();
+        let old: SystemTime = (Utc::now() - chrono::Duration::days(UNUSED_FILE_DAYS + 1)).into();
+        let root_orphan = file_path(&dir, &"a".repeat(64), "png");
+        let sharded_orphan = file_path(&shard, &"b".repeat(64), "webp");
+        let recent = file_path(&shard, &"c".repeat(64), "gif");
+        let non_media = file_path(&dir, &"d".repeat(64), "txt");
+        let malformed_hash = file_path(&shard, &"z".repeat(64), "jpg");
+        let partial = file_path(&shard, &"f".repeat(64), "partial");
+        for path in [&root_orphan, &sharded_orphan, &non_media, &malformed_hash, &partial] {
+            write_aged_file(path, old);
+        }
+        std::fs::write(&recent, b"recent").unwrap();
+        prune_files(&Store::memory(), &dir).await.unwrap();
+        assert!(!root_orphan.exists());
+        assert!(!sharded_orphan.exists());
+        for path in [recent, non_media, malformed_hash, partial] {
+            assert!(path.exists(), "{}", path.display());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

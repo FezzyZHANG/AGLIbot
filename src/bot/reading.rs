@@ -150,7 +150,7 @@ impl Bot {
                 anyhow::ensure!(inline_photo || supported_name(name), "文件格式未受支持");
                 let native = purpose != Purpose::OcrFallback && native_image(file);
                 if !native { cloud()?; }
-                let mut bytes = self.outlets.download_file(ctx.platform, &ctx.chat_id, file, MAX_DOCUMENT_BYTES).await
+                let mut bytes = self.outlets.fetch_attachment(ctx.platform, &ctx.chat_id, file, MAX_DOCUMENT_BYTES).await
                     .map_err(|e| if e.is::<crate::channels::TooLarge>() { anyhow::anyhow!("文件超出大小限制") } else {
                         report(Fault::FileRead);
                         anyhow::anyhow!("平台附件下载失败")

@@ -43,14 +43,15 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{self, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{info, warn};
@@ -59,6 +60,8 @@ use super::{Attachment, AttachmentKind, Envelope, ReplyPiece, reply_prefix, repl
 
 const CHUNK_CHARS: usize = 1500;
 const ACTION_TIMEOUT: Duration = Duration::from_secs(20);
+const PENDING_SWEEP: Duration = Duration::from_secs(1);
+const INBOUND_CAPACITY: usize = 256;
 /// How many of his own message ids to remember, to recognise replies to him.
 const OWN_MESSAGES: usize = 300;
 const RECENT_MESSAGES: usize = 500;
@@ -69,8 +72,7 @@ const FORWARD_NODES: usize = 40;
 const FORWARD_CHARS: usize = 2000;
 /// Per node, after rendering.
 const NODE_CHARS: usize = 500;
-/// `get_forward_msg` calls per inbound message, and how long each may take: the inbound line
-/// waits on them.
+/// Maximum forward lookups and total lookup time per inbound message.
 const FORWARD_FETCHES: usize = 6;
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(8);
 /// `get_msg` calls per quote chain: the inbound line waits on them too.
@@ -81,20 +83,49 @@ const CARD_CHARS: usize = 200;
 struct Request {
     action: &'static str,
     params: Value,
-    reply: oneshot::Sender<Result<Value>>,
+    deadline: Instant,
+    reply: oneshot::Sender<CallResult>,
 }
+
+type CallResult = Result<Value, QqCallError>;
+
+#[derive(Debug)]
+enum QqCallError {
+    Rejected(Value),
+    Timeout,
+    Disconnected,
+    Transport(String),
+}
+
+impl std::fmt::Display for QqCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(response) => write!(f, "qq action rejected: {response}"),
+            Self::Timeout => f.write_str("qq action timed out"),
+            Self::Disconnected => f.write_str("qq is disconnected"),
+            Self::Transport(detail) => write!(f, "qq transport error: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for QqCallError {}
 
 #[derive(Default)]
 struct Shared {
     self_id: AtomicI64,
-    last_inbound: Mutex<HashMap<String, Option<String>>>,
+    state: Mutex<QqState>,
+}
+
+#[derive(Default)]
+struct QqState {
+    last_inbound: HashMap<String, Option<String>>,
     /// His QQ nickname, for self-authored forward nodes.
-    nickname: Mutex<Option<String>>,
-    pokes: Mutex<HashMap<(String, i64), tokio::time::Instant>>,
-    own_messages: Mutex<VecDeque<SentMessage>>,
-    recent: Mutex<VecDeque<(String, Quoted)>>,
+    nickname: Option<String>,
+    pokes: HashMap<(String, i64), Instant>,
+    own_messages: VecDeque<SentMessage>,
+    recent: VecDeque<(String, Quoted)>,
     /// Unknown segment types already logged.
-    unknown_types: Mutex<HashSet<String>>,
+    unknown_types: HashSet<String>,
 }
 
 struct SentMessage {
@@ -115,8 +146,12 @@ struct Quoted {
 }
 
 impl Shared {
+    fn lock(&self) -> MutexGuard<'_, QqState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn cache(&self, id: String, message: Quoted) {
-        let mut q = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        let q = &mut self.lock().recent;
         q.retain(|(key, _)| key != &id);
         q.push_back((id, message));
         if q.len() > RECENT_MESSAGES {
@@ -125,7 +160,7 @@ impl Shared {
     }
 
     fn cached(&self, id: &str) -> Option<Quoted> {
-        let mut q = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        let q = &mut self.lock().recent;
         let i = q.iter().position(|(key, _)| key == id)?;
         let entry = q.remove(i)?;
         let message = entry.1.clone();
@@ -134,21 +169,22 @@ impl Shared {
     }
 
     fn note_unknown(&self, kind: &str) {
-        if self.unknown_types.lock().unwrap_or_else(|e| e.into_inner()).insert(kind.to_string()) {
+        if self.lock().unknown_types.insert(kind.to_string()) {
             info!("qq: unhandled segment type `{kind}`, shown as [{kind}]");
         }
     }
 
     fn remember(&self, chat_id: &str, id: String, text: &str) {
-        let mut q = self.own_messages.lock().unwrap_or_else(|e| e.into_inner());
-        q.push_back(SentMessage { chat_id: chat_id.into(), id, preview: message_preview(text) });
+        let message = SentMessage { chat_id: chat_id.into(), id, preview: message_preview(text) };
+        let q = &mut self.lock().own_messages;
+        q.push_back(message);
         while q.len() > OWN_MESSAGES {
             q.pop_front();
         }
     }
 
     fn is_mine(&self, id: &str) -> bool {
-        self.own_messages.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|m| m.id == id)
+        self.lock().own_messages.iter().any(|m| m.id == id)
     }
 }
 
@@ -161,9 +197,7 @@ pub struct QqHandle {
 /// Start the connection task. Inbound messages go to `inbound`.
 pub fn spawn(url: String, token: Option<String>, inbound: mpsc::Sender<Envelope>) -> QqHandle {
     let (tx, rx) = mpsc::channel(64);
-    // If this fills while a forward is being fetched, the socket task waits too; the fetch ends
-    // at FORWARD_TIMEOUT, so it never waits on its own reply forever.
-    let (raw_tx, raw_rx) = mpsc::channel(256);
+    let (raw_tx, raw_rx) = mpsc::channel(INBOUND_CAPACITY);
     let shared = Arc::new(Shared::default());
     let qq = QqHandle { tx, shared: shared.clone() };
     tokio::spawn(run(url, token, rx, raw_tx, shared));
@@ -174,27 +208,28 @@ pub fn spawn(url: String, token: Option<String>, inbound: mpsc::Sender<Envelope>
 /// Resolve what an event needs from NapCat, in arrival order, then hand it on.
 async fn enrich(mut raw: mpsc::Receiver<Pending>, qq: QqHandle, inbound: mpsc::Sender<Envelope>) {
     while let Some(mut p) = raw.recv().await {
+        let deadline = Instant::now() + FORWARD_TIMEOUT;
         if let Some(target) = p.reaction_target.take() {
-            let Some(preview) = qq.reaction_preview(&p.env.chat_id, &target).await else { continue };
+            let Some(preview) = qq.reaction_preview(&p.env.chat_id, &target, deadline).await else { continue };
             p.env.text = format!("[对你的消息 #{target}「{preview}」{}]", p.env.text);
         }
         // Record arrival before potentially slow reply/forward lookups; notices never replace it.
         if !p.env.notice {
-            qq.shared.last_inbound.lock().unwrap_or_else(|e| e.into_inner())
+            qq.shared.lock().last_inbound
                 .insert(p.env.chat_id.clone(), p.env.message_id.clone());
         }
         let forwards = if has_forward(&p.message) {
             collect_forwards(&p.message, |id| {
-                let qq = qq.clone();
-                async move { qq.forward_nodes(&id).await }
+                let qq = &qq;
+                async move { qq.forward_nodes(&id, deadline).await }
             })
             .await
         } else {
             Forwards::new()
         };
         let (reply, quoted_images) = resolve_reply(&p.message, &qq.shared, |id| {
-            let qq = qq.clone();
-            async move { qq.get_message(&id).await }
+            let qq = &qq;
+            async move { qq.get_message(&id, deadline).await }
         })
         .await;
         if let Some(mut env) = finish(p, &forwards, &qq.shared, &reply) {
@@ -219,13 +254,26 @@ impl QqHandle {
         self.shared.self_id.load(Ordering::Relaxed)
     }
 
-    async fn call(&self, action: &'static str, params: Value) -> Result<Value> {
+    async fn call(&self, action: &'static str, params: Value) -> CallResult {
+        self.call_with_timeout(action, params, Instant::now() + ACTION_TIMEOUT).await
+    }
+
+    async fn call_with_timeout(&self, action: &'static str, params: Value, deadline: Instant) -> CallResult {
+        if Instant::now() >= deadline {
+            return Err(QqCallError::Timeout);
+        }
+        let permit = time::timeout_at(deadline, self.tx.reserve())
+            .await.map_err(|_| QqCallError::Timeout)?
+            .map_err(|_| QqCallError::Disconnected)?;
+        if Instant::now() >= deadline {
+            return Err(QqCallError::Timeout);
+        }
         let (reply, rx) = oneshot::channel();
-        self.tx.send(Request { action, params, reply }).await.map_err(|_| anyhow!("qq task stopped"))?;
-        tokio::time::timeout(ACTION_TIMEOUT, rx)
+        permit.send(Request { action, params, deadline, reply });
+        time::timeout_at(deadline, rx)
             .await
-            .map_err(|_| anyhow!("qq action {action} timed out"))?
-            .map_err(|_| anyhow!("qq connection dropped during {action}"))?
+            .map_err(|_| QqCallError::Timeout)?
+            .map_err(|_| QqCallError::Disconnected)?
     }
 
     /// `chat_id` is `private:<user>` or `group:<group>`. Text goes as a text segment, so CQ codes
@@ -235,18 +283,20 @@ impl QqHandle {
     }
 
     pub async fn send_reply(&self, chat_id: &str, pieces: &[ReplyPiece], reply_to: Option<&str>) -> Result<()> {
+        let deadline = Instant::now() + ACTION_TIMEOUT;
         let (action, forward_action, key, id) = chat_target(chat_id)?;
         let text = reply_text(pieces);
         let chunks = super::telegram::chunks(&text, CHUNK_CHARS);
         if chunks.len() > 2 {
-            let nickname = self.nickname().await;
+            let nickname = self.nickname(deadline).await;
             let params = forward_params(key, id, self.shared.self_id.load(Ordering::Relaxed), &nickname, &chunks);
-            match self.call(forward_action, params).await {
+            match self.call_with_timeout(forward_action, params, deadline).await {
                 Ok(data) => {
                     self.cache_sent(chat_id, &data, &chunks[0]);
                     return Ok(());
                 }
-                Err(e) => warn!("qq forward failed, falling back to chunks: {e:#}"),
+                Err(e @ QqCallError::Rejected(_)) => warn!("qq forward rejected, falling back to chunks: {e}"),
+                Err(e) => return Err(e.into()),
             }
         }
         for (i, chunk) in chunks.iter().enumerate() {
@@ -255,7 +305,7 @@ impl QqHandle {
             let body = if i == 0 && chunks.len() <= 2 {
                 reply_prefix(pieces, chunk.len())
             } else { vec![ReplyPiece::Text(chunk.clone())] };
-            let data = self.call(action, reply_params(key, id, self.self_id(), &body, quote)).await?;
+            let data = self.call_with_timeout(action, reply_params(key, id, self.self_id(), &body, quote), deadline).await?;
             self.cache_sent(chat_id, &data, chunk);
         }
         Ok(())
@@ -264,7 +314,7 @@ impl QqHandle {
     /// Quote only when other messages came after the one being answered.
     fn quote<'a>(&self, chat_id: &str, reply_to: Option<&'a str>) -> Option<&'a str> {
         let target = reply_to?;
-        let last = self.shared.last_inbound.lock().unwrap_or_else(|e| e.into_inner());
+        let last = &self.shared.lock().last_inbound;
         (last.get(chat_id).and_then(|id| id.as_deref()) != Some(target)).then_some(target)
     }
 
@@ -283,13 +333,14 @@ impl QqHandle {
     }
 
     /// Asked once; an empty name lets NapCat fall back to the account's own.
-    async fn nickname(&self) -> String {
-        if let Some(n) = self.shared.nickname.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+    async fn nickname(&self, deadline: Instant) -> String {
+        let cached = self.shared.lock().nickname.clone();
+        if let Some(n) = cached {
             return n;
         }
-        let Ok(info) = self.call("get_login_info", json!({})).await else { return String::new() };
+        let Ok(info) = self.call_with_timeout("get_login_info", json!({}), deadline).await else { return String::new() };
         let n = info.get("nickname").and_then(Value::as_str).unwrap_or_default().to_string();
-        *self.shared.nickname.lock().unwrap_or_else(|e| e.into_inner()) = Some(n.clone());
+        self.shared.lock().nickname = Some(n.clone());
         n
     }
 
@@ -300,16 +351,17 @@ impl QqHandle {
         }
     }
 
-    async fn get_message(&self, id: &str) -> Result<Value> {
-        tokio::time::timeout(FORWARD_TIMEOUT, self.call("get_msg", json!({ "message_id": id }))).await.map_err(|_| anyhow!("get_msg timed out"))?
+    async fn get_message(&self, id: &str, deadline: Instant) -> Result<Value> {
+        Ok(self.call_with_timeout("get_msg", json!({ "message_id": id }), deadline).await?)
     }
 
-    async fn reaction_preview(&self, chat_id: &str, id: &str) -> Option<String> {
-        if let Some(msg) = self.shared.own_messages.lock().unwrap_or_else(|e| e.into_inner())
-            .iter().rev().find(|msg| msg.chat_id == chat_id && msg.id == id) {
-            return Some(msg.preview.clone());
+    async fn reaction_preview(&self, chat_id: &str, id: &str, deadline: Instant) -> Option<String> {
+        let cached = self.shared.lock().own_messages.iter().rev()
+            .find(|msg| msg.chat_id == chat_id && msg.id == id).map(|msg| msg.preview.clone());
+        if cached.is_some() {
+            return cached;
         }
-        let data = self.get_message(id).await.ok()?;
+        let data = self.get_message(id, deadline).await.ok()?;
         let group = data.get("group_id").map(id_string)?;
         let author = data.pointer("/sender/user_id").or_else(|| data.get("user_id"))?;
         if chat_id.strip_prefix("group:") != Some(group.as_str()) || id_string(author) != self.self_id().to_string() {
@@ -348,13 +400,11 @@ impl QqHandle {
     }
 
     /// The nodes of a merged forward.
-    async fn forward_nodes(&self, id: &str) -> Result<Vec<Value>> {
-        let data = tokio::time::timeout(FORWARD_TIMEOUT, self.call("get_forward_msg", json!({ "message_id": id })))
-            .await
-            .map_err(|_| anyhow!("get_forward_msg timed out"))??;
+    async fn forward_nodes(&self, id: &str, deadline: Instant) -> Result<Vec<Value>> {
+        let data = self.call_with_timeout("get_forward_msg", json!({ "message_id": id }), deadline).await?;
         match data.get("messages").or_else(|| data.get("message")) {
             Some(Value::Array(nodes)) => Ok(nodes.clone()),
-            _ => bail!("get_forward_msg returned no messages: {data}"),
+            _ => Err(QqCallError::Transport("get_forward_msg returned no messages".into()).into()),
         }
     }
 }
@@ -430,12 +480,13 @@ async fn run(
     shared: Arc<Shared>,
 ) {
     let mut backoff = Duration::from_secs(2);
+    let mut buffered = VecDeque::new();
     loop {
         match connect(&url, token.as_deref()).await {
             Ok(ws) => {
                 info!("qq connected to {url}");
                 backoff = Duration::from_secs(2);
-                match session(ws, &mut rx, &inbound, &shared).await {
+                match session(ws, &mut rx, &inbound, &mut buffered, &shared).await {
                     Ok(()) => return, // all senders and the inbound side are gone
                     Err(e) => warn!("qq connection lost: {e:#}"),
                 }
@@ -444,12 +495,34 @@ async fn run(
         }
         if rx.is_closed() || inbound.is_closed() { return; }
         crate::error_report::report(crate::error_report::Fault::QqConnection);
-        // Fail requests queued while disconnected instead of letting them hang.
-        while let Ok(req) = rx.try_recv() {
-            let _ = req.reply.send(Err(anyhow!("qq is disconnected")));
+        if !reconnect_backoff(backoff, &mut rx, &inbound, &mut buffered).await {
+            return;
         }
-        tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(60));
+    }
+}
+
+async fn reconnect_backoff(
+    delay: Duration,
+    rx: &mut mpsc::Receiver<Request>,
+    inbound: &mpsc::Sender<Pending>,
+    buffered: &mut VecDeque<Pending>,
+) -> bool {
+    let wait = time::sleep(delay);
+    tokio::pin!(wait);
+    loop {
+        tokio::select! {
+            _ = &mut wait => return true,
+            _ = inbound.closed() => return false,
+            req = rx.recv() => {
+                let Some(req) = req else { return false };
+                let _ = req.reply.send(Err(QqCallError::Disconnected));
+            }
+            permit = inbound.reserve(), if !buffered.is_empty() => {
+                let Ok(permit) = permit else { return false };
+                permit.send(buffered.pop_front().unwrap());
+            }
+        }
     }
 }
 
@@ -464,57 +537,126 @@ async fn connect(url: &str, token: Option<&str>) -> Result<Ws> {
     Ok(ws)
 }
 
+struct PendingCall {
+    deadline: Instant,
+    reply: oneshot::Sender<CallResult>,
+}
+
+fn rpc_response(v: Value) -> CallResult {
+    let status = v.get("status").and_then(Value::as_str);
+    let retcode = v.get("retcode").and_then(Value::as_i64);
+    // OneBot uses retcode 1 for accepted asynchronous calls.
+    if status == Some("async") || retcode == Some(1) {
+        Err(QqCallError::Transport("OneBot accepted the action without confirming completion".into()))
+    } else if status == Some("failed") || retcode.is_some_and(|code| code != 0) {
+        Err(QqCallError::Rejected(v))
+    } else if status == Some("ok") && (v.get("retcode").is_none() || retcode == Some(0)) {
+        Ok(v["data"].clone())
+    } else {
+        Err(QqCallError::Transport("invalid OneBot response status".into()))
+    }
+}
+
 async fn session(
     ws: Ws,
     rx: &mut mpsc::Receiver<Request>,
     inbound: &mpsc::Sender<Pending>,
+    buffered: &mut VecDeque<Pending>,
     shared: &Shared,
-) -> Result<()> {
+) -> Result<(), QqCallError> {
     let (mut sink, mut stream) = ws.split();
-    let mut pending: HashMap<String, oneshot::Sender<Result<Value>>> = HashMap::new();
-    let seq = AtomicU64::new(0);
+    let mut pending: HashMap<String, PendingCall> = HashMap::new();
+    let mut seq = 0u64;
+    let mut sweep = time::interval(PENDING_SWEEP);
+    sweep.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut warned_overflow = false;
     let result = loop {
         tokio::select! {
+            _ = inbound.closed() => break Ok(()),
+            permit = inbound.reserve(), if !buffered.is_empty() => {
+                let Ok(permit) = permit else { break Ok(()) };
+                permit.send(buffered.pop_front().unwrap());
+                warned_overflow = false;
+            }
+            _ = sweep.tick(), if !pending.is_empty() => {
+                let now = Instant::now();
+                for (_, call) in pending.extract_if(|_, call| now >= call.deadline || call.reply.is_closed()) {
+                    let _ = call.reply.send(Err(QqCallError::Timeout));
+                }
+            }
             req = rx.recv() => {
                 let Some(req) = req else { break Ok(()) };
-                let echo = format!("aglibot-{}", seq.fetch_add(1, Ordering::Relaxed));
-                let frame = json!({"action": req.action, "params": req.params, "echo": echo});
-                if let Err(e) = sink.send(Message::text(frame.to_string())).await {
-                    let _ = req.reply.send(Err(anyhow!("qq send failed: {e}")));
-                    break Err(e.into());
+                if req.reply.is_closed() { continue; }
+                let echo = format!("aglibot-{seq}");
+                seq += 1;
+                let frame = Message::text(json!({"action": req.action, "params": req.params, "echo": echo}).to_string());
+                if Instant::now() >= req.deadline {
+                    let _ = req.reply.send(Err(QqCallError::Timeout));
+                    continue;
                 }
-                pending.insert(echo, req.reply);
+                match time::timeout_at(req.deadline, sink.send(frame)).await {
+                    Ok(Ok(())) => {
+                        pending.insert(echo, PendingCall { deadline: req.deadline, reply: req.reply });
+                    }
+                    Ok(Err(error)) => {
+                        let detail = error.to_string();
+                        let _ = req.reply.send(Err(QqCallError::Transport(detail.clone())));
+                        break Err(QqCallError::Transport(detail));
+                    }
+                    Err(_) => {
+                        let _ = req.reply.send(Err(QqCallError::Timeout));
+                        // The cancelled send may have buffered part of its frame.
+                        break Err(QqCallError::Transport("websocket write deadline elapsed".into()));
+                    }
+                }
             }
             msg = stream.next() => {
                 let text = match msg {
-                    None => break Err(anyhow!("socket closed")),
-                    Some(Err(e)) => break Err(e.into()),
-                    Some(Ok(Message::Text(t))) => t.to_string(),
-                    Some(Ok(Message::Ping(p))) => { let _ = sink.send(Message::Pong(p)).await; continue; }
-                    Some(Ok(Message::Close(_))) => break Err(anyhow!("server closed the socket")),
+                    None | Some(Ok(Message::Close(_))) => break Err(QqCallError::Disconnected),
+                    Some(Err(e)) => break Err(QqCallError::Transport(e.to_string())),
+                    Some(Ok(Message::Text(t))) => t,
+                    Some(Ok(Message::Ping(_))) => {
+                        // Tungstenite queues the pong when it reads a ping.
+                        match time::timeout(ACTION_TIMEOUT, sink.flush()).await {
+                            Ok(Ok(())) => continue,
+                            Ok(Err(e)) => break Err(QqCallError::Transport(e.to_string())),
+                            Err(_) => break Err(QqCallError::Transport("websocket pong deadline elapsed".into())),
+                        }
+                    }
                     Some(Ok(_)) => continue,
                 };
-                let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    break Err(QqCallError::Transport("invalid OneBot JSON".into()));
+                };
                 if let Some(echo) = v.get("echo").and_then(Value::as_str) {
-                    if let Some(reply) = pending.remove(echo) {
-                        let ok = v.get("status").and_then(Value::as_str) == Some("ok");
-                        let _ = reply.send(if ok { Ok(v["data"].clone()) } else { Err(anyhow!("qq action failed: {v}")) });
+                    if let Some(call) = pending.remove(echo) {
+                        let response = if Instant::now() >= call.deadline { Err(QqCallError::Timeout) } else { rpc_response(v) };
+                        let _ = call.reply.send(response);
                     }
                     continue;
                 }
                 if let Some(id) = v.get("self_id").and_then(Value::as_i64) {
                     shared.self_id.store(id, Ordering::Relaxed);
                 }
-                if let Some(p) = parse_event(&v, shared)
-                    && inbound.send(p).await.is_err()
-                {
-                    break Ok(());
+                if let Some(p) = parse_event(&v, shared) {
+                    if buffered.len() == INBOUND_CAPACITY {
+                        buffered.pop_front();
+                        if !warned_overflow {
+                            warn!("qq inbound buffer full; dropping oldest buffered events");
+                            warned_overflow = true;
+                        }
+                    }
+                    buffered.push_back(p);
                 }
             }
         }
     };
-    for (_, reply) in pending.drain() {
-        let _ = reply.send(Err(anyhow!("qq connection dropped")));
+    for call in pending.into_values() {
+        let error = match &result {
+            Err(QqCallError::Transport(detail)) => QqCallError::Transport(detail.clone()),
+            _ => QqCallError::Disconnected,
+        };
+        let _ = call.reply.send(Err(error));
     }
     result
 }
@@ -620,7 +762,7 @@ fn parse_notice(v: &Value, shared: &Shared) -> Option<Pending> {
             v.get("operator_id").and_then(Value::as_i64).unwrap_or(member), "[撤回了一条消息]", false),
         "notify" if v["sub_type"] == "poke" && v["target_id"].as_i64() == Some(self_id) => {
             let now = tokio::time::Instant::now();
-            let mut pokes = shared.pokes.lock().unwrap_or_else(|e| e.into_inner());
+            let pokes = &mut shared.lock().pokes;
             pokes.retain(|_, t| now.duration_since(*t) < Duration::from_secs(600));
             if pokes.contains_key(&(chat_id.clone(), member)) { return None; }
             pokes.insert((chat_id.clone(), member), now);
@@ -693,7 +835,7 @@ fn images_in(segments: &[Value]) -> Vec<Attachment> {
 fn finish(mut p: Pending, forwards: &Forwards, shared: &Shared, reply: &str) -> Option<Envelope> {
     if p.env.notice {
         if let Some(id) = p.recalled_id {
-            let mut recent = shared.recent.lock().unwrap_or_else(|e| e.into_inner());
+            let recent = &mut shared.lock().recent;
             if let Some(i) = recent.iter().position(|(key, _)| key == &id) {
                 let (_, quoted) = recent.remove(i)?;
                 p.env.text = format!("[撤回了一条消息: {}]", message_preview(&quoted.text));
@@ -1073,7 +1215,7 @@ mod tests {
                 assert_eq!(req.params["message_id"], "-9");
                 req.reply.send(Ok(json!({"group_id": group, "sender":{"user_id":author}, "message":"旧消息"}))).unwrap();
             };
-            let (actual, ()) = tokio::join!(qq.reaction_preview("group:34", "-9"), respond);
+            let (actual, ()) = tokio::join!(qq.reaction_preview("group:34", "-9", Instant::now() + FORWARD_TIMEOUT), respond);
             assert_eq!(actual.as_deref(), expected);
         }
     }
@@ -1141,7 +1283,7 @@ mod tests {
         assert_eq!(env.sender_id, "12");
         assert!(env.notice && env.mentions_me);
         assert!(parse_event(&v, &s).is_none());
-        s.pokes.lock().unwrap().insert(("group:34".into(), 12), tokio::time::Instant::now() - Duration::from_secs(600));
+        s.lock().pokes.insert(("group:34".into(), 12), tokio::time::Instant::now() - Duration::from_secs(600));
         assert!(parse_event(&v, &s).is_some());
         v["user_id"] = json!(13);
         assert!(parse_event(&v, &s).is_some());
@@ -1491,7 +1633,7 @@ mod tests {
         for (seg, want) in cases {
             assert_eq!(text_of(&s, json!([seg.clone()])), want, "{seg}");
         }
-        assert!(s.unknown_types.lock().unwrap().contains("shake"));
+        assert!(s.lock().unknown_types.contains("shake"));
     }
 
     #[test]
@@ -1581,25 +1723,33 @@ mod tests {
         assert!(s.cached("1").is_none());
         s.cache("0".into(), Quoted { name: "我".into(), text: "updated".into(), images: Vec::new() });
         assert_eq!(s.cached("0").unwrap().text, "updated");
-        assert_eq!(s.recent.lock().unwrap().len(), RECENT_MESSAGES);
+        assert_eq!(s.lock().recent.len(), RECENT_MESSAGES);
     }
 
     #[tokio::test]
-    async fn id_only_files_request_their_platform_url_and_check_its_destination() {
-        for (chat, expected) in [("group:34", "get_group_file_url"), ("private:72", "get_private_file_url")] {
+    async fn attachment_refresh_uses_the_platform_action_and_validates_the_result() {
+        for (kind, chat, expected) in [
+            (AttachmentKind::File, "group:34", "get_group_file_url"),
+            (AttachmentKind::File, "private:72", "get_private_file_url"),
+            (AttachmentKind::Image, "group:34", "get_image"),
+        ] {
             let (tx, mut rx) = mpsc::channel::<Request>(2);
             let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
             let outlets = super::super::Outlets { qq: Some(qq), telegram: None };
-            let file = Attachment { kind: AttachmentKind::File, file_id: Some("opaque-id".into()), name: Some("sample.pdf".into()),
-                url: None, size: None, quoted_from: None, media_id: None };
+            let file = Attachment { kind, file_id: Some("opaque-id".into()), name: None,
+                url: (expected == "get_image").then(|| "http://10.0.0.1/stale".into()),
+                size: None, quoted_from: None, media_id: None };
             let respond = async {
                 let req = rx.recv().await.unwrap();
                 assert_eq!(req.action, expected);
-                assert_eq!(req.params["file_id"], "opaque-id");
-                if chat.starts_with("group:") { assert_eq!(req.params["group_id"], 34); }
+                match expected {
+                    "get_image" => assert_eq!(req.params, json!({"file":"opaque-id"})),
+                    "get_group_file_url" => assert_eq!(req.params, json!({"group_id":34,"file_id":"opaque-id"})),
+                    _ => assert_eq!(req.params, json!({"file_id":"opaque-id"})),
+                }
                 req.reply.send(Ok(json!({"url":"http://127.0.0.1/blocked"}))).unwrap();
             };
-            let (result, ()) = tokio::join!(outlets.download_file("qq", chat, &file, 64), respond);
+            let (result, ()) = tokio::join!(outlets.fetch_attachment("qq", chat, &file, 64), respond);
             assert!(result.unwrap_err().to_string().contains("公网"));
         }
     }
@@ -1636,7 +1786,7 @@ mod tests {
         ] {
             let (tx, mut rx) = mpsc::channel::<Request>(8);
             let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
-            qq.shared.last_inbound.lock().unwrap().insert(chat.into(), Some(last.into()));
+            qq.shared.lock().last_inbound.insert(chat.into(), Some(last.into()));
             let body = format!("[CQ:at,qq=42]{}", "字".repeat(CHUNK_CHARS));
             let chunks = super::super::telegram::chunks(&body, CHUNK_CHARS);
             let respond = async {
@@ -1660,7 +1810,7 @@ mod tests {
         for (chat, last, quoted) in [("group:34", "2", true), ("group:34", "1", false), ("private:34", "2", false)] {
             let (tx, mut rx) = mpsc::channel::<Request>(8);
             let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
-            qq.shared.last_inbound.lock().unwrap().insert(chat.into(), Some(last.into()));
+            qq.shared.lock().last_inbound.insert(chat.into(), Some(last.into()));
             let pieces = vec![
                 ReplyPiece::Text("先说：".into()),
                 ReplyPiece::Mention { name: "小明".into(), qq_id: Some(42) },
@@ -1721,7 +1871,7 @@ mod tests {
             for fail in [false, true] {
                 let (tx, mut rx) = mpsc::channel::<Request>(8);
                 let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
-                *qq.shared.nickname.lock().unwrap() = Some("小庄".into());
+                qq.shared.lock().nickname = Some("小庄".into());
                 let pieces = vec![ReplyPiece::Mention { name: "小明".into(), qq_id: Some(42) },
                     ReplyPiece::Text(format!("[CQ:at,qq=42]{}", "字".repeat(CHUNK_CHARS * 2)))];
                 let body = reply_text(&pieces);
@@ -1738,7 +1888,7 @@ mod tests {
                             "user_id":99, "nickname":"小庄", "content":[text(chunk)]}}));
                     }
                     if fail {
-                        req.reply.send(Err(anyhow!("forward rejected"))).unwrap();
+                        req.reply.send(rpc_response(json!({"status":"failed","retcode":1200}))).unwrap();
                         for (i, chunk) in chunks.iter().enumerate() {
                             let req = rx.recv().await.unwrap();
                             assert_eq!(req.action, plain);
@@ -1759,6 +1909,170 @@ mod tests {
                 assert_eq!(cached.text, chunks[0]);
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_forward_failures_never_send_plain_chunks() {
+        for response in [None, Some(rpc_response(json!({"status":"unexpected"}))),
+            Some(rpc_response(json!({"status":"async","retcode":1}))), Some(Err(QqCallError::Disconnected))] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+            qq.shared.lock().nickname = Some("nick".into());
+            let body = "字".repeat(2 * CHUNK_CHARS + 1);
+            let respond = async {
+                let request: Request = rx.recv().await.unwrap();
+                assert_eq!(request.action, "send_group_forward_msg");
+                if let Some(result) = response {
+                    request.reply.send(result).unwrap();
+                    None
+                } else {
+                    // Keep the sender alive past the RPC deadline without replying.
+                    Some(request)
+                }
+            };
+            let (result, unanswered) = tokio::join!(qq.send("group:34", &body), respond);
+            let error = result.unwrap_err().downcast::<QqCallError>().unwrap();
+            if unanswered.is_some() {
+                assert!(matches!(error, QqCallError::Timeout));
+            } else {
+                assert!(matches!(error, QqCallError::Transport(_) | QqCallError::Disconnected));
+            }
+            assert!(rx.try_recv().is_err());
+        }
+        assert!(matches!(rpc_response(json!({"status":"ok","retcode":1200})), Err(QqCallError::Rejected(_))));
+        assert!(matches!(rpc_response(json!({"retcode":1})), Err(QqCallError::Transport(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rpc_deadline_covers_waiting_for_queue_space() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+        let deadline = Instant::now() + FORWARD_TIMEOUT;
+        let (reply, _result) = oneshot::channel();
+        qq.tx.try_send(Request { action: "occupied", params: Value::Null, deadline, reply }).unwrap();
+        let error = qq.get_message("1", deadline).await.unwrap_err();
+        assert!(matches!(error.downcast_ref(), Some(QqCallError::Timeout)));
+        assert!(Instant::now() >= deadline);
+        assert!(Instant::now() - deadline <= Duration::from_millis(2));
+        assert_eq!(rx.try_recv().unwrap().action, "occupied");
+        let error = qq.forward_nodes("2", deadline).await.unwrap_err();
+        assert!(matches!(error.downcast_ref(), Some(QqCallError::Timeout)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nested_enrichment_lookups_share_one_deadline() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+        let (raw_tx, raw_rx) = mpsc::channel(1);
+        let (in_tx, mut in_rx) = mpsc::channel(1);
+        raw_tx.send(super::parse_event(&group(json!([
+            {"type":"forward","data":{"id":"f"}}, reply("2"), text("body")
+        ])), &qq.shared).unwrap()).await.unwrap();
+        drop(raw_tx);
+        let respond = async {
+            let forward = rx.recv().await.unwrap();
+            assert_eq!(forward.action, "get_forward_msg");
+            time::advance(Duration::from_secs(1)).await;
+            forward.reply.send(Ok(json!({"messages":[]}))).unwrap();
+            let quote = rx.recv().await.unwrap();
+            assert_eq!(quote.action, "get_msg");
+            assert_eq!(quote.deadline, forward.deadline);
+            quote.reply.send(Ok(node("甲", json!([text("原文")])))).unwrap();
+        };
+        tokio::join!(enrich(raw_rx, qq, in_tx), respond);
+        assert!(in_rx.recv().await.unwrap().text.contains("原文"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_backoff_rejects_new_calls_immediately() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let qq = QqHandle { tx, shared: Arc::new(shared(99)) };
+        let (inbound, _events) = mpsc::channel(1);
+        let mut buffered = VecDeque::new();
+        let start = Instant::now();
+        let backoff = tokio::spawn(async move {
+            reconnect_backoff(Duration::from_secs(60), &mut rx, &inbound, &mut buffered).await
+        });
+        tokio::task::yield_now().await;
+        let result = qq.call("get_login_info", json!({})).await;
+        assert!(matches!(result, Err(QqCallError::Disconnected)));
+        assert_eq!(Instant::now(), start);
+        drop(qq);
+        assert!(!backoff.await.unwrap());
+    }
+
+    async fn websocket_pair() -> (Ws, tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let accept = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        };
+        let (client, server) = tokio::join!(connect(&url, None), accept);
+        (client.unwrap(), server)
+    }
+
+    #[tokio::test]
+    async fn session_skips_expired_requests_and_evicts_unanswered_calls() {
+        let (client, mut server) = websocket_pair().await;
+        let (tx, mut rx) = mpsc::channel(2);
+        let (inbound, _events) = mpsc::channel(1);
+        let (reply, expired) = oneshot::channel();
+        tx.send(Request { action: "expired", params: Value::Null, deadline: Instant::now(), reply }).await.unwrap();
+        let (reply, unanswered) = oneshot::channel();
+        tx.send(Request { action: "unanswered", params: Value::Null, deadline: Instant::now() + 2 * PENDING_SWEEP, reply }).await.unwrap();
+        let task = tokio::spawn(async move {
+            session(client, &mut rx, &inbound, &mut VecDeque::new(), &shared(99)).await
+        });
+        let frame = time::timeout(ACTION_TIMEOUT, server.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["action"], "unanswered");
+        assert!(matches!(expired.await.unwrap(), Err(QqCallError::Timeout)));
+        // No caller-side timer or server echo can resolve this receiver.
+        time::pause();
+        assert!(matches!(time::timeout(5 * PENDING_SWEEP, unanswered).await.unwrap().unwrap(), Err(QqCallError::Timeout)));
+        drop(tx);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_inbound_channel_preserves_heartbeat_rpc_and_bounded_fifo() {
+        let (client, mut server) = websocket_pair().await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let shared = Arc::new(shared(99));
+        let qq = QqHandle { tx, shared: shared.clone() };
+        let (inbound, mut events) = mpsc::channel(1);
+        let sample = group(json!([text("body")]));
+        inbound.send(super::parse_event(&sample, &shared).unwrap()).await.unwrap();
+        let task = tokio::spawn(async move {
+            session(client, &mut rx, &inbound, &mut VecDeque::new(), &shared).await
+        });
+        let exercise = async {
+            for id in 2..=INBOUND_CAPACITY + 3 {
+                let mut event = sample.clone();
+                event["message_id"] = json!(id);
+                server.send(Message::text(event.to_string())).await.unwrap();
+            }
+            server.send(Message::Ping(vec![42].into())).await.unwrap();
+            assert_eq!(server.next().await.unwrap().unwrap(), Message::Pong(vec![42].into()));
+
+            let respond = async {
+                let frame = server.next().await.unwrap().unwrap();
+                let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                assert_eq!(frame["action"], "get_login_info");
+                server.send(Message::text(json!({"status":"ok","echo":frame["echo"],"data":{"user_id":99}}).to_string())).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(qq.call("get_login_info", json!({})), respond);
+            assert_eq!(result.unwrap()["user_id"], 99);
+            for id in std::iter::once(1).chain(4..=INBOUND_CAPACITY + 3) {
+                assert_eq!(events.recv().await.unwrap().env.message_id, Some(id.to_string()));
+            }
+        };
+        time::timeout(ACTION_TIMEOUT, exercise).await.unwrap();
+        drop(qq);
+        task.await.unwrap().unwrap();
+        assert!(events.recv().await.is_none());
     }
 
     #[tokio::test]
@@ -1801,7 +2115,7 @@ mod tests {
         }
         drop(raw_tx);
         enrich(raw_rx, qq.clone(), in_tx).await;
-        let last = qq.shared.last_inbound.lock().unwrap();
+        let last = &qq.shared.lock().last_inbound;
         assert_eq!(last.get("group:34"), Some(&Some("3".into())));
         assert_eq!(last.get("private:5"), Some(&None));
     }
@@ -1813,7 +2127,7 @@ mod tests {
         dotenvy::dotenv().ok();
         let (tx, _rx) = mpsc::channel(8);
         let qq = spawn(std::env::var("ONEBOT_URL")?, std::env::var("ONEBOT_TOKEN").ok(), tx);
-        let data = qq.get_message(&std::env::var("REPLY_ID")?).await?;
+        let data = qq.get_message(&std::env::var("REPLY_ID")?, Instant::now() + FORWARD_TIMEOUT).await?;
         assert!(data.get("message").is_some_and(|m| m.is_array() || m.is_string()));
         Ok(())
     }
@@ -1825,7 +2139,7 @@ mod tests {
         dotenvy::dotenv().ok();
         let (tx, _rx) = mpsc::channel(8);
         let qq = spawn(std::env::var("ONEBOT_URL")?, std::env::var("ONEBOT_TOKEN").ok(), tx);
-        let nodes = qq.forward_nodes(&std::env::var("FORWARD_ID")?).await?;
+        let nodes = qq.forward_nodes(&std::env::var("FORWARD_ID")?, Instant::now() + FORWARD_TIMEOUT).await?;
         assert!(!nodes.is_empty());
         let s = Shared::default();
         let msg = json!({"post_type": "message", "message_type": "private", "user_id": 5,

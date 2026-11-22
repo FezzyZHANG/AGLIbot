@@ -10,7 +10,7 @@ use chrono::{DateTime, Duration as ChronoDuration, TimeZone};
 use crate::work::{board::{TaskKind, TaskStatus, ThreadRef}, research::Job};
 use serde_json::{Value, json};
 use super::commands::attach_followups;
-use super::ingress::{WorkQueue, next_work, owner_command};
+use super::ingress::{WorkQueue, next_work, owner_command, recv_work};
 use super::jobs::delivery_preview;
 use super::scheduler::OVERNIGHT_CHATS;
 use crate::config::DebounceCfg;
@@ -105,7 +105,7 @@ async fn debounce_three_spaced_owner_messages_prepare_one_reply() {
     let a = &mut test.bot;
     let (tx, mut rx) = mpsc::channel(16);
     let mut queue = WorkQueue::new();
-    let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session));
+    let mut recv = Box::pin(recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session));
     for (i, text) in ["先查方案 A", "再对比方案 B", "给我结论"].into_iter().enumerate() {
         if i != 0 { tokio::time::advance(Duration::from_secs(1)).await; }
         tx.try_send(inbound("42", text, &i.to_string())).unwrap();
@@ -133,7 +133,7 @@ async fn debounce_single_message_waits_for_quiet() {
     let (tx, mut rx) = mpsc::channel(16);
     let mut queue = WorkQueue::new();
     tx.try_send(inbound("42", "hello", "1")).unwrap();
-    let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+    let mut recv = Box::pin(recv_work(&mut rx, &mut queue, &acl, &session));
     assert!(poll_once(recv.as_mut()).is_pending());
     tokio::time::advance(Duration::from_millis(2499)).await;
     assert!(poll_once(recv.as_mut()).is_pending());
@@ -153,10 +153,10 @@ async fn debounce_steady_stream_stops_at_cap_even_after_cancellation() {
         if i != 0 { tokio::time::advance(Duration::from_secs(1)).await; }
         tx.try_send(inbound("42", &i.to_string(), &i.to_string())).unwrap();
         // Drop and recreate the future every second: neither deadline may restart.
-        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+        let mut recv = Box::pin(recv_work(&mut rx, &mut queue, &acl, &session));
         assert!(poll_once(recv.as_mut()).is_pending());
     }
-    let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+    let mut recv = Box::pin(recv_work(&mut rx, &mut queue, &acl, &session));
     assert!(poll_once(recv.as_mut()).is_pending());
     tokio::time::advance(Duration::from_millis(999)).await;
     assert!(poll_once(recv.as_mut()).is_pending());
@@ -170,7 +170,7 @@ async fn debounce_steady_stream_stops_at_cap_even_after_cancellation() {
         "basis=fixed", "cap_ended=true"] {
         assert!(logged.contains(field), "{logged}");
     }
-    assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["next batch"]);
+    assert_eq!(texts(recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["next batch"]);
     assert_eq!(Instant::now() - started, Duration::from_millis(12500));
 }
 
@@ -182,22 +182,22 @@ async fn debounce_command_flushes_pending_messages_and_skips_wait() {
     let mut queue = WorkQueue::new();
     tx.try_send(inbound("42", "/status", "0")).unwrap();
     let started = Instant::now();
-    let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+    let mut recv = Box::pin(recv_work(&mut rx, &mut queue, &acl, &session));
     assert_eq!(texts(ready(recv.as_mut()).unwrap()), ["/status"]);
     drop(recv);
     tx.try_send(inbound("42", "before", "1")).unwrap();
-    let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+    let mut recv = Box::pin(recv_work(&mut rx, &mut queue, &acl, &session));
     assert!(poll_once(recv.as_mut()).is_pending());
     tokio::time::advance(Duration::from_secs(1)).await;
     tx.try_send(inbound("42", " /tasks", "2")).unwrap();
     tx.try_send(inbound("42", "after", "3")).unwrap();
     assert_eq!(texts(ready(recv.as_mut()).unwrap()), ["before"]);
     drop(recv);
-    let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+    let mut recv = Box::pin(recv_work(&mut rx, &mut queue, &acl, &session));
     assert_eq!(texts(ready(recv.as_mut()).unwrap()), [" /tasks"]);
     drop(recv);
     assert_eq!(Instant::now() - started, Duration::from_secs(1));
-    assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["after"]);
+    assert_eq!(texts(recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["after"]);
     assert_eq!(Instant::now() - started, Duration::from_millis(3500));
 }
 
@@ -208,7 +208,7 @@ async fn debounce_cancellation_preserves_interleaved_events_and_quiet_deadline()
     let (tx, mut rx) = mpsc::channel(16);
     let mut queue = WorkQueue::new();
     tx.try_send(inbound("42", "first", "1")).unwrap();
-    let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+    let mut recv = Box::pin(recv_work(&mut rx, &mut queue, &acl, &session));
     assert!(poll_once(recv.as_mut()).is_pending());
     tokio::time::advance(Duration::from_secs(1)).await;
     for event in [Event::Tick, inbound("7", "other chat", "2"), Event::JobDone(research::Outcome {
@@ -219,7 +219,7 @@ async fn debounce_cancellation_preserves_interleaved_events_and_quiet_deadline()
     assert!(poll_once(recv.as_mut()).is_pending());
     drop(recv);
     tokio::time::advance(Duration::from_secs(1)).await;
-    let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+    let mut recv = Box::pin(recv_work(&mut rx, &mut queue, &acl, &session));
     assert!(poll_once(recv.as_mut()).is_pending());
     tokio::time::advance(Duration::from_millis(1499)).await;
     assert!(poll_once(recv.as_mut()).is_pending());
@@ -227,14 +227,14 @@ async fn debounce_cancellation_preserves_interleaved_events_and_quiet_deadline()
     assert_eq!(texts(ready(recv.as_mut()).unwrap()), ["first", "second"]);
     drop(recv);
     let now = Instant::now();
-    assert!(matches!(crate::recv_work(&mut rx, &mut queue, &acl, &session).await, Some(WorkItem::Tick)));
-    assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["other chat"]);
-    let Some(WorkItem::JobDone(o)) = crate::recv_work(&mut rx, &mut queue, &acl, &session).await else { panic!("lost job") };
+    assert!(matches!(recv_work(&mut rx, &mut queue, &acl, &session).await, Some(WorkItem::Tick)));
+    assert_eq!(texts(recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["other chat"]);
+    let Some(WorkItem::JobDone(o)) = recv_work(&mut rx, &mut queue, &acl, &session).await else { panic!("lost job") };
     assert_eq!((o.task_id.as_str(), o.summary.as_str()), ("task-1", "result"));
     assert_eq!(Instant::now(), now);
     assert!(queue.is_empty());
     drop(tx);
-    assert!(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.is_none());
+    assert!(recv_work(&mut rx, &mut queue, &acl, &session).await.is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -243,7 +243,7 @@ async fn debounce_group_messages_keep_every_speaker_and_floor_input() {
     let a = &mut test.bot;
     let (tx, mut rx) = mpsc::channel(16);
     let mut queue = WorkQueue::new();
-    let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session));
+    let mut recv = Box::pin(recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session));
     for env in group_messages(&["one", "/status", "three"], false) {
         tx.try_send(Event::Inbound(env)).unwrap();
         assert!(poll_once(recv.as_mut()).is_pending());
@@ -267,7 +267,7 @@ async fn debounce_zero_disables_wait_and_closed_channel_flushes() {
         let mut queue = WorkQueue::new();
         tx.try_send(inbound("42", "hello", "1")).unwrap();
         if session.debounce.quiet_ms != 0 { drop(tx); }
-        let mut recv = Box::pin(crate::recv_work(&mut rx, &mut queue, &acl, &session));
+        let mut recv = Box::pin(recv_work(&mut rx, &mut queue, &acl, &session));
         assert_eq!(texts(ready(recv.as_mut()).unwrap()), ["hello"]);
     }
 }
@@ -1523,16 +1523,16 @@ async fn three_queued_owner_messages_prepare_one_turn_and_keep_individual_record
     let (tx, mut rx) = mpsc::channel(16);
     let mut queue = WorkQueue::new();
     tx.try_send(inbound("42", "earlier turn", "0")).unwrap();
-    let in_flight = crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session).await.unwrap();
+    let in_flight = recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session).await.unwrap();
     assert_eq!(texts(in_flight), ["earlier turn"]);
     // While that turn is handled, these three messages arrive without another receive.
     for ev in [inbound("42", "先查方案 A", "1"), inbound("42", "再对比方案 B", "2"), inbound("42", "给我结论", "3")] {
         tx.try_send(ev).unwrap();
     }
     drop(tx);
-    let work = crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session).await.unwrap();
+    let work = recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session).await.unwrap();
     let batch = a.prepare_messages(messages(work)).await;
-    assert!(crate::recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session).await.is_none());
+    assert!(recv_work(&mut rx, &mut queue, &a.cfg.acl, &a.cfg.runtime.session).await.is_none());
     assert!(queue.is_empty());
     assert!(batch.speak && !batch.consider);
     assert_eq!(batch.current, 3);
@@ -1563,12 +1563,12 @@ async fn newly_arrived_messages_join_the_next_queued_batch_after_a_boundary() {
     for ev in [inbound("42", "first", "1"), Event::Tick, inbound("42", "second", "2")] {
         tx.try_send(ev).unwrap();
     }
-    assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["first"]);
+    assert_eq!(texts(recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["first"]);
     tx.try_send(inbound("42", "third", "3")).unwrap();
     drop(tx);
-    assert!(matches!(crate::recv_work(&mut rx, &mut queue, &acl, &session).await, Some(WorkItem::Tick)));
-    assert_eq!(texts(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["second", "third"]);
-    assert!(crate::recv_work(&mut rx, &mut queue, &acl, &session).await.is_none());
+    assert!(matches!(recv_work(&mut rx, &mut queue, &acl, &session).await, Some(WorkItem::Tick)));
+    assert_eq!(texts(recv_work(&mut rx, &mut queue, &acl, &session).await.unwrap()), ["second", "third"]);
+    assert!(recv_work(&mut rx, &mut queue, &acl, &session).await.is_none());
 }
 
 #[tokio::test]
@@ -1659,7 +1659,6 @@ async fn bounded_source_reaches_same_chat_followup_and_matching_task_only() -> R
     let mock = Router::new()
         .route("/bot-fixture/getFile", get(|| async { Json(json!({"result":{"file_path":"drawing.png"}})) }))
         .route("/bot-fixture/sendMessage", post(|| async { Json(json!({"ok":true})) }))
-        .route("/file/bot-fixture/drawing.png", get(move || async move { bytes }))
         .route("/v1/tools/fetch", post(|| async { Json(json!({"title":"Sample","content":"unused-detail=7291"})) }))
         .route("/chat/completions", post(move |Json(body): Json<Value>| {
             let capture = capture.clone();
@@ -1679,7 +1678,8 @@ async fn bounded_source_reaches_same_chat_followup_and_matching_task_only() -> R
     cfg.models.providers.get_mut("test").unwrap().base_url = Some(origin.clone());
     cfg.models.models[0].stream = false;
     a.models = Arc::new(Models::new(cfg, a.store.clone()).await?);
-    a.outlets.telegram = Some(crate::channels::telegram::Telegram::fixture(format!("{origin}/bot-fixture")));
+    a.outlets.telegram = Some(crate::channels::telegram::Telegram::fixture(format!("{origin}/bot-fixture"))
+        .with_fixture_file("drawing.png", bytes));
     let mut env = private_message("42", "读这个网页");
     env.attachments.push(Attachment {kind: AttachmentKind::Link, url: Some("https://8.8.8.8/wiki?title=First#details".into()), name: None, file_id: None, size: None, media_id: None, quoted_from: None});
     let batch = a.prepare_messages(vec![env]).await;

@@ -22,7 +22,7 @@ impl Bot {
     pub(super) async fn converse_with_options(&mut self, ctx: &ChatCtx, mut body: String, current: usize, unsolicited: bool, may_quit: bool) -> Result<()> {
         // Addressed turns only: chiming in never spends a look, and the images keep waiting.
         let mut look = match self.pending_media.remove(&ctx.key) {
-            Some(pending) if !unsolicited => crate::mind::vision::look(&self.outlets, &self.media, pending).await,
+            Some(pending) if !unsolicited => crate::mind::vision::look(&self.outlets, &self.media, &ctx.chat_id, pending).await,
             Some(pending) => {
                 self.pending_media.insert(ctx.key.clone(), pending);
                 Default::default()

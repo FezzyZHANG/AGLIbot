@@ -22,14 +22,24 @@ pub struct Telegram {
     /// The bot's own id and username, for detecting @mentions and replies to it in groups.
     me_id: i64,
     me_username: String,
+    #[cfg(test)]
+    fixture_file: Option<(&'static str, Vec<u8>)>,
 }
 
 impl Telegram {
     #[cfg(test)]
     pub(crate) fn fixture(base: String) -> Self {
         assert!(base.starts_with("http://127.0.0.1:"));
-        Self { http: reqwest::Client::builder().no_proxy().build().unwrap(), base, offset: 0, poll_timeout_s: 1, me_id: 1, me_username: "fixture".into() }
+        Self { http: reqwest::Client::builder().no_proxy().build().unwrap(), base, offset: 0, poll_timeout_s: 1,
+            me_id: 1, me_username: "fixture".into(), fixture_file: None }
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_fixture_file(mut self, path: &'static str, bytes: Vec<u8>) -> Self {
+        self.fixture_file = Some((path, bytes));
+        self
+    }
+
     pub fn from_env(cfg: &TelegramCfg) -> Result<Self> {
         let token = std::env::var("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN is not set")?;
         let http = http_client(cfg)?;
@@ -40,6 +50,8 @@ impl Telegram {
             poll_timeout_s: cfg.poll_timeout_s,
             me_id: 0,
             me_username: String::new(),
+            #[cfg(test)]
+            fixture_file: None,
         })
     }
 
@@ -104,16 +116,19 @@ impl Telegram {
         Ok(out)
     }
 
-    /// Download a file by id.
+    /// Resolve a file id through the Bot API, then download it through the shared HTTP path.
     pub async fn fetch_file(&self, file_id: &str, max: usize) -> Result<Vec<u8>> {
         let v: Value = self.http.get(format!("{}/getFile", self.base)).query(&[("file_id", file_id)])
             .send().await.map_err(reqwest::Error::without_url)?
             .json().await.map_err(reqwest::Error::without_url)?;
         let Some(path) = v.pointer("/result/file_path").and_then(Value::as_str) else { bail!("getFile returned no path") };
+        #[cfg(test)]
+        if let Some((expected_path, bytes)) = &self.fixture_file {
+            anyhow::ensure!(path == *expected_path, "getFile did not resolve the fixture path");
+            return super::read_capped(axum::http::Response::new(bytes.clone()).into(), max).await;
+        }
         let url = format!("{}/{path}", self.base.replacen("/bot", "/file/bot", 1));
-        let response = self.http.get(url).send().await.map_err(reqwest::Error::without_url)?
-            .error_for_status().map_err(reqwest::Error::without_url)?;
-        super::read_capped(response, max).await
+        super::urls::download(&url, max).await
     }
 
     pub async fn send(&self, chat_id: &str, text: &str) -> Result<()> {
@@ -363,6 +378,7 @@ mod tests {
             poll_timeout_s: cfg.poll_timeout_s,
             me_id: 0,
             me_username: String::new(),
+            fixture_file: None,
         };
         assert!(tg.poll().await.unwrap().is_empty());
         tg.send("42", "proxy test").await.unwrap();
@@ -384,6 +400,7 @@ mod tests {
                 poll_timeout_s: 1,
                 me_id: 0,
                 me_username: String::new(),
+                fixture_file: None,
             };
             vec![
                 tg.identify().await.unwrap_err(),

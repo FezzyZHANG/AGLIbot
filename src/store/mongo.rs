@@ -555,6 +555,25 @@ impl MongoStore {
         self.collection("media")
             .delete_one(doc! { "_id": hash })
             .await?;
+        self.delete_sticker_vector(hash).await
+    }
+
+    pub async fn delete_unused_media(&self, hash: &str, cutoff: DateTime<Utc>) -> Result<bool> {
+        let result = self.collection("media")
+            .delete_one(doc! {
+                "_id": hash,
+                "status": { "$in": [bson::to_bson(&MediaStatus::Seen)?, bson::to_bson(&MediaStatus::Rejected)?] },
+                "last_seen": { "$lt": bson_dt(cutoff) },
+            })
+            .await?;
+        if result.deleted_count == 0 {
+            return Ok(false);
+        }
+        self.delete_sticker_vector(hash).await?;
+        Ok(true)
+    }
+
+    async fn delete_sticker_vector(&self, hash: &str) -> Result<()> {
         self.collection("sticker_vectors")
             .delete_one(doc! { "_id": hash })
             .await?;

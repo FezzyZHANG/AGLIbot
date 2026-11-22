@@ -343,6 +343,18 @@ impl MemStore {
         Ok(())
     }
 
+    pub fn delete_unused_media(&self, hash: &str, cutoff: DateTime<Utc>) -> Result<bool> {
+        let mut data = self.write()?;
+        let expired = data.media.get(hash).is_some_and(|record| {
+            matches!(record.status, MediaStatus::Seen | MediaStatus::Rejected) && record.last_seen < cutoff
+        });
+        if expired {
+            data.media.remove(hash);
+            data.sticker_vectors.remove(hash);
+        }
+        Ok(expired)
+    }
+
     pub fn sticker_vectors(&self, model_id: &str) -> Result<BTreeMap<String, StickerVector>> {
         Ok(self
             .read()?

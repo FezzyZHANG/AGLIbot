@@ -17,7 +17,7 @@ const QUEUE_SIZE: usize = 64;
 // Only fixed catalog entries cross the notification boundary. Underlying errors may
 // contain request URLs, message contents or credentials and stay with the local caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Fault {
+pub enum Fault {
     StartupConfig,
     StartupStore,
     StartupModels,
@@ -135,7 +135,7 @@ impl Queue {
 
 static REPORTS: OnceLock<Queue> = OnceLock::new();
 
-pub(crate) fn report(fault: Fault) {
+pub fn report(fault: Fault) {
     tracing::error!(%fault, "runtime error");
     #[cfg(test)]
     let _ = CAPTURE.try_with(|list| list.borrow_mut().push(fault));
@@ -164,13 +164,13 @@ pub(crate) async fn capture<T>(future: impl Future<Output = T>) -> (T, Vec<Fault
         .await
 }
 
-pub(crate) struct Reporter {
+pub struct Reporter {
     stop: oneshot::Sender<()>,
     worker: JoinHandle<()>,
 }
 
 impl Reporter {
-    pub(crate) fn start(tg: Option<&Telegram>, owner_id: i64) -> Option<Self> {
+    pub fn start(tg: Option<&Telegram>, owner_id: i64) -> Option<Self> {
         let tg = tg.filter(|_| owner_id > 0)?;
         let (queue, reporter) = Self::spawn(tg.clone(), owner_id);
         REPORTS
@@ -218,7 +218,7 @@ impl Reporter {
         )
     }
 
-    pub(crate) async fn shutdown(mut self) {
+    pub async fn shutdown(mut self) {
         let _ = self.stop.send(());
         if timeout(SHUTDOWN_TIMEOUT, &mut self.worker).await.is_err() {
             self.worker.abort();
