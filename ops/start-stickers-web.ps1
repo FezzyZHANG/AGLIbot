@@ -9,16 +9,28 @@ $ErrorActionPreference = 'Stop'
 $rt = (Resolve-Path -LiteralPath $Runtime).Path
 $current = Join-Path $rt 'data\logs\stickers-web.json'
 
+$running = $null
 if (Test-Path -LiteralPath $current) {
     $old = Get-Content -Raw -LiteralPath $current | ConvertFrom-Json
     $running = Get-CimInstance Win32_Process -Filter "ProcessId=$($old.pid)" | Where-Object { $_.CommandLine -like '*stickers-web*' }
-    if ($running) {
-        if (-not $Restart) { "already running pid=$($old.pid) on http://127.0.0.1:$($old.port)"; return }
-        Stop-Process -Id $old.pid -Confirm:$false
+    if ($running -and -not $Restart) {
+        "already running pid=$($old.pid) on http://127.0.0.1:$($old.port)"
+        return
     }
 }
 
-$release = Get-Content -Raw -LiteralPath (Join-Path $rt 'data\release.json') | ConvertFrom-Json
+$releasePath = Join-Path $rt 'data\release.json'
+$release = Get-Content -Raw -LiteralPath $releasePath | ConvertFrom-Json
+if (-not $release.exe -or -not (Test-Path -LiteralPath $release.exe -PathType Leaf)) {
+    throw "release executable is missing: $($release.exe)"
+}
+$sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $release.exe).Hash.ToLower()
+if ($sha -ne $release.exe_sha256) { throw "release executable changed since it was recorded: $($release.exe)" }
+New-Item -ItemType Directory -Force -Path (Join-Path $rt 'data\logs') | Out-Null
+if ($running) {
+    Stop-Process -Id $old.pid -Confirm:$false
+}
+
 $out = Join-Path $rt 'data\logs\stickers-web.out.log'
 $err = Join-Path $rt 'data\logs\stickers-web.err.log'
 # WMI starts it outside the caller's process tree, so it survives the shell that ran this.

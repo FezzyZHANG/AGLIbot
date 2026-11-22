@@ -9,6 +9,14 @@ $rt = (Resolve-Path -LiteralPath $Runtime).Path
 $cfg = Get-Content -Raw -LiteralPath (Join-Path $rt 'runtime.json') | ConvertFrom-Json
 $current = Join-Path $rt 'data\logs\current.json'
 
+$releasePath = Join-Path $rt 'data\release.json'
+$release = Get-Content -Raw -LiteralPath $releasePath | ConvertFrom-Json
+if (-not $release.exe -or -not (Test-Path -LiteralPath $release.exe -PathType Leaf)) {
+    throw "release executable is missing: $($release.exe)"
+}
+$sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $release.exe).Hash.ToLower()
+if ($sha -ne $release.exe_sha256) { throw "release executable changed since it was recorded: $($release.exe)" }
+
 if ($Restart -and (Test-Path -LiteralPath $current)) {
     $old = Get-Content -Raw -LiteralPath $current | ConvertFrom-Json
     $proc = Get-Process -Id $old.pid -ErrorAction SilentlyContinue
@@ -26,10 +34,7 @@ if ($Restart -and (Test-Path -LiteralPath $current)) {
 # The sticker page runs from the same exe, so tell the two apart by command line.
 if (Get-CimInstance Win32_Process -Filter "Name='aglibot.exe'" | Where-Object { $_.CommandLine -notlike '*stickers-web*' }) { throw 'AGLI is already running; stop the intended instance explicitly before another start.' }
 
-$release = Get-Content -Raw -LiteralPath (Join-Path $rt 'data\release.json') | ConvertFrom-Json
-$sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $release.exe).Hash.ToLower()
-if ($sha -ne $release.exe_sha256) { throw "release executable changed since it was recorded: $($release.exe)" }
-
+New-Item -ItemType Directory -Force -Path (Join-Path $rt 'data\logs') | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $out = Join-Path $rt "data\logs\bot-$stamp.out.log"
 $err = Join-Path $rt "data\logs\bot-$stamp.err.log"

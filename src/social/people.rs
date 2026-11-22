@@ -118,6 +118,7 @@ impl People {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn save(&mut self, store: &dyn Store, person: Person) -> Result<()> {
         store.save_person(&person)?;
         self.cache.insert(person.person_id.clone(), person);

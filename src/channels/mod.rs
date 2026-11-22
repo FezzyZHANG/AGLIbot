@@ -167,49 +167,6 @@ pub struct Outlets {
     pub qq: Option<qq::QqHandle>,
 }
 
-#[cfg(test)]
-mod tests {
-    use std::io::{Read, Write};
-
-    use super::*;
-
-    fn serve_once(status: &str, body: Vec<u8>) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/secret-token", listener.local_addr().unwrap());
-        let status = status.to_string();
-        std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                socket.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
-            }
-            write!(socket, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-            socket.write_all(&body).unwrap();
-        });
-        url
-    }
-
-    #[tokio::test]
-    async fn downloads_stop_at_the_limit_and_errors_hide_the_url() {
-        assert_eq!(fetch_url(&serve_once("200 OK", vec![7; 8]), 8).await.unwrap(), vec![7; 8]);
-        assert!(fetch_url(&serve_once("200 OK", vec![7; 9]), 8).await.unwrap_err().downcast_ref::<TooLarge>().is_some());
-        let error = fetch_url(&serve_once("403 Forbidden", vec![]), 8).await.unwrap_err();
-        assert!(!format!("{error:#}").contains("secret-token"), "{error:#}");
-        assert!(fetch_url("file:///C:/Windows/win.ini", 8).await.is_err());
-        assert!(fetch_url("C:/Windows/win.ini", 8).await.is_err());
-    }
-
-    /// Whether this TLS stack can talk to QQ's image CDN at all; a 4xx still proves the handshake.
-    #[tokio::test]
-    #[ignore = "requires network"]
-    async fn live_qq_cdn_handshake() {
-        let response = MEDIA_HTTP.get("https://multimedia.nt.qq.com.cn/download?appid=1407").send().await.unwrap();
-        println!("status {}", response.status());
-    }
-}
-
 impl Outlets {
     /// Channel file references can expire. Resolve QQ ids using the originating chat.
     pub(crate) async fn download_file(&self, platform: &str, chat_id: &str, a: &Attachment, max: usize) -> Result<Vec<u8>> {
@@ -294,5 +251,48 @@ impl Outlets {
             },
             other => bail!("unknown platform {other}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+
+    use super::*;
+
+    fn serve_once(status: &str, body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/secret-token", listener.local_addr().unwrap());
+        let status = status.to_string();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            socket.write_all(&body).unwrap();
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn downloads_stop_at_the_limit_and_errors_hide_the_url() {
+        assert_eq!(fetch_url(&serve_once("200 OK", vec![7; 8]), 8).await.unwrap(), vec![7; 8]);
+        assert!(fetch_url(&serve_once("200 OK", vec![7; 9]), 8).await.unwrap_err().downcast_ref::<TooLarge>().is_some());
+        let error = fetch_url(&serve_once("403 Forbidden", vec![]), 8).await.unwrap_err();
+        assert!(!format!("{error:#}").contains("secret-token"), "{error:#}");
+        assert!(fetch_url("file:///C:/Windows/win.ini", 8).await.is_err());
+        assert!(fetch_url("C:/Windows/win.ini", 8).await.is_err());
+    }
+
+    /// Whether this TLS stack can talk to QQ's image CDN at all; a 4xx still proves the handshake.
+    #[tokio::test]
+    #[ignore = "requires network"]
+    async fn live_qq_cdn_handshake() {
+        let response = MEDIA_HTTP.get("https://multimedia.nt.qq.com.cn/download?appid=1407").send().await.unwrap();
+        println!("status {}", response.status());
     }
 }

@@ -53,12 +53,6 @@ async fn recv_work(events: &mut mpsc::Receiver<Event>, queued: &mut WorkQueue, a
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("evolution-restart") {
-        let mut args = std::env::args().skip(2);
-        let parent = args.next().ok_or_else(|| anyhow::anyhow!("missing parent PID"))?.parse()?;
-        let request = args.next().ok_or_else(|| anyhow::anyhow!("missing restart request"))?;
-        return evolution::restart::helper(parent, request.into());
-    }
     // The runtime root's .env first, so the bot need not run from a source checkout.
     if let Some(root) = std::env::var_os("AGLI_ROOT") {
         dotenvy::from_path(PathBuf::from(root).join(".env")).ok();
@@ -185,31 +179,19 @@ async fn run(cfg: Arc<Config>, telegram: Result<Telegram>) -> Result<()> {
         .inspect_err(|_| report(Fault::StartupRuntime))?;
     let mut config_poll = tokio::time::interval(Duration::from_secs(2));
     config_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    agli.acknowledge_evolution_start().inspect_err(|_| report(Fault::StartupRuntime))?;
     agli.start_media();
-    info!("{}", evolution::restart::describe_release(&cfg.data_dir()));
+    info!("{}", evolution::describe_release(&cfg.data_dir()));
     info!("AGLI is up");
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = config_poll.tick() => {
                 agli.reload_config(&mut config_watcher);
-                agli.poll_evolution().await;
             },
             work = recv_work(&mut events, &mut queued, &cfg.acl, &cfg.runtime.session) => match work {
                 Some(work) => agli.handle(work).await,
                 None => break,
             },
-        }
-        if let Some(restart) = agli.take_evolution_restart() {
-            match restart.launch().await {
-                Ok(()) => break,
-                Err(e) => {
-                    report(Fault::EvolutionRestart);
-                    let _ = restart.receipt("failed", Some(&format!("{e:#}")));
-                    warn!("evolution restart failed; old bot remains running: {e:#}");
-                }
-            }
         }
     }
     info!("bye");

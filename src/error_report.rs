@@ -35,7 +35,6 @@ pub(crate) enum Fault {
     EventHandling,
     StateSave,
     Background,
-    EvolutionRestart,
 }
 
 impl Fault {
@@ -58,7 +57,6 @@ impl Fault {
             Self::EventHandling => ("E4001", "运行事件处理失败。"),
             Self::StateSave => ("E4002", "运行状态保存失败。"),
             Self::Background => ("E4003", "后台作业执行失败。"),
-            Self::EvolutionRestart => ("E4004", "进化重启失败，原进程继续运行。"),
         }
     }
 }

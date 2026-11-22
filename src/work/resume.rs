@@ -79,10 +79,6 @@ pub(super) async fn inspect(dir: &Path, task: &Task, store: &dyn Store) -> Resul
 }
 
 impl Snapshot {
-    pub fn needs_reconciliation(&self) -> bool {
-        self.audit.iter().any(|a| !lifecycle(&a.tool))
-    }
-
     /// Pure and deterministic: file existence is evidence to inspect, never proof of completion.
     pub fn brief(&self) -> String {
         let interrupted = self.log.contains("中断");
@@ -115,9 +111,6 @@ impl Snapshot {
             let kind = if lifecycle(&a.tool) { "委托生命周期，不证明任何外部动作完成" } else { "外部动作待核实" };
             brief.push_str(&format!("audit: {} | {} | {outcome} | {} | {kind}\n", a.ts.to_rfc3339(), a.tool, a.reason));
         }
-        if self.needs_reconciliation() {
-            brief.push_str("仅规划时不要声称完成核实，把这些检查留给 hands；hands 只有逐项核实后才能继续未完成工作，最终答复须以 RESUME_CHECKED: 开头说明各项可观察证据（DSH JSON 用 resume_checked 字段）。缺少核实说明会转交主人。\n");
-        }
         brief.push('\n');
         brief
     }
@@ -139,15 +132,11 @@ impl std::fmt::Display for Uncertain {
 
 impl std::error::Error for Uncertain {}
 
-pub(super) fn check_reply(text: &str, needs_reconciliation: bool) -> Result<()> {
+pub(super) fn check_reply(text: &str) -> Result<()> {
     let value = serde_json::from_str::<serde_json::Value>(text).ok();
     let waiting = text.trim_start().strip_prefix("RESUME_WAIT:").or_else(|| value.as_ref()?.get("resume_wait")?.as_str());
     if let Some(reason) = waiting {
         return Err(Uncertain(reason.trim().to_string()).into());
-    }
-    let checked = text.trim_start().strip_prefix("RESUME_CHECKED:").or_else(|| value.as_ref()?.get("resume_checked")?.as_str());
-    if needs_reconciliation && checked.is_none_or(|evidence| evidence.trim().is_empty()) {
-        return Err(Uncertain("执行者未提供 sent/unknown 动作的核实说明；保留原审计结果，请检查可观察结果后决定。".into()).into());
     }
     Ok(())
 }
@@ -213,9 +202,7 @@ mod tests {
         let brief = snapshot.brief();
         assert!(brief.contains("publish | sent") && brief.contains("send | unknown"));
         assert!(!brief.contains("failed") && !brief.contains("denied") && !brief.contains("unrelated"));
-        assert!(snapshot.needs_reconciliation());
         snapshot.audit.retain(|a| lifecycle(&a.tool));
-        assert!(!snapshot.needs_reconciliation());
         assert!(snapshot.brief().contains("不证明任何外部动作完成"));
     }
 
@@ -238,21 +225,14 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_or_unacknowledged_actions_stop_without_treating_session_as_proof() {
-        for reply in [
-            "RESUME_WAIT: remote result still unknown",
-            r#"{"resume_wait":"sent receipt unavailable"}"#,
-            "completed",
-            "session-id: 1234",
-            "RESUME_CHECKED: ",
-            r#"{"resume_checked":""}"#,
+    fn explicit_wait_pauses_for_owner_review() {
+        for (reply, reason) in [
+            ("RESUME_WAIT: remote result still unknown", "remote result still unknown"),
+            (r#"{"resume_wait":"sent receipt unavailable"}"#, "sent receipt unavailable"),
         ] {
-            assert!(check_reply(reply, true).unwrap_err().downcast_ref::<Uncertain>().is_some(), "{reply}");
+            assert_eq!(check_reply(reply).unwrap_err().downcast_ref::<Uncertain>().unwrap().0, reason);
         }
-        assert!(check_reply("RESUME_WAIT: unknown", false).is_err());
-        assert!(check_reply("RESUME_CHECKED: remote record 123 matches; skipped sending", true).is_ok());
-        assert!(check_reply(r#"{"resume_checked":"record 123 matches; skipped sending"}"#, true).is_ok());
-        assert!(check_reply("ordinary fresh result", false).is_ok());
+        assert!(check_reply("ordinary fresh result").is_ok());
     }
 
     #[tokio::test]
@@ -275,7 +255,6 @@ mod tests {
         for expected in ["中断标记：有", "plan.md", "sources/ (1 entries)", "dsh-session-id", "publish | sent", "send | unknown"] {
             assert!(brief.contains(expected), "{brief}");
         }
-        assert!(snapshot.needs_reconciliation());
         assert_eq!(read_optional(&dir.join("plan.md")).unwrap(), "existing plan");
         std::fs::write(root.join("data/audit.jsonl"), "{partial audit").unwrap();
         assert!(inspect(&dir, &task, &store).await.is_err());

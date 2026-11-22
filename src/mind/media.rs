@@ -676,7 +676,7 @@ mod tests {
 
         // The model no longer wants it: the sticker stays as it was and is reported.
         let done = recaption_active(store.as_ref(), &models, &dir, &[]).await.unwrap();
-        assert_eq!(done.declined, [hash.clone()]);
+        assert_eq!(done.declined, std::slice::from_ref(&hash));
         assert_eq!(store.media(&hash).unwrap().unwrap().description, "猫瞪着屏幕");
     }
 
@@ -705,7 +705,7 @@ rewritten 1, left alone";
             origin: "qq:group:1".into(), first_seen: Utc::now(), last_seen: Utc::now(), sightings: 1, sent_count: 0, last_sent: None,
         }).unwrap();
         let done = recaption_active(store.as_ref(), &models, &dir, &[]).await.unwrap();
-        assert_eq!(done.failed, [hash.clone()]);
+        assert_eq!(done.failed, std::slice::from_ref(&hash));
         assert_eq!(store.media(&hash).unwrap().unwrap().description, "旧描述");
     }
 

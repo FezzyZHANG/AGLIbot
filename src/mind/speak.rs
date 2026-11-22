@@ -68,12 +68,6 @@ impl Speaker {
         &self.l1
     }
 
-    /// Activate a new effective persona only between sessions.
-    pub fn replace_l1(&mut self, l1: String) {
-        self.l1 = l1;
-        self.reset_all();
-    }
-
     /// End every session so the next turn rebuilds L2 with fresh memories (after nightly reflection).
     pub fn reset_all(&mut self) {
         self.sessions.clear();
@@ -90,6 +84,7 @@ impl Speaker {
     /// Append `user_text`, followed by `images` when he is looking at some, to the chat's session
     /// and get his reply. `this_turn_only` goes with this request and is not replayed later.
     /// `frame` builds L2 and is only called when a new session starts.
+    #[allow(clippy::too_many_arguments)]
     pub async fn say(
         &mut self,
         models: &Models,

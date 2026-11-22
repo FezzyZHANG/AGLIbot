@@ -7,17 +7,13 @@ use chrono::{DateTime, Utc};
 use tracing::info;
 
 use crate::ns::{Audience, Namespace, ProcessingPolicy, Scope};
-use crate::store::{Episode, Fact, Lesson, Person, Store};
-
-#[cfg(test)]
-mod semantic_tests;
+use crate::store::{Episode, Fact, Person, Store};
 
 #[derive(Debug, Default)]
 pub struct Recall {
     /// (person name, fact)
     pub facts: Vec<(String, Fact)>,
     pub episodes: Vec<Episode>,
-    pub lessons: Vec<Lesson>,
     /// How many candidate items the scope check held back.
     pub withheld: usize,
 }
@@ -29,8 +25,7 @@ impl Recall {
             .facts
             .iter()
             .map(|(_, f)| &f.scope)
-            .chain(self.episodes.iter().map(|e| &e.scope))
-            .chain(self.lessons.iter().map(|l| &l.scope));
+            .chain(self.episodes.iter().map(|e| &e.scope));
         if scopes.into_iter().any(|s| *s == Scope::SelfOnly) {
             ProcessingPolicy::LocalOnly
         } else {
@@ -38,9 +33,6 @@ impl Recall {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.facts.is_empty() && self.episodes.is_empty() && self.lessons.is_empty()
-    }
 }
 
 pub struct Query<'a> {
@@ -51,57 +43,11 @@ pub struct Query<'a> {
     pub partners: &'a [&'a Person],
     pub max_episodes: usize,
     pub max_facts: usize,
-    /// Self-scoped lessons are only for solo thinking, and only when a local model can process them.
-    pub include_lessons: bool,
     pub half_life_days: f64,
 }
 
 pub fn recall(store: &dyn Store, q: &Query<'_>) -> Result<Recall> {
     recall_at(store, q, Utc::now())
-}
-
-/// Brute force over permitted, active episodes. Source text never goes to the embedder here.
-/// TODO: replace the scan with an index when volume warrants it; retain this scope gate.
-pub fn recall_semantic(
-    store: &dyn Store, q: &Query<'_>, cfg: &crate::mind::embedding::EmbeddingCfg, vector: &[f32],
-) -> Result<Recall> {
-    recall_semantic_at(store, q, cfg, vector, Utc::now())
-}
-
-fn recall_semantic_at(
-    store: &dyn Store, q: &Query<'_>, cfg: &crate::mind::embedding::EmbeddingCfg,
-    vector: &[f32], now: DateTime<Utc>,
-) -> Result<Recall> {
-    let mut out = recall_at(store, q, now)?;
-    let own = out.episodes.iter().filter(|e| &e.ns == q.ns).count();
-    let available = q.max_episodes.saturating_sub(own).min(cfg.max_cross_namespace);
-    if available == 0 { return Ok(out) }
-    let embeddings = store.load_embeddings(&cfg.model_id())?;
-    let mut hits = Vec::new();
-    for episode in store.episodes()? {
-        // Before looking up or comparing vectors, including malformed cached vectors.
-        if !episode.scope.permits(q.audience) || &episode.ns == q.ns { continue }
-        let Some(cached) = embeddings.get(&episode.id) else { continue };
-        let similarity = crate::mind::embedding::cosine(vector, cached)?;
-        if similarity >= cfg.threshold {
-            let score = similarity * episode.effective_salience(now, q.half_life_days);
-            hits.push((score, episode));
-        }
-    }
-    hits.sort_by(|(a, ae), (b, be)| b.total_cmp(a).then(be.ts.cmp(&ae.ts)).then(ae.id.cmp(&be.id)));
-    hits.truncate(available);
-    tracing::debug!(hits = hits.len(), "semantic recall hits added");
-    if hits.is_empty() { return Ok(out) }
-    // Keep all selected own-namespace memories, then semantic hits in score order. Retain
-    // ordinary participant matches in any leftover slots, without duplicates.
-    let (mut selected, others): (Vec<_>, Vec<_>) = out.episodes.into_iter().partition(|e| &e.ns == q.ns);
-    selected.extend(hits.into_iter().map(|(_, episode)| episode));
-    for episode in others {
-        if selected.len() == q.max_episodes { break }
-        if !selected.iter().any(|e| e.id == episode.id) { selected.push(episode); }
-    }
-    out.episodes = selected;
-    Ok(out)
 }
 
 fn recall_at(store: &dyn Store, q: &Query<'_>, now: DateTime<Utc>) -> Result<Recall> {
@@ -138,9 +84,6 @@ fn recall_at(store: &dyn Store, q: &Query<'_>, now: DateTime<Utc>) -> Result<Rec
     relevant.sort_by_key(|e| e.ts);
     out.episodes = relevant;
 
-    if q.include_lessons && q.audience.is_solo() {
-        out.lessons = store.lessons()?.into_iter().filter(|l| l.scope.permits(q.audience)).collect();
-    }
     if out.withheld > 0 {
         info!("privacy: withheld {} memory item(s) from {} (audience {:?})", out.withheld, q.ns, q.audience);
     }
@@ -160,12 +103,6 @@ pub fn render(r: &Recall) -> String {
         out.push_str("\n\n## 相关的经历\n");
         for e in &r.episodes {
             out.push_str(&format!("\n- [{}] {}", e.ts.with_timezone(&chrono::Local).format("%m-%d"), e.summary));
-        }
-    }
-    if !r.lessons.is_empty() {
-        out.push_str("\n\n## 你自己总结过的经验（只属于你自己）\n");
-        for l in &r.lessons {
-            out.push_str(&format!("\n- {}", l.text));
         }
     }
     out
@@ -206,7 +143,7 @@ mod tests {
         let ns = old.ns.clone();
         let audience = Audience::private("owner");
         let mut q = Query { audience: &audience, ns: &ns, partners: &[], max_episodes: 1,
-            max_facts: 0, include_lessons: false, half_life_days: 30.0 };
+            max_facts: 0, half_life_days: 30.0 };
         assert_eq!(recall_at(&store, &q, now).unwrap().episodes[0].id, "recent");
         q.half_life_days = 300.0;
         assert_eq!(recall_at(&store, &q, now).unwrap().episodes[0].id, "old");
@@ -246,7 +183,7 @@ mod tests {
 
         let group_ns: Namespace = "group/qq:1".parse().unwrap();
         let group = Audience::group("qq:1", ["owner".to_string(), "qq:5".to_string()]);
-        let q = Query { audience: &group, ns: &group_ns, partners: &partners, max_episodes: 10, max_facts: 10, include_lessons: false, half_life_days: 30.0 };
+        let q = Query { audience: &group, ns: &group_ns, partners: &partners, max_episodes: 10, max_facts: 10, half_life_days: 30.0 };
         let r = recall(&store, &q).unwrap();
         let text = render(&r);
         assert!(!text.contains("辞职") && !text.contains("换工作"), "{text}");
@@ -255,7 +192,7 @@ mod tests {
 
         let owner_ns: Namespace = "person/owner".parse().unwrap();
         let outsider = Audience::private("owner");
-        let q = Query { audience: &outsider, ns: &owner_ns, partners: &partners, max_episodes: 10, max_facts: 10, include_lessons: false, half_life_days: 30.0 };
+        let q = Query { audience: &outsider, ns: &owner_ns, partners: &partners, max_episodes: 10, max_facts: 10, half_life_days: 30.0 };
         let text = render(&recall(&store, &q).unwrap());
         assert!(text.contains("辞职") && text.contains("换工作"));
         // Without membership the group episode stays out of the DM, even though he took part.
@@ -272,7 +209,7 @@ mod tests {
         let stranger = Audience::private_member_of("qq:6", ["qq:2".to_string()]);
         let q = Query { audience: &stranger, ns: &stranger_ns, ..q };
         let r = recall(&store, &q).unwrap();
-        assert!(r.is_empty(), "{}", render(&r));
+        assert!(r.facts.is_empty() && r.episodes.is_empty(), "{}", render(&r));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

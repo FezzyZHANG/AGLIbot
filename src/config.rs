@@ -66,6 +66,7 @@ pub struct ModelEntry {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ModelsCfg {
     #[serde(default)]
+    #[allow(dead_code)] // Phase 2/3 cleanup
     pub embedding: Option<crate::mind::embedding::EmbeddingCfg>,
     /// Vectors for sticker search, separate so turning it on does not change memory recall.
     #[serde(default)]
@@ -448,7 +449,8 @@ impl MongoCfg {
 pub struct Config {
     /// Runtime root (`AGLI_ROOT`): config, mind, data and work.
     pub root: PathBuf,
-    /// The source checkout (`AGLI_SOURCE`, default `root`), used by the evolution gate.
+    /// The source checkout (`AGLI_SOURCE`, default `root`).
+    #[allow(dead_code)] // Phase 0: kept for config/env compatibility
     pub source: PathBuf,
     pub models: ModelsCfg,
     pub scenarios: ScenariosCfg,

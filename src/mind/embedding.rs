@@ -1,12 +1,8 @@
-//! Optional derived episode vectors. No startup backfill and no vector-server dependency.
+//! Embedding configuration and vector utilities for sticker search.
 
 use anyhow::{Result, ensure};
 use serde::Deserialize;
-use tracing::info;
-
-use super::models::Models;
 use crate::ns::ProcessingPolicy;
-use crate::store::{Episode, EpisodeEmbedding, Store};
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct EmbeddingCfg {
@@ -57,34 +53,3 @@ pub fn cosine(a: &[f32], b: &[f32]) -> Result<f64> {
     let norm = |v: &[f32]| v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
     Ok((dot / (norm(a) * norm(b))).clamp(-1.0, 1.0))
 }
-
-/// Called after extraction's watermark is durable. A failed cache write never repeats extraction.
-pub async fn fill(models: &Models, store: &dyn Store, episodes: &[Episode], cap: usize) -> Result<usize> {
-    let Some(cfg) = models.embedding() else { return Ok(0) };
-    if cap == 0 { return Ok(0) }
-    let model_id = cfg.model_id();
-    let mut existing = store.load_embeddings(&model_id)?;
-    let mut filled = 0;
-    for episode in episodes {
-        if filled == cap { break }
-        let policy = ProcessingPolicy::default_for(&episode.scope);
-        if existing.contains_key(&episode.id) || !cfg.allows(&policy) { continue }
-        let Some(vector) = models.embed(&policy, &episode.summary).await? else { continue };
-        store.save_embedding(&EpisodeEmbedding { episode_id: episode.id.clone(), model_id: model_id.clone(), vector: vector.clone() })?;
-        existing.insert(episode.id.clone(), vector);
-        filled += 1;
-    }
-    Ok(filled)
-}
-
-pub async fn nightly(models: &Models, store: &dyn Store) {
-    let Some(cfg) = models.embedding() else { return };
-    let result = async { fill(models, store, &store.episodes()?, cfg.nightly_cap).await }.await;
-    match result {
-        Ok(filled) => info!(filled, cap = cfg.nightly_cap, "nightly episode embeddings"),
-        Err(e) => models.warn_embedding(&e),
-    }
-}
-
-#[cfg(test)]
-mod tests;

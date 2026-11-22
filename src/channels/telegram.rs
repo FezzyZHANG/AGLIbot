@@ -403,7 +403,7 @@ mod tests {
         std::thread::spawn(move || {
             for socket in listener.incoming() {
                 let mut socket = socket.unwrap();
-                socket.read(&mut [0; 4096]).unwrap();
+                let _ = socket.read(&mut [0; 4096]).unwrap();
                 write!(socket, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad").unwrap();
             }
         });

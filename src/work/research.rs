@@ -615,7 +615,7 @@ async fn gather(
                 std::fs::write(dir.join("dsh-session-id"), id)?;
             }
             *session = output.session_id;
-            resume::check_reply(&output.text, snapshot.needs_reconciliation())?;
+            resume::check_reply(&output.text)?;
             save_dsh_research(dir, &output.text)
         }
         DelegateTool::Codex => {
@@ -633,14 +633,11 @@ async fn gather(
             std::fs::write(dir.join("codex-session-id"), &output.session_id)?;
             job.log(&format!("Codex 会话：{}", output.session_id));
             *session = Some(output.session_id);
-            resume::check_reply(&output.text, snapshot.needs_reconciliation())?;
+            resume::check_reply(&output.text)?;
             job.log("Codex 完成取证");
             Ok(output.text)
         }
         DelegateTool::Off => {
-            if snapshot.needs_reconciliation() {
-                return Err(Uncertain(format!("hands 已关闭，无法核实外部动作。\n{brief}")).into());
-            }
             // No hands: say so plainly instead of pretending to have sources.
             let user = format!(
                 "任务：{}\n计划：\n{plan}\n\n你现在无法主动联网。根据本次提供的材料与已有知识写报告，引用材料出处，\
@@ -652,7 +649,7 @@ async fn gather(
                 user.push_str(&format!("\n\n上一版报告：\n{}\n审稿人修改意见：\n{f}", read(dir, "report.md")));
             }
             let text = job.models.ask("synthesize", &ProcessingPolicy::Any, &job.l1, &user).await?;
-            resume::check_reply(&text, false)?;
+            resume::check_reply(&text)?;
             std::fs::write(dir.join("report.md"), &text)?;
             job.log("未联网，凭已有知识写了报告");
             Ok(text.chars().take(400).collect())
@@ -766,7 +763,7 @@ async fn research(job: &Job) -> Result<Outcome> {
             let context = format!("{brief}{}", supplied_material(&dir)?);
             let prompt = plan_prompt(&job.task.title, &context, &existing_plan, &followups.instructions);
             let plan = job.models.ask("research_plan", &ProcessingPolicy::Any, &job.l1, &prompt).await?;
-            resume::check_reply(&plan, false)?;
+            resume::check_reply(&plan)?;
             std::fs::write(dir.join("plan.md"), &plan)?;
             existing_plan = plan.clone();
             job.log(if replans == 0 { "计划写好了" } else { "已按补充重新规划，覆盖 plan.md" });
@@ -895,7 +892,7 @@ pub(crate) async fn code_rounds<F: std::future::Future<Output = Result<String>>>
         let prompt = format!("{}任务：{subject}\n任务资料目录（只读）：{}\n{materials}\n只在当前 scratch 目录里工作。在已有产物上继续，验证成果并说明检查结果与未解决项。\n审稿意见：{fixes}",
             snapshot.brief(), task_dir.display());
         let text = execute(dir.clone(), prompt).await?;
-        resume::check_reply(&text, snapshot.needs_reconciliation())?;
+        resume::check_reply(&text)?;
         let evidence = format!("{materials}\n任务产出的文件与摘录：{}\n\n执行者的说明：\n{text}", artifact_evidence(&dir)?);
         let (j, review) = review_round(job, ReviewCategory::Act, &subject, &evidence, round, instructions.len()).await?;
         let latest = followup_snapshot(job)?;
@@ -1175,7 +1172,7 @@ mod tests {
         let mut board = Board::load(&root).unwrap();
         let task = board.add("publish", TaskKind::Code, "owner", TaskStatus::Active, None).unwrap();
         let store = JsonlStore::open(&root.join("data")).unwrap();
-        let error = resume::check_reply("RESUME_WAIT: remote result unknown; owner must check receipt", true).unwrap_err();
+        let error = resume::check_reply("RESUME_WAIT: remote result unknown; owner must check receipt").unwrap_err();
         let reason = error.downcast_ref::<Uncertain>().unwrap();
         let outcome = waiting_for_owner(&store, &task, &reason.0).unwrap();
         assert!(!outcome.ok);

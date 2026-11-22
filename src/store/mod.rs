@@ -101,6 +101,7 @@ fn active_episodes(all: Vec<Episode>) -> Vec<Episode> {
 }
 
 /// Checked under the backend's write lock. One appended summary is the archive commit.
+#[allow(dead_code)] // Phase 2/3 cleanup
 fn archive_needed(all: &[Episode], archive: &Episode) -> Result<bool> {
     anyhow::ensure!(!archive.sources.is_empty() && !archive.summary.trim().is_empty(), "empty archive");
     if let Some(existing) = all.iter().find(|e| e.id == archive.id) {
@@ -351,25 +352,31 @@ pub trait Store: Send + Sync {
 
     fn append_model_call(&self, c: &ModelCallRecord) -> Result<()>;
     /// Calls in the half-open focus window [since, until).
+    #[allow(dead_code)] // Phase 2/3 cleanup
     fn model_calls_between(&self, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Vec<ModelCallRecord>>;
     fn spent_since(&self, since: DateTime<Utc>) -> Result<f64>;
 
     fn append_episode(&self, e: &Episode) -> Result<()>;
+    #[allow(dead_code)] // Phase 2/3 cleanup
     fn save_embedding(&self, embedding: &EpisodeEmbedding) -> Result<()>;
     /// Only vectors from this embedder; a model change makes old cache entries missing.
+    #[allow(dead_code)] // Phase 2/3 cleanup
     fn load_embeddings(&self, model_id: &str) -> Result<BTreeMap<String, Vec<f32>>>;
     /// Active memories, with archived originals excluded from normal recall.
     fn episodes(&self) -> Result<Vec<Episode>> { Ok(active_episodes(self.all_episodes()?)) }
     /// Includes unchanged originals, retrievable by the summary's `sources` ids.
     fn all_episodes(&self) -> Result<Vec<Episode>>;
     /// Append a summary and hide its sources atomically; an exact retry is a no-op.
+    #[allow(dead_code)] // Phase 2/3 cleanup
     fn archive_episode(&self, archive: &Episode) -> Result<()>;
 
     fn persons(&self) -> Result<BTreeMap<String, Person>>;
     fn save_person(&self, p: &Person) -> Result<()>;
 
+    #[allow(dead_code)] // Phase 2/3 cleanup
     fn group(&self, chat_id: &str) -> Result<Option<Group>>;
     fn save_group(&self, g: &Group) -> Result<()>;
+    #[allow(dead_code)] // Phase 2/3 cleanup
     fn relations(&self, ns: &Namespace) -> Result<Vec<Relation>>;
     /// Insert or replace by (source namespace, a, b, type).
     fn save_relation(&self, r: &Relation) -> Result<()>;

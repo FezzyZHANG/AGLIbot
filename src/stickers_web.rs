@@ -185,7 +185,7 @@ async fn list(State(app): State<Shared>, Query(filter): Query<Filter>) -> Respon
     if filter.sort == "sent" {
         items.sort_by(|a, b| b.sent_count.cmp(&a.sent_count).then(b.last_seen.cmp(&a.last_seen)));
     } else {
-        items.sort_by(|a, b| b.first_seen.cmp(&a.first_seen));
+        items.sort_by_key(|b| std::cmp::Reverse(b.first_seen));
     }
     let total = items.len();
     items.truncate(LIST_MAX);

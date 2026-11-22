@@ -11,6 +11,7 @@ use super::{Episode, EpisodeEmbedding, Lesson, Person};
 pub(super) struct Data {
     pub episodes: Option<Vec<Episode>>,
     pub active_episodes: Option<Vec<Episode>>,
+    #[allow(dead_code)] // Phase 2/3 cleanup
     pub embeddings: Option<BTreeMap<String, EpisodeEmbedding>>,
     pub persons: Option<BTreeMap<String, Person>>,
     pub lessons: Option<Vec<Lesson>>,

@@ -344,7 +344,7 @@ mod tests {
         let now = Instant::now();
         let mut pending = Vec::new();
         let image = attachment(AttachmentKind::Image, Some("https://example.test/a".into()));
-        remember(&mut pending, "qq", "甲", &[image.clone()], now);
+        remember(&mut pending, "qq", "甲", std::slice::from_ref(&image), now);
         let again = Attachment { quoted_from: Some("甲".into()), ..image };
         remember(&mut pending, "qq", "乙", &[again], now);
         assert_eq!(pending.len(), 1);

@@ -80,6 +80,7 @@ pub struct Audience {
 }
 
 impl Audience {
+    #[cfg(test)]
     pub fn solo() -> Self {
         Self::default()
     }

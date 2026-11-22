@@ -1712,20 +1712,6 @@ mod tests {
         assert_eq!(reply_params("group_id", 34, 99, &cut, None), json!({"group_id":34, "message":[text("@小")]}));
     }
 
-    /// Manual live-shaped payload preview; builds parameters only, with no socket or credentials.
-    #[test]
-    #[ignore = "manual mention params preview, sends nothing"]
-    fn live_build_mention_params() {
-        let pieces = vec![
-            ReplyPiece::Mention { name: "小明".into(), qq_id: Some(42) },
-            ReplyPiece::Text("，你怎么看？[CQ:at,qq=all]".into()),
-        ];
-        for quote in [None, Some("123456")] {
-            println!("{}", serde_json::to_string_pretty(&reply_params("group_id", 34, 99, &pieces, quote)).unwrap());
-        }
-        println!("{}", serde_json::to_string_pretty(&forward_params("group_id", 34, 99, "小庄", &[reply_text(&pieces)])).unwrap());
-    }
-
     #[tokio::test]
     async fn long_forward_actions_nodes_cache_and_fallback() {
         for (chat, key, forward, plain) in [
@@ -1773,14 +1759,6 @@ mod tests {
                 assert_eq!(cached.text, chunks[0]);
             }
         }
-    }
-
-    /// Manual live-payload preview; never connects or sends anything.
-    #[test]
-    #[ignore = "manual forward params preview, sends nothing"]
-    fn live_build_forward_params() {
-        let chunks = super::super::telegram::chunks(&"sample text ".repeat(300), CHUNK_CHARS);
-        println!("{}", serde_json::to_string_pretty(&forward_params("group_id", 34, 99, "小庄", &chunks)).unwrap());
     }
 
     #[tokio::test]

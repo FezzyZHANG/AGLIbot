@@ -78,10 +78,12 @@ fn checklist(category: ReviewCategory) -> &'static str {
 }
 
 /// Ask the reviewer model. `evidence` should already contain rule/test/execution results.
+#[allow(dead_code)] // Phase 2/3 cleanup
 pub async fn review(models: &Models, category: ReviewCategory, subject: &str, evidence: &str) -> Result<Judgement> {
     review_with_limit(models, category, subject, evidence, None).await
 }
 
+#[allow(dead_code)] // Phase 2/3 cleanup
 pub async fn review_with_limit(models: &Models, category: ReviewCategory, subject: &str, evidence: &str, limit: Option<SpendLimit>) -> Result<Judgement> {
     let scenario = if category == ReviewCategory::Evolve { "evolve" } else { "verify" };
     review_scenario(models, scenario, category, subject, evidence, limit).await
