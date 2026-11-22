@@ -15,12 +15,12 @@ use crate::error_report::{Fault, OwnerState, notify_state, report};
 use crate::ns::{Audience, Namespace, Scope};
 use crate::social::{floor::FloorDecision, identity::{Who, identify}, skill_lines};
 use crate::store::{MessageRecord, Store};
-use crate::work::research;
+use crate::work;
 
 pub enum Event {
     Inbound(Envelope),
     Tick,
-    JobDone(research::Outcome),
+    JobDone(work::Outcome),
     JobWatchdog { task_id: String, reason: String },
     Control(ControlEvent),
 }
@@ -33,7 +33,7 @@ pub enum ControlEvent {
 pub enum WorkItem {
     Messages(Vec<Envelope>),
     Tick,
-    JobDone(research::Outcome),
+    JobDone(work::Outcome),
     JobWatchdog { task_id: String, reason: String },
     Control(ControlEvent),
 }

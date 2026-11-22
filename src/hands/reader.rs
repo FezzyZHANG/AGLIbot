@@ -1,19 +1,35 @@
 //! Standalone DeepSeek tools. Callers authorize the disclosure before invoking these methods.
+mod web;
+
+pub use web::{FetchHttpError, FetchPage, SearchHit};
+
 use crate::error_report::{Fault, report};
+use crate::mind::models::Models;
 use anyhow::{Context, Result, anyhow, ensure};
 use reqwest::{Client, Method, RequestBuilder, multipart};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::future::Future;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 pub const MAX_DOCUMENT_BYTES: usize = 12 * 1024 * 1024;
 const RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const TEXT_LIMIT: usize = 12_000;
+static READER_HTTP: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(40))
+        .build()
+        .expect("building shared DeepSeek HTTP client")
+});
 
 #[derive(Clone)]
 pub struct Reader {
     client: Client,
     key: String,
     origin: String,
+    models: Option<Arc<Models>>,
 }
 
 fn extension(name: &str) -> String {
@@ -94,7 +110,7 @@ impl std::fmt::Display for UnreadableInput {
 impl std::error::Error for UnreadableInput {}
 
 fn remote_failure(error: &anyhow::Error, fault: Fault) {
-    if !error.is::<UnreadableInput>() {
+    if !error.is::<UnreadableInput>() && error.downcast_ref::<FetchHttpError>().is_none_or(|e| e.status != 404) {
         report(fault);
     }
 }
@@ -115,16 +131,36 @@ fn bounded(s: &str) -> Result<String> {
 impl Reader {
     pub fn new(key: String) -> Result<Self> {
         ensure!(!key.trim().is_empty(), "缺少 DeepSeek 凭据");
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(40))
-            .build()?;
         Ok(Self {
-            client,
+            client: READER_HTTP.clone(),
             key,
             origin: "https://api.deepseek.com".into(),
+            models: None,
         })
+    }
+
+    pub fn with_models(mut self, models: Arc<Models>) -> Self {
+        self.models = Some(models);
+        self
+    }
+
+    async fn metered<T>(
+        &self, scenario: &str, call: impl Future<Output = Result<T>>,
+        price: impl FnOnce(&T) -> f64,
+    ) -> Result<T> {
+        if self.models.as_ref().is_some_and(|m| m.budget_exhausted()) {
+            return Err(UnreadableInput("今日工具预算已用完".into()).into());
+        }
+        let start = Instant::now();
+        let result = call.await;
+        if let Some(models) = &self.models {
+            models.record_tool_call(
+                scenario, "deepseek", scenario, start.elapsed(),
+                result.as_ref().map_or(0.0, price), result.is_ok(),
+                result.as_ref().err().map(ToString::to_string),
+            ).await;
+        }
+        result
     }
 
     #[cfg(test)]
@@ -134,6 +170,7 @@ impl Reader {
         let mut reader = Self::new("synthetic".to_string()).unwrap();
         reader.client = Client::builder()
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap();
@@ -164,6 +201,12 @@ impl Reader {
             "DeepSeek HTTP {}",
             response.status().as_u16()
         );
+        let v = Self::decode_json(&mut response).await?;
+        ensure!(v.get("error").is_none_or(Value::is_null), "DeepSeek 处理失败");
+        Ok(v)
+    }
+
+    async fn decode_json(response: &mut reqwest::Response) -> Result<Value> {
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -176,47 +219,7 @@ impl Reader {
             );
             bytes.extend_from_slice(&chunk);
         }
-        let v: Value =
-            serde_json::from_slice(&bytes).map_err(|_| anyhow!("DeepSeek 返回无效 JSON"))?;
-        ensure!(v.get("error").is_none(), "DeepSeek 处理失败");
-        Ok(v)
-    }
-
-    pub async fn fetch(&self, url: &str) -> Result<String> {
-        let url_for_check = reqwest::Url::parse(url).map_err(|_| anyhow!("无效链接"))?;
-        ensure!(
-            !contains_access_token(&url_for_check),
-            "含访问凭据的链接不能提交至网页读取服务"
-        );
-        let (url, _) = crate::channels::public_url(url).await?;
-        self.fetch_public(&url).await.inspect_err(|e| remote_failure(e, Fault::WebRead))
-    }
-
-    async fn fetch_public(&self, url: &reqwest::Url) -> Result<String> {
-        let request = || {
-            self.request(Method::POST, "/v1/tools/fetch")
-                .json(&json!({"url": url.as_str()}))
-        };
-        let response = request()
-            .send()
-            .await
-            .map_err(|_| anyhow!("DeepSeek 请求未完成"))?;
-        let status = response.status();
-        let v = if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
-            drop(response);
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            Self::json(request()).await?
-        } else {
-            Self::response_json(response).await?
-        };
-        let body = bounded(v["content"].as_str().context("缺少网页正文")?)?;
-        let title = v["title"]
-            .as_str()
-            .unwrap_or("")
-            .chars()
-            .take(160)
-            .collect::<String>();
-        bounded(&format!("{title}\n{body}"))
+        serde_json::from_slice(&bytes).map_err(|_| anyhow!("DeepSeek 返回无效 JSON"))
     }
 
     pub async fn document(&self, name: &str, bytes: Vec<u8>) -> Result<String> {
@@ -241,20 +244,20 @@ impl Reader {
             .mime_str("application/octet-stream")?;
         let question: String = question.chars().take(1024).collect();
         if matches!(ext, "xlsx" | "xls") {
-            return self.file_chat(part, "user_data", &question).await;
+            return self.metered("file_chat", self.file_chat(part, "user_data", &question), |_| 0.0).await;
         }
         if matches!(ext, "pdf" | "doc" | "docx" | "ppt" | "pptx")
             && needs_layout(&question)
         {
-            return self
-                .file_chat(part, "rich_layout_recognition", &question)
-                .await;
+            return self.metered("file_chat", self.file_chat(part, "rich_layout_recognition", &question), |_| 0.0).await;
         }
         let form = multipart::Form::new()
             .text("purpose", "text_recognition")
             .part("file", part);
-        let v = Self::json(self.request(Method::POST, "/v1/tools/ocr").multipart(form)).await?;
-        ocr_pages(&v)
+        self.metered("ocr", async {
+            let v = Self::json(self.request(Method::POST, "/v1/tools/ocr").multipart(form)).await?;
+            ocr_pages(&v)
+        }, |_| 0.0).await
     }
 
     async fn file_chat(
@@ -313,55 +316,15 @@ impl Reader {
     }
 }
 
-fn contains_access_token(url: &reqwest::Url) -> bool {
-    url.query_pairs().any(|(name, _)| {
-        let name = name.to_ascii_lowercase().replace('-', "_");
-        matches!(
-            name.as_str(),
-            "key"
-                | "apikey"
-                | "auth"
-                | "authorization"
-                | "signature"
-                | "sig"
-                | "jwt"
-                | "password"
-                | "passwd"
-                | "sessionid"
-                | "credential"
-                | "secret"
-        ) || name.ends_with("token")
-            || name.ends_with("_key")
-            || name.starts_with("x_amz_")
-            || name.starts_with("x_goog_")
-    })
-}
-
 fn needs_layout(question: &str) -> bool {
-    let q = question.to_lowercase();
-    [
-        "图表",
-        "图像",
-        "图中",
-        "插图",
-        "图片",
-        "配图",
-        "曲线",
-        "布局",
-        "排版",
-        "流程图",
-        "示意图",
-        "截图",
-        "chart",
-        "figure",
-        "diagram",
-        "layout",
-        "illustration",
-        "photograph",
-        "graph",
-    ]
-    .iter()
-    .any(|needle| q.contains(needle))
+    const CJK: &[&str] = &["图表", "图像", "图中", "插图", "图片", "配图", "曲线", "布局", "排版", "流程图", "示意图", "截图"];
+    const ENGLISH: &[&str] = &[
+        "chart", "charts", "flowchart", "figure", "figures", "diagram", "diagrams",
+        "layout", "layouts", "illustration", "illustrations", "photograph", "photographs", "graph", "graphs",
+    ];
+    CJK.iter().any(|word| question.contains(word))
+        || question.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| ENGLISH.iter().any(|term| word.eq_ignore_ascii_case(term)))
 }
 
 fn ocr_pages(v: &Value) -> Result<String> {
@@ -389,7 +352,7 @@ fn ocr_pages(v: &Value) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{*, web::contains_access_token};
     use axum::{
         Json, Router,
         body::Bytes,
@@ -478,6 +441,83 @@ mod tests {
             .await?
             .contains("7 kg")
         );
+        server.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn layout_words_match_complete_ascii_words_or_cjk_phrases() {
+        for question in ["read the paragraph", "configure the page", "biography", "telegraph", "figure2"] {
+            assert!(!needs_layout(question), "{question}");
+        }
+        for question in ["show (CHARTS)", "compare-flowchart", "Figures 2–3", "layout/layouts", "graph's axis", "有没有流程图"] {
+            assert!(needs_layout(question), "{question}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_and_fetch_status_retry_and_budget_receipts() -> Result<()> {
+        use axum::http::StatusCode;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let app = Router::new()
+            .route("/v1/tools/search", post(move |Json(body): Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    let attempt = seen.fetch_add(1, Ordering::SeqCst);
+                    if body["query"] == "empty" {
+                        assert_eq!(body["count"], 1);
+                        assert!(body.get("ori_question").is_none());
+                        return (StatusCode::OK, Json(json!({"results": []})));
+                    }
+                    assert_eq!(body["query"], "猫".repeat(128));
+                    assert_eq!(body["count"], 50);
+                    assert_eq!(body["ori_question"], "original");
+                    assert_eq!(body["need_content"], true);
+                    if attempt == 0 {
+                        return (StatusCode::TOO_MANY_REQUESTS, Json(json!({})));
+                    }
+                    (StatusCode::OK, Json(json!({"results": [
+                        null, {"url":""}, {"url":"https://1.1.1.1/","title":"Result","summary":"summary",
+                            "rerank_score":0.8,"authority":"bad","content":"content"}
+                    ]})))
+                }
+            }))
+            .route("/v1/tools/fetch", post(|Json(body): Json<Value>| async move {
+                match body["url"].as_str().unwrap().rsplit('/').next().unwrap() {
+                    "http-error" => (StatusCode::NOT_FOUND, Json(json!({"content":"not an article"}))),
+                    "embedded-error" => (StatusCode::OK, Json(json!({"status_code":200,"http_status":"404","content":"not an article"}))),
+                    _ => (StatusCode::OK, Json(json!({"status_code":200,"content":"article","title":"title"}))),
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let store = crate::store::Store::memory();
+        let models = Arc::new(Models::stub(store.clone(), Vec::new()));
+        let reader = Reader::at(format!("http://{}", listener.local_addr()?)).with_models(models.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert!(reader.search("   ", 5, None, false).await.unwrap_err().is::<UnreadableInput>());
+        let hits = reader.search(&format!("  {}  ", "猫".repeat(140)), 500, Some("original"), true).await?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].content, "content");
+        assert_eq!(hits[0].rerank_score, Some(0.8));
+        assert!(hits[0].authority.is_none());
+        assert!(reader.search("empty", 0, None, false).await?.is_empty());
+        for path in ["http-error", "embedded-error"] {
+            let error = reader.fetch_page(&format!("https://1.1.1.1/{path}")).await.unwrap_err();
+            assert_eq!(error.downcast_ref::<FetchHttpError>().unwrap().status, 404);
+        }
+        let page = reader.fetch_page("https://1.1.1.1/ok").await?;
+        assert_eq!((page.http_status, page.title.as_str(), page.content.as_str()), (200, "title", "article"));
+        let records = store.model_calls().await?;
+        assert_eq!(records.len(), 5);
+        assert_eq!(records.iter().map(|c| c.cost_usd).collect::<Vec<_>>(), [0.00075, 0.0, 0.0, 0.0, 0.00075]);
+        assert_eq!(records.iter().map(|c| c.ok).collect::<Vec<_>>(), [true, true, false, false, true]);
+        assert_eq!(models.spent_today().0, 0.0015);
+        models.record_tool_call("test", "stub", "test", Duration::ZERO, 1.0, true, None).await;
+        assert!(reader.search("budget exhausted", 5, None, false).await.unwrap_err().to_string().contains("预算"));
+        assert_eq!(store.model_calls().await?.len(), 6);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
         server.abort();
         Ok(())
     }

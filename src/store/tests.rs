@@ -135,7 +135,43 @@ pub(super) fn vector() -> StickerVector {
     }
 }
 
+async fn task_contract(store: &Store) -> Result<()> {
+    let first: TaskRecord = serde_json::from_value(json!({
+        "id": "first", "title": "first", "kind": "research", "status": "active",
+        "requester": "owner", "created": truncate_ms(time()), "updated": truncate_ms(time()),
+    }))?;
+    let next = truncate_ms(time()) + TimeDelta::seconds(1);
+    let second = TaskRecord { id: "second".into(), created: next, updated: next, status: TaskStatus::Inbox, ..first.clone() };
+    store.save_task(&second).await?;
+    store.save_task(&first).await?;
+    assert_eq!(store.tasks().await?.into_iter().map(|t| t.id).collect::<Vec<_>>(), ["first", "second"]);
+    let thread = ThreadRef { platform: "qq".into(), chat_id: "1".into(), message_id: Some("2".into()) };
+    let updates = (0..12).map(|n| {
+        let store = store.clone();
+        let thread = thread.clone();
+        tokio::spawn(async move {
+            store.append_task_followup("first", &format!("update {n}"), thread, next).await
+        })
+    }).collect::<Vec<_>>();
+    for update in updates { update.await??; }
+    store.mark_task_followups_consumed("first", 4, 2).await?;
+    store.mark_task_followups_consumed("first", 6, 1).await?;
+    assert_eq!(store.recover_active_tasks(next).await?, ["first"]);
+    let task = store.task("first").await?.unwrap();
+    assert_eq!(task.followups.iter().map(|f| f.seq).collect::<Vec<_>>(), (1..=12).collect::<Vec<_>>());
+    assert_eq!(task.followups[3].consumed_round, Some(2));
+    assert_eq!(task.followups[4].consumed_round, Some(1));
+    assert_eq!(task.current_round, 2);
+    assert_eq!(task.unconsumed_followups().len(), 6);
+    assert_eq!(task.status, TaskStatus::Inbox);
+    assert_eq!(task.note, RECOVERY_NOTE);
+    assert_eq!(task.threads, [thread]);
+    assert!(store.recover_active_tasks(next).await?.is_empty());
+    Ok(())
+}
+
 pub(super) async fn contract(store: &Store) -> Result<()> {
+    task_contract(store).await?;
     let t = time();
     let ms = truncate_ms(t);
     let group = "group/qq:7".parse()?;
@@ -392,4 +428,28 @@ async fn invalid_mongo_url_redacts_credentials() {
         panic!("expected invalid URL error")
     };
     assert!(!format!("{error:#}").contains("secret"));
+}
+
+#[test]
+fn task_document_keeps_exact_id_and_nested_bson_dates() {
+    use mongodb::bson::Bson;
+    let task: TaskRecord = serde_json::from_value(json!({
+        "id": "exact-id", "title": "task", "kind": "research", "status": "inbox",
+        "requester": "owner", "created": time(), "updated": time(),
+        "followups": [{
+            "seq": 1, "ts": time(), "body": "context",
+            "thread": { "platform": "qq", "chat_id": "1", "message_id": null }
+        }],
+    })).unwrap();
+    let doc = mongo::to_bson_doc(&task, Some(Bson::String(task.id.clone()))).unwrap();
+    assert_eq!(doc.get_str("_id").unwrap(), task.id);
+    for field in ["created", "updated"] {
+        assert_eq!(doc.get_datetime(field).unwrap().timestamp_millis(), time().timestamp_millis());
+    }
+    let followup = doc.get_array("followups").unwrap()[0].as_document().unwrap();
+    assert_eq!(followup.get_datetime("ts").unwrap().timestamp_millis(), time().timestamp_millis());
+    let decoded: TaskRecord = mongo::from_bson_doc(doc).unwrap();
+    assert_eq!(decoded.id, task.id);
+    assert_eq!(decoded.followups[0].ts, truncate_ms(time()));
+    assert!(decoded.followups[0].consumed_round.is_none());
 }

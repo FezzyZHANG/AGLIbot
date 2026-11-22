@@ -5,7 +5,7 @@
 //! privacy-filtered recall → speak → store. Ticks advance the routine and check scheduler timers.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -30,7 +30,7 @@ use crate::social::{
     privacy::{self, Query}, skill_lines::SkillLines,
 };
 use crate::store::{AuditRecord, Outcome, Store, Tier};
-use crate::work::{board::Board, research};
+use crate::work::{self, Board};
 
 mod chat;
 mod commands;
@@ -70,7 +70,7 @@ pub struct Bot {
     skill_lines: SkillLines,
     last_proactive_check: Option<DateTime<Utc>>,
     nightly_retry: Option<(NaiveDate, u8, DateTime<Utc>)>,
-    board: Arc<Mutex<Board>>,
+    board: Board,
     control: Arc<ControlPlane>,
     /// Group lines he has not yet "read" into his session, per chat key.
     unseen: HashMap<String, VecDeque<UnseenLine>>,
@@ -85,7 +85,7 @@ pub struct Bot {
     lexicon: crate::social::lexicon::Lexicon,
     /// Recent speakers per group chat key, for the audience and recall.
     speakers: HashMap<String, Vec<String>>,
-    deliveries: Vec<research::Outcome>,
+    deliveries: Vec<work::Outcome>,
     ignored_logged: HashSet<String>,
     /// People whose QQ group membership was looked up this run.
     membership_checked: HashSet<String>,
@@ -103,8 +103,8 @@ impl Bot {
         if let Err(e) = crate::social::lexicon::Lexicon::seed(&store, &cfg.social.aliases).await {
             warn!("lexicon seed failed: {e:#}");
         }
-        let mut board = Board::load(&cfg.work_dir())?;
-        let recovered = board.recover()?;
+        let board = Board::open(&cfg.work_dir(), store.clone()).await?;
+        let recovered = board.recover().await?;
         if recovered > 0 {
             info!("{recovered} interrupted task(s) moved back to the inbox");
         }
@@ -120,7 +120,7 @@ impl Bot {
             skill_lines,
             last_proactive_check: None,
             nightly_retry: None,
-            board: Arc::new(Mutex::new(board)),
+            board,
             control,
             unseen: HashMap::new(),
             pending_media: HashMap::new(),
@@ -168,9 +168,6 @@ impl Bot {
         false
     }
 
-    fn board(&self) -> std::sync::MutexGuard<'_, Board> {
-        self.board.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     fn frozen(&self) -> bool {
         self.control.is_frozen()
@@ -182,7 +179,7 @@ impl Bot {
             WorkItem::Tick => self.on_tick().await,
             WorkItem::JobDone(o) => self.on_job_done(o).await,
             WorkItem::JobWatchdog { task_id, reason } => self.on_job_watchdog(task_id, reason).await,
-            WorkItem::Control(event) => self.on_control_event(event),
+            WorkItem::Control(event) => self.on_control_event(event).await,
         };
         if let Err(e) = result {
             report_error(&e, Fault::EventHandling);

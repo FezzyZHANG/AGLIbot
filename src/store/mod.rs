@@ -1,6 +1,8 @@
 //! Async storage shared by the runtime and in-memory tests.
 
 mod mem;
+mod task;
+pub(crate) use task::{RECOVERY_NOTE, task_status_line};
 pub mod migrate;
 mod mongo;
 
@@ -294,6 +296,87 @@ impl NewReview {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    Research,
+    Code,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    /// Approved and waiting to be started.
+    Inbox,
+    Active,
+    /// Waiting for the owner (requests from others, or a stopped task).
+    Waiting,
+    Done,
+    Dropped,
+}
+
+impl TaskStatus {
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Inbox | Self::Active | Self::Waiting)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadRef {
+    pub platform: String,
+    pub chat_id: String,
+    pub message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRecord {
+    pub id: String,
+    pub title: String,
+    pub kind: TaskKind,
+    pub status: TaskStatus,
+    /// person_id of whoever asked.
+    pub requester: String,
+    pub created: DateTime<Utc>,
+    pub updated: DateTime<Utc>,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub origin: Option<ThreadRef>,
+    #[serde(default)]
+    pub threads: Vec<ThreadRef>,
+    /// Frozen at creation / status change; ordinary log appends must not change L2.
+    #[serde(default)]
+    pub status_log: String,
+    #[serde(default)]
+    pub followups: Vec<TaskFollowup>,
+    #[serde(default)]
+    pub current_round: u32,
+    #[serde(default)]
+    pub last_verdict: Option<TaskVerdict>,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskFollowup {
+    pub seq: u64,
+    pub ts: DateTime<Utc>,
+    pub body: String,
+    pub thread: ThreadRef,
+    #[serde(default)]
+    pub consumed_round: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskVerdict {
+    pub review_id: u64,
+    pub round: u32,
+    pub verdict: String,
+    #[serde(default)]
+    pub reasons: String,
+    #[serde(default)]
+    pub fixes: String,
+}
+
 #[derive(Clone)]
 pub struct Store(Arc<StoreBackend>);
 
@@ -344,28 +427,14 @@ impl Store {
         Self(Arc::new(StoreBackend::Mem(mem::MemStore::default())))
     }
 
-    pub fn append_model_call_best_effort(&self, record: ModelCallRecord) {
-        match self.0.as_ref() {
-            StoreBackend::Mem(store) => {
-                if let Err(error) = store.append_model_call(&record) {
-                    tracing::warn!("could not record model call: {error}");
-                }
-            }
-            StoreBackend::Mongo(store) => match tokio::runtime::Handle::try_current() {
-                Ok(runtime) => {
-                    let store = store.clone();
-                    runtime.spawn(async move {
-                        if let Err(error) = store.append_model_call(&record).await {
-                            tracing::warn!("could not record model call: {error}");
-                        }
-                    });
-                }
-                Err(_) => tracing::warn!("could not record model call outside the Tokio runtime"),
-            },
-        }
-    }
-
     store_methods! {
+        fn tasks() -> Vec<TaskRecord>;
+        fn task(id: &str) -> Option<TaskRecord>;
+        fn save_task(task: &TaskRecord) -> ();
+        fn append_task_followup(id: &str, body: &str, thread: ThreadRef, now: DateTime<Utc>) -> TaskRecord;
+        fn mark_task_followups_consumed(id: &str, up_to_seq: u64, round: u32) -> ();
+        fn set_task_status(id: &str, status: TaskStatus, note: &str, now: DateTime<Utc>, verdict: Option<TaskVerdict>) -> TaskRecord;
+        fn recover_active_tasks(now: DateTime<Utc>) -> Vec<String>;
         fn append_message(m: &MessageRecord) -> ();
         fn recent_in_ns(ns: &Namespace, n: usize) -> Vec<MessageRecord>;
         fn messages_after(ns: &Namespace, after: DateTime<Utc>) -> Vec<MessageRecord>;

@@ -9,10 +9,11 @@ use super::{Bot, ChatCtx};
 use crate::channels::Envelope;
 use crate::error_report::{Fault, report};
 use crate::ns::ProcessingPolicy;
-use crate::work::{board::Board, research};
+use crate::work::{Board, Task, linked};
 use crate::channels::{Attachment, AttachmentKind};
 use crate::hands::reader::{MAX_DOCUMENT_BYTES, Reader, supported_name};
 use crate::mind::llm::{Part, Prompt, Turn};
+use crate::mind::vision::{AttachmentCache, attachment_key};
 use sha2::{Digest, Sha256};
 
 const MAX_SOURCES: usize = 3;
@@ -116,13 +117,17 @@ impl Bot {
         }).cloned().collect()
     }
 
-    pub(super) async fn read_inputs(&self, ctx: &ChatCtx, policy: &ProcessingPolicy, inputs: Inputs, purpose: Purpose) -> Read {
-        if inputs.is_empty() { return Read::default(); }
-        let reader = Reader::new(std::env::var("DEEPSEEK_API_KEY").unwrap_or_default());
-        self.read_inputs_with(ctx, policy, inputs, purpose, reader).await
+    pub(super) fn tool_reader(&self) -> Result<Reader> {
+        Ok(Reader::new(std::env::var("DEEPSEEK_API_KEY").unwrap_or_default())?.with_models(self.models.clone()))
     }
 
-    pub(super) async fn read_inputs_with(&self, ctx: &ChatCtx, policy: &ProcessingPolicy, inputs: Inputs, purpose: Purpose, reader: Result<Reader>) -> Read {
+    pub(super) async fn read_inputs(&self, ctx: &ChatCtx, policy: &ProcessingPolicy, inputs: Inputs, purpose: Purpose, cache: &mut AttachmentCache) -> Read {
+        if inputs.is_empty() { return Read::default(); }
+        let reader = self.tool_reader();
+        self.read_inputs_with(ctx, policy, inputs, purpose, cache, reader).await
+    }
+
+    pub(super) async fn read_inputs_with(&self, ctx: &ChatCtx, policy: &ProcessingPolicy, inputs: Inputs, purpose: Purpose, cache: &mut AttachmentCache, reader: Result<Reader>) -> Read {
         let mut out = Read::default();
         let mut inputs = inputs;
         // Inline photos already go through the chat model's native image path.
@@ -150,11 +155,18 @@ impl Bot {
                 anyhow::ensure!(inline_photo || supported_name(name), "文件格式未受支持");
                 let native = purpose != Purpose::OcrFallback && native_image(file);
                 if !native { cloud()?; }
-                let mut bytes = self.outlets.fetch_attachment(ctx.platform, &ctx.chat_id, file, MAX_DOCUMENT_BYTES).await
-                    .map_err(|e| if e.is::<crate::channels::TooLarge>() { anyhow::anyhow!("文件超出大小限制") } else {
-                        report(Fault::FileRead);
-                        anyhow::anyhow!("平台附件下载失败")
-                    })?;
+                let key = attachment_key(ctx.platform, file).filter(|_| native_image(file));
+                let mut bytes = if let Some(bytes) = key.as_ref().and_then(|key| cache.get(key)) {
+                    bytes.clone()
+                } else {
+                    let bytes = self.outlets.fetch_attachment(ctx.platform, &ctx.chat_id, file, MAX_DOCUMENT_BYTES).await
+                        .map_err(|e| if e.is::<crate::channels::TooLarge>() { anyhow::anyhow!("文件超出大小限制") } else {
+                            report(Fault::FileRead);
+                            anyhow::anyhow!("平台附件下载失败")
+                        })?;
+                    if let Some(key) = key { cache.insert(key, bytes.clone()); }
+                    bytes
+                };
                 if native {
                     let (pixels, original) = tokio::task::spawn_blocking(move || (crate::mind::vision::sampled_frames(&bytes, 1), bytes)).await?;
                     if let Ok((frames, _)) = pixels {
@@ -223,13 +235,14 @@ impl Bot {
 }
 
 /// Only the owner can disclose a chat attachment to a task created in this same chat.
-pub(super) fn save(board: &Board, id: &str, ctx: &ChatCtx, evidence: &[Evidence]) -> Result<()> {
+pub(super) fn save(board: &Board, task: &Task, ctx: &ChatCtx, evidence: &[Evidence]) -> Result<()> {
     if evidence.is_empty() { return Ok(()); }
-    let origin = board.get(id).and_then(|t| t.origin.as_ref());
+    let id = &task.id;
+    let origin = task.origin.as_ref();
     anyhow::ensure!(ctx.owner_private() && origin.is_some_and(|t| t.platform == ctx.platform && t.chat_id == ctx.chat_id), "任务与材料来自不同对话");
     let dir = board.task_dir(id).join("inputs");
     let parent = board.task_dir(id);
-    anyhow::ensure!(!research::linked(&parent.symlink_metadata()?), "任务目录包含链接");
+    anyhow::ensure!(!linked(&parent.symlink_metadata()?), "任务目录包含链接");
     anyhow::ensure!(parent.canonicalize()? == parent.parent().ok_or_else(|| anyhow::anyhow!("任务目录无效"))?.canonicalize()?.join(id), "任务目录指向外部");
     match std::fs::create_dir(&dir) {
         Ok(()) => {}
@@ -237,7 +250,7 @@ pub(super) fn save(board: &Board, id: &str, ctx: &ChatCtx, evidence: &[Evidence]
         Err(e) => return Err(e.into()),
     }
     anyhow::ensure!(dir.canonicalize()? == parent.canonicalize()?.join("inputs"), "材料目录指向外部");
-    anyhow::ensure!(!research::linked(&dir.symlink_metadata()?), "材料目录包含链接");
+    anyhow::ensure!(!linked(&dir.symlink_metadata()?), "材料目录包含链接");
     for e in evidence {
         anyhow::ensure!(e.chat_id == ctx.chat_id && e.platform == ctx.platform, "材料来自其他对话");
         let json = serde_json::to_vec_pretty(e)?;
@@ -245,7 +258,7 @@ pub(super) fn save(board: &Board, id: &str, ctx: &ChatCtx, evidence: &[Evidence]
         let destination = dir.join(format!("{hash}.json"));
         if destination.try_exists()? {
             let meta = destination.symlink_metadata()?;
-            anyhow::ensure!(meta.is_file() && !research::linked(&meta) && meta.len() == json.len() as u64
+            anyhow::ensure!(meta.is_file() && !linked(&meta) && meta.len() == json.len() as u64
                 && destination.canonicalize()? == dir.canonicalize()?.join(format!("{hash}.json"))
                 && std::fs::read(&destination)? == json, "已有材料校验失败");
             continue;

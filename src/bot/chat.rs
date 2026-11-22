@@ -219,8 +219,8 @@ impl ChatCtx {
         ThreadRef { platform: self.platform.into(), chat_id: self.chat_id.clone(), message_id: self.message_id.clone() }
     }
 
-    pub(super) fn task_cards(&self, board: &Board) -> String {
-        if self.owner_private() { board.cards() } else { String::new() }
+    pub(super) async fn task_cards(&self, board: &Board) -> anyhow::Result<String> {
+        if self.owner_private() { board.cards().await } else { Ok(String::new()) }
     }
 }
 

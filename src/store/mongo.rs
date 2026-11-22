@@ -8,6 +8,8 @@ use mongodb::{Client, Collection, Cursor, Database, IndexModel};
 use serde::de::DeserializeOwned;
 
 use super::*;
+
+mod tasks;
 use crate::config::MongoCfg;
 
 #[derive(Clone)]
@@ -20,16 +22,18 @@ pub(super) fn bson_dt(ts: DateTime<Utc>) -> bson::DateTime {
 }
 
 fn map_dates(doc: &mut Document, convert: fn(&Bson) -> Result<Option<Bson>>) -> Result<()> {
-    for field in ["ts", "first_seen", "last_seen", "last_sent", "last_update"] {
+    for field in ["ts", "first_seen", "last_seen", "last_sent", "last_update", "created", "updated"] {
         if let Some(value) = doc.get_mut(field)
             && let Some(converted) = convert(value)?
         {
             *value = converted;
         }
     }
-    if let Ok(facts) = doc.get_array_mut("facts") {
-        for fact in facts.iter_mut().filter_map(Bson::as_document_mut) {
-            map_dates(fact, convert)?;
+    for field in ["facts", "followups"] {
+        if let Ok(entries) = doc.get_array_mut(field) {
+            for entry in entries.iter_mut().filter_map(Bson::as_document_mut) {
+                map_dates(entry, convert)?;
+            }
         }
     }
     Ok(())
@@ -186,6 +190,7 @@ impl MongoStore {
             ),
             ("episodes", doc! { "ns": 1, "ts": 1 }),
             ("audit", doc! { "ts": 1 }),
+            ("tasks", doc! { "status": 1, "created": 1 }),
             ("reviews", doc! { "status": 1, "id": 1 }),
             ("media", doc! { "status": 1, "first_seen": -1 }),
             ("sticker_vectors", doc! { "model_id": 1 }),
@@ -611,6 +616,7 @@ mod test {
         audit, call, contract, episode, json_payload, media, message, person, review, time, vector,
     };
     use super::*;
+
 
     fn wire(doc: &Document) -> Result<Document> {
         Ok(RawDocumentBuf::from_document(doc)?.to_document()?)

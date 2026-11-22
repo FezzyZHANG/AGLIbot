@@ -39,32 +39,6 @@ pub struct Situation {
     pub may_message_owner: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReflectionAction {
-    Continue,
-    Merge,
-    Switch,
-    Exit,
-}
-
-impl ReflectionAction {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Continue => "continue",
-            Self::Merge => "merge",
-            Self::Switch => "switch",
-            Self::Exit => "exit",
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Reflection {
-    pub action: ReflectionAction,
-    pub reason: String,
-}
-
 fn decide_schema() -> JsonSchema {
     JsonSchema {
         name: "decision",
@@ -80,33 +54,6 @@ fn decide_schema() -> JsonSchema {
             }
         }),
     }
-}
-
-fn reflect_schema() -> JsonSchema {
-    JsonSchema {
-        name: "reflection",
-        schema: json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["action", "reason"],
-            "properties": {
-                "action": {"type": "string", "enum": ["continue", "merge", "switch", "exit"]},
-                "reason": {"type": "string"}
-            }
-        }),
-    }
-}
-
-/// A side call using the same cheap routing and JSON validation as action selection.
-pub async fn reflect(models: &Models, policy: &ProcessingPolicy, l1: &str, situation: &str) -> Result<Reflection> {
-    let user = format!(
-        "（这是研究步骤边界的即时反思，不是聊天。）\n{situation}\n\n\
-         选择 continue（按原有边界规则继续）、merge（把新补充合并到下一步，仍受重规划和取证轮数限制）、\
-         switch（保存断点，任务暂挂 Waiting，让心智处理其他工作）、exit（用现有材料结束，不再取证）。\n\
-         主人补充是 urgent 输入，但不一定需要切换；根据内容选择。仅输出 JSON：\
-         {{\"action\":\"continue|merge|switch|exit\",\"reason\":\"一句话理由\"}}"
-    );
-    models.ask_structured("triage", policy, l1, &user, &reflect_schema()).await
 }
 
 pub async fn decide(models: &Models, policy: &ProcessingPolicy, l1: &str, s: &Situation) -> Result<Decision> {

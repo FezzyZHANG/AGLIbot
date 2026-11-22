@@ -200,6 +200,23 @@ impl Models {
         (b.spent_usd, b.limit_usd)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_tool_call(
+        &self, scenario: &str, model_id: &str, session_id: &str, latency: Duration,
+        cost_usd: f64, ok: bool, error: Option<String>,
+    ) {
+        self.budget().add(cost_usd);
+        let call = ModelCallRecord {
+            ts: Utc::now(), scenario: scenario.into(), model_id: model_id.into(),
+            session_id: session_id.into(), uncached_input: 0, cached_input: 0,
+            cache_write: 0, output: 0, latency_ms: latency.as_millis() as u64,
+            cost_usd, ok, error, escalated_from: None,
+        };
+        if let Err(e) = self.store.append_model_call(&call).await {
+            warn!("failed to log tool call: {e:#}");
+        }
+    }
+
     pub fn pick(&self, scenario: &str, policy: &ProcessingPolicy) -> Result<ModelEntry> {
         Ok(self.router.select(scenario, policy, self.budget_exhausted())?.clone())
     }

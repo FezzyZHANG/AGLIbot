@@ -320,8 +320,9 @@ impl MemoryCfg {
 #[serde(rename_all = "snake_case")]
 pub enum DelegateTool {
     #[default]
+    #[serde(alias = "dsh")]
+    Native,
     Codex,
-    Dsh,
     Off,
 }
 
@@ -333,9 +334,11 @@ pub struct HandsCfg {
     pub research: DelegateTool,
     pub code: DelegateTool,
     pub codex_model: String,
-    #[serde(default = "default_dsh_profile")]
+    #[serde(default)]
+    #[allow(dead_code)] // Retained for existing runtime YAML.
     pub dsh_profile: String,
-    #[serde(default = "default_dsh_home")]
+    #[serde(default)]
+    #[allow(dead_code)] // Retained for existing runtime YAML.
     pub dsh_home: PathBuf,
     pub timeout_min: u64,
     #[serde(default = "default_stall_minutes")]
@@ -355,23 +358,10 @@ fn positive_max_jobs<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::
 fn default_stall_minutes() -> u64 { 20 }
 fn default_total_budget_minutes() -> u64 { 90 }
 
-fn default_dsh_profile() -> String {
-    "agli".into()
-}
-
-fn default_dsh_home() -> PathBuf {
-    "data/dsh-home".into()
-}
-
 impl HandsCfg {
-    fn resolve_dsh_home(&mut self, root: &Path) -> Result<()> {
-        self.dsh_home = std::path::absolute(root.join(&self.dsh_home)).context("resolving AGLI DSH home")?;
-        Ok(())
-    }
-
     /// Fail at load time rather than when the first task starts.
     fn validate(&self) -> Result<()> {
-        anyhow::ensure!(self.code != DelegateTool::Dsh, "hands.code: dsh is not supported; DSH is research-only (use codex or off)");
+        anyhow::ensure!(self.code != DelegateTool::Native, "hands.code must be codex or off (native research is unsupported for code)");
         for (name, minutes) in [("timeout_min", self.timeout_min), ("stall_minutes", self.stall_minutes),
             ("total_budget_minutes", self.total_budget_minutes)] {
             anyhow::ensure!(minutes > 0, "hands.{name} must be > 0");
@@ -488,7 +478,6 @@ impl Config {
             social: read_yaml(&dir.join("social.yaml"))?,
             runtime: read_yaml(&dir.join("runtime.yaml"))?,
         };
-        cfg.runtime.hands.resolve_dsh_home(root)?;
         cfg.resolve_env()?;
         cfg.validate()?;
         crate::ns::secrets::register_config(&cfg);
@@ -581,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn hands_validation_rejects_dsh_code_and_zero_minutes() {
+    fn hands_validation_rejects_native_code_and_zero_minutes() {
         let base = "research: dsh
 code: codex
 codex_model: m
@@ -589,8 +578,10 @@ timeout_min: 30
 ";
         let hands: HandsCfg = serde_yaml::from_str(base).unwrap();
         hands.validate().unwrap();
-        let hands: HandsCfg = serde_yaml::from_str(&base.replace("code: codex", "code: dsh")).unwrap();
-        assert!(hands.validate().unwrap_err().to_string().contains("research-only"));
+        for invalid in ["code: dsh", "code: native"] {
+            let hands: HandsCfg = serde_yaml::from_str(&base.replace("code: codex", invalid)).unwrap();
+            assert!(hands.validate().unwrap_err().to_string().contains("must be codex or off"));
+        }
         for key in ["timeout_min: 0", "stall_minutes: 0", "total_budget_minutes: 0"] {
             let yaml = if key.starts_with("timeout") { base.replace("timeout_min: 30", key) } else { format!("{base}{key}
 ") };
@@ -672,15 +663,15 @@ timeout_min: 30
     }
 
     #[test]
-    fn hands_defaults_preserve_codex_and_dsh_is_opt_in() {
+    fn hands_defaults_to_native_and_accepts_legacy_dsh_fields() {
         let yaml = "code: codex\ncodex_model: pinned\ntimeout_min: 10\n";
         let hands: HandsCfg = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(hands.research, DelegateTool::Codex);
-        assert_eq!(hands.dsh_profile, "agli");
-        assert_eq!(hands.dsh_home, Path::new("data/dsh-home"));
+        assert_eq!(hands.research, DelegateTool::Native);
+        assert!(hands.dsh_profile.is_empty());
+        assert_eq!(hands.dsh_home, PathBuf::new());
         assert_eq!((hands.stall_minutes, hands.total_budget_minutes), (20, 90));
         let hands: HandsCfg = serde_yaml::from_str(&format!("{yaml}research: dsh\ndsh_profile: agli-research")).unwrap();
-        assert_eq!(hands.research, DelegateTool::Dsh);
+        assert_eq!(hands.research, DelegateTool::Native);
         assert_eq!(hands.code, DelegateTool::Codex);
         assert_eq!(hands.dsh_profile, "agli-research");
         let hands: HandsCfg = serde_yaml::from_str(&format!("{yaml}stall_minutes: 3\ntotal_budget_minutes: 15")).unwrap();
@@ -699,22 +690,6 @@ timeout_min: 30
         yaml["work_dir"] = serde_yaml::Value::String("custom/tasks".into());
         cfg.runtime = serde_yaml::from_value(yaml).unwrap();
         assert_eq!(cfg.work_dir(), cfg.root.join("custom/tasks"));
-    }
-
-    #[test]
-    fn dsh_home_resolves_against_root_not_task_directory() {
-        let yaml = "code: codex\ncodex_model: pinned\ntimeout_min: 10\n";
-        let root = Path::new("agli root");
-        for configured in [None, Some("data/custom home")] {
-            let setting = configured.map(|p| format!("dsh_home: {p}")).unwrap_or_default();
-            let mut hands: HandsCfg = serde_yaml::from_str(&format!("{yaml}{setting}")).unwrap();
-            hands.resolve_dsh_home(root).unwrap();
-            assert_eq!(hands.dsh_home, std::path::absolute(root.join(configured.unwrap_or("data/dsh-home"))).unwrap());
-            assert!(hands.dsh_home.is_absolute());
-            let resolved = hands.dsh_home.clone();
-            hands.resolve_dsh_home(Path::new("another root")).unwrap();
-            assert_eq!(hands.dsh_home, resolved);
-        }
     }
 
     #[test]
@@ -747,7 +722,6 @@ timeout_min: 30
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let cfg = Config::load(root).expect("config/ should parse");
         assert!(!cfg.models.models.is_empty());
-        assert_eq!(cfg.runtime.hands.dsh_home, root.join("data/dsh-home"));
         assert!(cfg.scenarios.contains_key("verify"));
         assert_ne!(cfg.runtime.routine.sleep_at, cfg.runtime.routine.wake_at);
     }

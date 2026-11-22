@@ -13,7 +13,7 @@ use anyhow::Result;
 use crate::bot::Event;
 use crate::config::{Config, HandsCfg};
 use crate::store::Store;
-use crate::work::research::Outcome;
+use crate::work::Outcome;
 
 pub struct CancelSource {
     tx: watch::Sender<bool>,
@@ -92,12 +92,7 @@ impl ActiveJob {
         }
     }
 
-    fn abort(&mut self) -> Option<JoinHandle<()>> {
-        self.cancel.cancel();
-        let handle = self.handle.take()?;
-        handle.abort();
-        Some(handle)
-    }
+
 }
 
 #[derive(Default)]
@@ -144,13 +139,14 @@ impl JobRegistry {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn stop_one(&self, id: &str) -> Option<String> {
-        let mut job = {
+        let job = {
             let mut jobs = self.lock();
             if !jobs.get(id)?.claim_stop() { return None }
             jobs.remove(id)?
         };
-        if let Some(handle) = job.abort() { let _ = handle.await; }
-        Some(job.id)
+        let id = job.id.clone();
+        stop_job(job).await;
+        Some(id)
     }
 
     pub async fn stop_all(&self) -> Vec<String> {
@@ -175,14 +171,21 @@ impl JobRegistry {
     }
 }
 
-async fn abort_and_join<T>(stopped: Vec<(T, ActiveJob)>) -> Vec<T> {
-    let handles: Vec<_> = stopped.into_iter().map(|(result, mut job)| (result, job.abort())).collect();
-    let mut results = Vec::with_capacity(handles.len());
-    for (result, handle) in handles {
-        if let Some(handle) = handle { let _ = handle.await; }
-        results.push(result);
+async fn stop_job(mut job: ActiveJob) {
+    job.cancel.cancel();
+    if let Some(mut handle) = job.handle.take()
+        && tokio::time::timeout(Duration::from_millis(300), &mut handle).await.is_err()
+    {
+        handle.abort();
+        let _ = handle.await;
     }
-    results
+}
+
+async fn abort_and_join<T>(stopped: Vec<(T, ActiveJob)>) -> Vec<T> {
+    futures_util::future::join_all(stopped.into_iter().map(|(result, job)| async {
+        stop_job(job).await;
+        result
+    })).await
 }
 
 pub struct ControlPlane {
@@ -338,6 +341,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_one_allows_cooperative_cleanup_before_joining() {
+        let jobs = JobRegistry::default();
+        let (events, mut rx) = mpsc::channel(1);
+        let (cleaned, cleanup) = oneshot::channel();
+        jobs.spawn("id".into(), "title".into(), PathBuf::new(), events, |mut token| async move {
+            token.cancelled().await;
+            tokio::task::yield_now().await;
+            cleaned.send(()).unwrap();
+            Outcome {
+                task_id: "id".into(), title: "title".into(), ok: true,
+                clarification: None, paused: Some("cancelled".into()), summary: String::new(),
+                verdict: None, verdict_record: None,
+            }
+        });
+        assert_eq!(jobs.stop_one("id").await.as_deref(), Some("id"));
+        cleanup.await.unwrap();
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
     async fn cancellation_claim_suppresses_late_completion() {
         let jobs = JobRegistry::default();
         let (events, mut rx) = mpsc::channel(1);
@@ -348,7 +371,7 @@ mod tests {
         assert!(job.claim_stop());
         finish.send(Outcome {
             task_id: "id".into(), title: "title".into(), ok: true, clarification: None,
-            paused: None, summary: "late result".into(), verdict: None,
+            paused: None, summary: "late result".into(), verdict: None, verdict_record: None,
         }).unwrap();
         job.handle.unwrap().await.unwrap();
         assert!(rx.recv().await.is_none());

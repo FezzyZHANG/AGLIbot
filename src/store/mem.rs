@@ -8,6 +8,7 @@ use super::*;
 
 #[derive(Default)]
 struct MemData {
+    tasks: BTreeMap<String, TaskRecord>,
     messages: Vec<MessageRecord>,
     model_calls: Vec<ModelCallRecord>,
     episodes: Vec<Episode>,
@@ -45,6 +46,57 @@ impl MemStore {
         self.data
             .write()
             .map_err(|_| anyhow!("in-memory store lock poisoned"))
+    }
+
+    pub fn tasks(&self) -> Result<Vec<TaskRecord>> {
+        let mut tasks: Vec<_> = self.read()?.tasks.values().cloned().collect();
+        tasks.sort_by_key(|task| task.created);
+        Ok(tasks)
+    }
+
+    pub fn task(&self, id: &str) -> Result<Option<TaskRecord>> {
+        Ok(self.read()?.tasks.get(id).cloned())
+    }
+
+    pub fn save_task(&self, task: &TaskRecord) -> Result<()> {
+        self.write()?.tasks.insert(task.id.clone(), task.clone());
+        Ok(())
+    }
+
+    fn mutate_task(&self, id: &str, change: impl FnOnce(&mut TaskRecord) -> Result<()>) -> Result<TaskRecord> {
+        let mut data = self.write()?;
+        let task = data.tasks.get_mut(id).with_context(|| format!("没有这个任务：{id}"))?;
+        change(task)?;
+        Ok(task.clone())
+    }
+
+    pub fn append_task_followup(&self, id: &str, body: &str, thread: ThreadRef, now: DateTime<Utc>) -> Result<TaskRecord> {
+        self.mutate_task(id, |task| task.append_followup(body, &thread, now))
+    }
+
+    pub fn mark_task_followups_consumed(&self, id: &str, up_to_seq: u64, round: u32) -> Result<()> {
+        self.mutate_task(id, |task| {
+            task.consume_followups(up_to_seq, round);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub fn set_task_status(&self, id: &str, status: TaskStatus, note: &str, now: DateTime<Utc>, verdict: Option<TaskVerdict>) -> Result<TaskRecord> {
+        self.mutate_task(id, |task| {
+            task.update_status(status, note, now, verdict);
+            Ok(())
+        })
+    }
+
+    pub fn recover_active_tasks(&self, now: DateTime<Utc>) -> Result<Vec<String>> {
+        let mut data = self.write()?;
+        let mut recovered = Vec::new();
+        for task in data.tasks.values_mut().filter(|task| task.status == TaskStatus::Active) {
+            task.update_status(TaskStatus::Inbox, RECOVERY_NOTE, now, None);
+            recovered.push(task.id.clone());
+        }
+        Ok(recovered)
     }
 
     pub fn append_message(&self, m: &MessageRecord) -> Result<()> {

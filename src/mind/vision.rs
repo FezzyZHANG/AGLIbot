@@ -20,6 +20,13 @@ use super::llm::Part;
 use super::media::MediaHandle;
 use crate::channels::{Attachment, AttachmentKind, Outlets, TooLarge};
 
+pub type AttachmentCache = std::collections::HashMap<String, Vec<u8>>;
+
+pub(crate) fn attachment_key(platform: &str, file: &Attachment) -> Option<String> {
+    file.file_id.as_ref().map(|id| format!("{platform}:id:{id}"))
+        .or_else(|| file.url.as_ref().map(|url| format!("{platform}:url:{url}")))
+}
+
 pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_PIXELS: u64 = 50_000_000;
 /// Decoded across all frames while counting; a longer animation is sampled from this prefix.
@@ -174,16 +181,21 @@ fn normalize(bytes: &[u8], max_frames: usize) -> Result<Normalized, Failure> {
     }
 }
 
-async fn load(outlets: &Outlets, cache: &MediaHandle, chat_id: &str, media: &PendingMedia, max_frames: usize) -> Result<Normalized, Failure> {
-    let bytes = match cache.cached(&media.attachment).await {
-        Some(bytes) => bytes,
-        None => {
-            outlets.fetch_attachment(media.platform, chat_id, &media.attachment, MAX_FILE_BYTES).await.map_err(|e| {
+async fn load(outlets: &Outlets, cache: &MediaHandle, attachments: &mut AttachmentCache, chat_id: &str, media: &PendingMedia, max_frames: usize) -> Result<Normalized, Failure> {
+    let key = attachment_key(media.platform, &media.attachment);
+    let bytes = if let Some(bytes) = key.as_ref().and_then(|key| attachments.get(key)) {
+        bytes.clone()
+    } else {
+        let bytes = match cache.cached(&media.attachment).await {
+            Some(bytes) => bytes,
+            None => outlets.fetch_attachment(media.platform, chat_id, &media.attachment, MAX_FILE_BYTES).await.map_err(|e| {
                 if e.downcast_ref::<TooLarge>().is_some() { return Failure::TooBig; }
                 warn!("image download failed: {e:#}");
                 Failure::Download
-            })?
-        }
+            })?,
+        };
+        if let Some(key) = key { attachments.insert(key, bytes.clone()); }
+        bytes
     };
     tokio::task::spawn_blocking(move || normalize(&bytes, max_frames)).await.map_err(|_| Failure::Format)?
 }
@@ -211,7 +223,7 @@ pub struct Look {
 }
 
 /// Fetch and normalise the waiting images. A failure becomes an explicit note, never a failed reply.
-pub async fn look(outlets: &Outlets, cache: &MediaHandle, chat_id: &str, pending: Vec<PendingMedia>) -> Look {
+pub async fn look(outlets: &Outlets, cache: &MediaHandle, chat_id: &str, pending: Vec<PendingMedia>, attachments: &mut AttachmentCache) -> Look {
     let now = Instant::now();
     let waiting = pending.len();
     let pending: Vec<PendingMedia> = pending.into_iter().filter(|m| now.duration_since(m.at) < PENDING_TTL).collect();
@@ -228,7 +240,7 @@ pub async fn look(outlets: &Outlets, cache: &MediaHandle, chat_id: &str, pending
             failures.push((number, media.sender, Failure::TooMany));
             continue;
         }
-        match load(outlets, cache, chat_id, &media, MAX_FRAMES.min(room)).await {
+        match load(outlets, cache, attachments, chat_id, &media, MAX_FRAMES.min(room)).await {
             Ok(image) => {
                 with_pixels.extend(media.attachment.media_id);
                 room -= image.frames.len();
@@ -387,7 +399,7 @@ mod tests {
             }
             media
         }).collect();
-        let result = look(&Outlets::default(), &cache, "group:1", media).await;
+        let result = look(&Outlets::default(), &cache, "group:1", media, &mut AttachmentCache::new()).await;
         std::fs::remove_dir_all(dir).unwrap();
         result
     }
@@ -423,7 +435,7 @@ mod tests {
     async fn expired_references_are_not_fetched_or_mentioned() {
         let mut media = pending("甲", Some("http://127.0.0.1:9/never".into()));
         media.at = Instant::now() - PENDING_TTL;
-        let look = look(&Outlets::default(), &MediaHandle::disabled(std::env::temp_dir()), "group:1", vec![media]).await;
+        let look = look(&Outlets::default(), &MediaHandle::disabled(std::env::temp_dir()), "group:1", vec![media], &mut AttachmentCache::new()).await;
         assert!(look.parts.is_empty() && look.note.is_empty() && look.note_without_parts.is_empty());
     }
 

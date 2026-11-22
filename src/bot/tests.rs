@@ -1,3 +1,4 @@
+use std::sync::Mutex;
 use super::*;
 use super::chat::{bubbles, markup, measure_reply, needs_format, parse_intent, reply_bubbles, resolve_mentions, truncate_reply};
 use super::ingress::render_unseen;
@@ -7,7 +8,8 @@ use crate::error_report::OwnerState;
 use crate::mind::{judge, reflect, speak::SayTurn};
 use crate::store::{MessageRecord, ReviewCategory, ReviewStatus};
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone};
-use crate::work::{board::{TaskKind, TaskStatus, ThreadRef}, research::Job};
+use crate::work::{Job, TaskKind, TaskStatus, ThreadRef};
+use crate::mind::vision::AttachmentCache;
 use serde_json::{Value, json};
 use super::commands::attach_followups;
 use super::ingress::{WorkQueue, next_work, owner_command, recv_work};
@@ -211,8 +213,8 @@ async fn debounce_cancellation_preserves_interleaved_events_and_quiet_deadline()
     let mut recv = Box::pin(recv_work(&mut rx, &mut queue, &acl, &session));
     assert!(poll_once(recv.as_mut()).is_pending());
     tokio::time::advance(Duration::from_secs(1)).await;
-    for event in [Event::Tick, inbound("7", "other chat", "2"), Event::JobDone(research::Outcome {
-        task_id: "task-1".into(), title: "done".into(), ok: true, clarification: None, paused: None, summary: "result".into(), verdict: None,
+    for event in [Event::Tick, inbound("7", "other chat", "2"), Event::JobDone(work::Outcome {
+        task_id: "task-1".into(), title: "done".into(), ok: true, clarification: None, paused: None, summary: "result".into(), verdict: None, verdict_record: None,
     }), inbound("42", "second", "3")] {
         tx.try_send(event).unwrap();
     }
@@ -310,11 +312,11 @@ fn batching_keeps_owner_commands_separate_in_arrival_order() {
 
 #[test]
 fn batching_preserves_tick_and_job_done_boundaries() {
-    let outcome = research::Outcome {
+    let outcome = work::Outcome {
         task_id: "task-1".into(), title: "done".into(), ok: true,
         clarification: None,
         paused: None,
-        summary: "result".into(), verdict: None,
+        summary: "result".into(), verdict: None, verdict_record: None,
     };
     let mut queue = WorkQueue::from([
         inbound("42", "before tick", "1"), Event::Tick, inbound("42", "after tick", "2"),
@@ -611,7 +613,7 @@ async fn formatting_falls_back_to_the_draft_and_never_executes_new_markers() {
         assert_eq!(prompts[0].0, ProcessingPolicy::LocalOnly);
         assert!(chat.turns.is_empty());
     }
-    assert!(a.board().tasks().is_empty());
+    assert!(a.board.tasks().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -691,11 +693,11 @@ async fn delivery_cards_keep_paths_verdicts_and_cap_all_branches() {
     a.test_chat = Some(TestChat::new(&["[沉默]", "[沉默]", "[沉默]", "[沉默]"], &[]));
     let long = format!("{}不得注入的尾部", "中文🦀".repeat(300));
     let preview = delivery_preview(&long);
-    let mut o = research::Outcome {
+    let mut o = work::Outcome {
         task_id: "task-card".into(), title: "研究".into(), ok: true,
-        clarification: None, paused: None, summary: long.clone(), verdict: Some("#7 需主人确认".into()),
+        clarification: None, paused: None, summary: long.clone(), verdict: Some("#7 需主人确认".into()), verdict_record: None,
     };
-    let report = a.board().task_dir(&o.task_id).join("report.md");
+    let report = a.board.task_dir(&o.task_id).join("report.md");
     a.deliver(o.clone()).await.unwrap();
     let body = &a.test_chat.as_ref().unwrap().turns[0].1;
     assert!(body.contains(&preview) && body.contains(&report.display().to_string()));
@@ -709,21 +711,21 @@ async fn delivery_cards_keep_paths_verdicts_and_cap_all_branches() {
         assert!(body.contains(&preview));
         assert!(!body.contains("不得注入的尾部"));
     }
-    let task = a.board().add("代码产出", TaskKind::Code, "owner", TaskStatus::Done, None).unwrap();
+    let task = a.board.add("代码产出", TaskKind::Code, "owner", TaskStatus::Done, None).await.unwrap();
     o.task_id = task.id.clone();
     o.paused = None;
     o.summary = "短结果".into();
     a.deliver(o).await.unwrap();
     let body = &a.test_chat.as_ref().unwrap().turns[3].1;
     assert!(body.contains("短结果"));
-    assert!(body.contains(&a.board().task_dir(&task.id).join("scratch").display().to_string()));
+    assert!(body.contains(&a.board.task_dir(&task.id).join("scratch").display().to_string()));
     assert!(!body.contains("report.md"));
 }
 
 // Use the real admission path, then replace the worker before yielding so
 // these tests never invoke an external executor.
 async fn start_slot(a: &mut Bot, owner_run: bool) -> crate::work::board::Task {
-    let task = a.board().add("slot", TaskKind::Research, "owner", TaskStatus::Inbox, None).unwrap();
+    let task = a.board.add("slot", TaskKind::Research, "owner", TaskStatus::Inbox, None).await.unwrap();
     assert_eq!(a.start_job_with_owner_slot(&task.id, owner_run).await.unwrap(), "开始做：slot");
     a.control.jobs().stop_one(&task.id).await.unwrap();
     spawn_test_job(a, &task, a.events.clone(), std::future::pending());
@@ -736,12 +738,12 @@ async fn default_slots_preserve_second_start_refusal() {
     let a = &mut test.bot;
     assert_eq!(a.cfg.runtime.hands.max_jobs, 1);
     let first = start_slot(a, false).await;
-    let next = a.board().add("next", TaskKind::Research, "owner", TaskStatus::Inbox, None).unwrap();
+    let next = a.board.add("next", TaskKind::Research, "owner", TaskStatus::Inbox, None).await.unwrap();
     let refusal = format!("正在做 {}，一次只做一件。", first.id);
     assert_eq!(a.start_job(&next.id).await.unwrap(), refusal);
     assert_eq!(a.start_job_with_owner_slot(&next.id, true).await.unwrap(), refusal);
     assert_eq!(a.start_job(&first.id).await.unwrap(), refusal);
-    assert_eq!(a.board().get(&next.id).unwrap().status, TaskStatus::Inbox);
+    assert_eq!(a.board.get(&next.id).await.unwrap().unwrap().status, TaskStatus::Inbox);
     a.stop_jobs().await;
 }
 
@@ -752,7 +754,7 @@ async fn parallel_slots_owner_extra_and_commands() {
     Arc::get_mut(&mut a.cfg).unwrap().runtime.hands.max_jobs = 2;
     let first = start_slot(a, false).await;
     let second = start_slot(a, false).await;
-    let next = a.board().add("next", TaskKind::Research, "owner", TaskStatus::Inbox, None).unwrap();
+    let next = a.board.add("next", TaskKind::Research, "owner", TaskStatus::Inbox, None).await.unwrap();
     assert!(a.start_job(&next.id).await.unwrap().contains("槽位已满"));
     assert!(a.start_job(&second.id).await.unwrap().contains("不能重复"));
     let ctx = owner_chat();
@@ -780,8 +782,8 @@ async fn owner_extra_slot_stays_available_after_a_job_finishes() {
     let background = start_slot(a, false).await;
     a.control.jobs().stop_one(&first.id).await.unwrap();
     spawn_test_job(a, &first, a.events.clone(), std::future::pending());
-    a.on_job_done(research::Outcome { task_id: first.id, title: first.title, ok: true,
-        summary: "done".into(), clarification: None, paused: None, verdict: None }).await.unwrap();
+    a.on_job_done(work::Outcome { task_id: first.id, title: first.title, ok: true,
+        summary: "done".into(), clarification: None, paused: None, verdict: None, verdict_record: None }).await.unwrap();
     let automatic = start_slot(a, false).await;
     let owner = start_slot(a, true).await;
     assert!(a.control.jobs().contains(&owner.id));
@@ -801,7 +803,7 @@ async fn parallel_stop_and_freeze_cancel_every_worker() {
         let reply = a.run_command(command, "", &ctx).await.unwrap();
         assert!(a.control.jobs().is_empty());
         for id in [&first.id, &second.id] {
-            assert_eq!(a.board().get(id).unwrap().status, TaskStatus::Waiting);
+            assert_eq!(a.board.get(id).await.unwrap().unwrap().status, TaskStatus::Waiting);
             if command == "/stop" { assert!(reply.contains(id)); }
         }
         assert_eq!(a.frozen(), command == "/freeze");
@@ -821,8 +823,8 @@ async fn parallel_completions_remove_their_own_jobs_and_deliver_once() {
         let (tx, mut rx) = mpsc::channel(2);
         for (i, task) in order.iter().enumerate() {
             a.control.jobs().stop_one(&task.id).await.unwrap();
-            let outcome = research::Outcome { task_id: task.id.clone(), title: task.title.clone(), ok: true,
-                summary: "done".into(), clarification: None, paused: None, verdict: None };
+            let outcome = work::Outcome { task_id: task.id.clone(), title: task.title.clone(), ok: true,
+                summary: "done".into(), clarification: None, paused: None, verdict: None, verdict_record: None };
             spawn_test_job(a, task, tx.clone(), async { outcome });
             let Some(Event::JobDone(o)) = rx.recv().await else { panic!("missing completion") };
             a.on_job_done(o).await.unwrap();
@@ -859,22 +861,26 @@ async fn parallel_watchdog_times_out_jobs_individually() {
     a.watchdog().await.unwrap();
     assert!(a.control.jobs().is_empty());
     assert_eq!(a.store.reviews().await.unwrap().len(), 2);
-    for id in [&first.id, &second.id] { assert_eq!(a.board().get(id).unwrap().status, TaskStatus::Waiting); }
+    for id in [&first.id, &second.id] { assert_eq!(a.board.get(id).await.unwrap().unwrap().status, TaskStatus::Waiting); }
 }
 
 fn spawn_test_job(
     a: &Bot, task: &crate::work::board::Task, events: mpsc::Sender<Event>,
-    work: impl std::future::Future<Output = research::Outcome> + Send + 'static,
+    work: impl std::future::Future<Output = work::Outcome> + Send + 'static,
 ) {
-    let log_path = a.board().task_dir(&task.id).join("log.md");
+    let log_path = a.board.task_dir(&task.id).join("log.md");
     a.control.jobs().spawn(task.id.clone(), task.title.clone(), log_path, events, |_| work);
 }
 
-fn fake_job(a: &mut Bot) -> crate::work::board::Task {
-    let task = a.board().add("watchdog", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
+async fn fake_job(a: &mut Bot) -> crate::work::board::Task {
+    let task = a.board.add("watchdog", TaskKind::Research, "owner", TaskStatus::Active, None).await.unwrap();
     spawn_test_job(a, &task, a.events.clone(), std::future::pending());
     a.state.asleep = true;
     task
+}
+
+fn research_plan_reply() -> String {
+    json!({"summary":"计划", "sub_questions":[], "search_queries":[], "clarification_questions":[]}).to_string()
 }
 
 #[tokio::test]
@@ -886,12 +892,12 @@ async fn work_review_verdicts_and_late_followups_survive_completion_and_reload()
     for kind in [TaskKind::Research, TaskKind::Code] {
         for case in ["pass", "revise", "defer", "owner", "late-followup"] {
             let title = format!("{kind:?}-{case}");
-            let task = a.board().add(&title, kind, "owner", TaskStatus::Active, None).unwrap();
+            let task = a.board.add(&title, kind, "owner", TaskStatus::Active, None).await.unwrap();
             let verdict = if case == "late-followup" { "pass" } else { case };
             let rounds = if case == "revise" { 3 } else { 1 };
             let decision = json!({"verdict":verdict, "reasons":"验收依据", "fixes":"具体修改意见"}).to_string();
             let mut replies = Vec::new();
-            if kind == TaskKind::Research { replies.push("计划\n澄清：无".into()); }
+            if kind == TaskKind::Research { replies.push(research_plan_reply()); }
             for _ in 0..rounds {
                 if kind == TaskKind::Research { replies.push("报告".into()); }
                 replies.push(decision.clone());
@@ -899,21 +905,21 @@ async fn work_review_verdicts_and_late_followups_survive_completion_and_reload()
             let mut hands = a.cfg.runtime.hands.clone();
             hands.research = crate::config::DelegateTool::Off;
             let job = Job { task: task.clone(), board: a.board.clone(), store: a.store.clone(),
-                models: Arc::new(Models::stub(a.store.clone(), replies)), hands, l1: "zh".into() };
+                models: Arc::new(Models::stub(a.store.clone(), replies)), hands, l1: "zh".into(), tools: None };
             let outcome = match kind {
-                TaskKind::Research => research::run(job).await,
-                TaskKind::Code => research::code_rounds(&job, |_, _| std::future::ready(Ok("执行记录".into()))).await.unwrap(),
+                TaskKind::Research => work::run(job, crate::control::CancelSource::new().1).await,
+                TaskKind::Code => work::coding::code_rounds(&job, |_, _| std::future::ready(Ok("执行记录".into()))).await.unwrap(),
             };
             if case == "late-followup" {
                 assert_eq!(outcome.status(), TaskStatus::Done);
-                a.board().follow_up(&task.id, "还有一份资料", ThreadRef {
+                a.board.follow_up(&task.id, "还有一份资料", ThreadRef {
                     platform: "telegram".into(), chat_id: "42".into(), message_id: Some("11".into()),
-                }).unwrap();
+                }).await.unwrap();
             }
             spawn_test_job(a, &task, a.events.clone(), std::future::pending());
             a.on_job_done(outcome).await.unwrap();
-            let board = Board::load(&a.cfg.work_dir()).unwrap();
-            let saved = board.get(&task.id).unwrap();
+            let board = Board::open(&a.cfg.work_dir(), a.store.clone()).await.unwrap();
+            let saved = board.get(&task.id).await.unwrap().unwrap();
             let store = a.store.clone();
             let reviews: Vec<_> = store.reviews().await.unwrap().into_iter().filter(|r| r.payload["task_id"] == task.id).collect();
             assert_eq!(reviews.len(), rounds);
@@ -933,8 +939,8 @@ async fn work_review_verdicts_and_late_followups_survive_completion_and_reload()
             }
             if expected == TaskStatus::Inbox {
                 assert!(saved.note.contains("排入下一轮") && a.wake_decide);
-                assert_eq!(last.payload["reviewed_followups_bytes"], 0);
-                assert!(std::fs::read_to_string(board.task_dir(&task.id).join("followups.md")).unwrap().contains("还有一份资料"));
+                assert_eq!(last.payload["reviewed_followup_seq"], 0);
+                assert_eq!(saved.unconsumed_followups()[0].body, "还有一份资料");
             }
             assert_eq!(a.deliveries.last().unwrap().task_id, task.id);
         }
@@ -948,7 +954,7 @@ async fn resumed_passing_work_settles_only_its_automatic_revision_requests() {
     let a = &mut test.bot;
     a.state.asleep = true;
     Arc::get_mut(&mut a.cfg).unwrap().runtime.hands.research = crate::config::DelegateTool::Off;
-    let task = a.board().add("revised report", TaskKind::Research, "owner", TaskStatus::Waiting, None).unwrap();
+    let task = a.board.add("revised report", TaskKind::Research, "owner", TaskStatus::Waiting, None).await.unwrap();
     let mut old = Vec::new();
     for (task_id, verdict) in [(&task.id[..], judge::Verdict::Revise), (&task.id, judge::Verdict::Defer),
         (&task.id, judge::Verdict::Owner), ("another-task", judge::Verdict::Revise)] {
@@ -956,7 +962,7 @@ async fn resumed_passing_work_settles_only_its_automatic_revision_requests() {
         old.push(judge::file(&a.store, ReviewCategory::Verify, &task.title, "previous work", &j, true,
             json!({"task_id":task_id,"work_round":1})).await.unwrap());
     }
-    a.models = Arc::new(Models::stub(a.store.clone(), vec!["plan\n澄清：无".into(), "revised report".into(),
+    a.models = Arc::new(Models::stub(a.store.clone(), vec![research_plan_reply(), "revised report".into(),
         r#"{"verdict":"pass","reasons":"addressed"}"#.into()]));
     let (tx, mut rx) = mpsc::channel(2);
     a.events = tx;
@@ -964,7 +970,7 @@ async fn resumed_passing_work_settles_only_its_automatic_revision_requests() {
     assert!(a.run_command("/run", &task.id, &ctx).await.unwrap().contains("开始做"));
     let Some(Event::JobDone(outcome)) = rx.recv().await else { panic!("missing resumed completion") };
     a.on_job_done(outcome).await.unwrap();
-    assert_eq!(Board::load(&a.cfg.work_dir()).unwrap().get(&task.id).unwrap().status, TaskStatus::Done);
+    assert_eq!(Board::open(&a.cfg.work_dir(), a.store.clone()).await.unwrap().get(&task.id).await.unwrap().unwrap().status, TaskStatus::Done);
     let store = a.store.clone();
     let reviews = store.reviews().await.unwrap();
     let passed = reviews.last().unwrap();
@@ -988,7 +994,7 @@ async fn resumed_passing_work_settles_only_its_automatic_revision_requests() {
 async fn watchdog_tick_stalls_waits_for_cancellation_and_delivers_once() {
     let mut test = TestBot::new("watchdog-stall").await;
     let a = &mut test.bot;
-    let task = fake_job(a);
+    let task = fake_job(a).await;
     // A dropped worker stands in for delegate's process-tree guard.
     struct Cleanup(Arc<AtomicBool>);
     impl Drop for Cleanup {
@@ -1013,10 +1019,10 @@ async fn watchdog_tick_stalls_waits_for_cancellation_and_delivers_once() {
     wake(a).await;
     assert!(cleaned.load(Ordering::Acquire));
     assert!(a.control.jobs().is_empty());
-    let saved = a.board().get(&task.id).unwrap().clone();
+    let saved = a.board.get(&task.id).await.unwrap().unwrap().clone();
     assert_eq!(saved.status, TaskStatus::Waiting);
     assert!(saved.note.contains("20 分钟没有增长"));
-    let log_path = a.board().task_dir(&task.id).join("log.md");
+    let log_path = a.board.task_dir(&task.id).join("log.md");
     let log = std::fs::read_to_string(&log_path).unwrap();
     assert!(log.contains(&saved.note));
     wake(a).await;
@@ -1033,12 +1039,12 @@ async fn watchdog_tick_stalls_waits_for_cancellation_and_delivers_once() {
 async fn watchdog_growth_and_followups_reset_stall_but_not_total_budget() {
     let mut test = TestBot::new("watchdog-total").await;
     let a = &mut test.bot;
-    let task = fake_job(a);
+    let task = fake_job(a).await;
     for minute in [15, 30, 45, 60, 75, 90] {
         tokio::time::advance(Duration::from_secs(15 * 60)).await;
-        a.board().follow_up(&task.id, "继续", ThreadRef {
+        a.board.follow_up(&task.id, "继续", ThreadRef {
             platform: "telegram".into(), chat_id: "42".into(), message_id: None,
-        }).unwrap();
+        }).await.unwrap();
         a.watchdog().await.unwrap();
         if minute < 90 {
             assert!(!a.control.jobs().is_empty());
@@ -1050,7 +1056,7 @@ async fn watchdog_growth_and_followups_reset_stall_but_not_total_budget() {
     let reviews = a.store.reviews().await.unwrap();
     assert_eq!(reviews.len(), 1);
     assert!(reviews[0].urgent && !reviews[0].pushed);
-    let saved = a.board().get(&task.id).unwrap().clone();
+    let saved = a.board.get(&task.id).await.unwrap().unwrap().clone();
     assert_eq!(saved.status, TaskStatus::Waiting);
     assert!(saved.note.contains("总运行时长已达 90 分钟"));
 }
@@ -1060,11 +1066,11 @@ async fn watchdog_stalls_after_last_growth_and_with_missing_log() {
     for missing in [false, true] {
         let mut test = TestBot::new(&format!("watchdog-log-{missing}")).await;
         let a = &mut test.bot;
-        let task = fake_job(a);
+        let task = fake_job(a).await;
         tokio::time::advance(Duration::from_secs(10 * 60)).await;
-        let log_path = a.board().task_dir(&task.id).join("log.md");
+        let log_path = a.board.task_dir(&task.id).join("log.md");
         if missing { std::fs::remove_file(&log_path).unwrap() }
-        else { a.board().log(&task.id, "进度").unwrap() }
+        else { a.board.log(&task.id, "进度").unwrap() }
         a.watchdog().await.unwrap();
         tokio::time::advance(Duration::from_secs(10 * 60)).await;
         a.watchdog().await.unwrap();
@@ -1087,22 +1093,22 @@ async fn watchdog_leaves_completed_and_pending_completion_events_alone() {
     for blocked_send in [false, true] {
         let mut test = TestBot::new(&format!("watchdog-completed-{blocked_send}")).await;
         let a = &mut test.bot;
-        let task = a.board().add("completed", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
-        let log_path = a.board().task_dir(&task.id).join("log.md");
+        let task = a.board.add("completed", TaskKind::Research, "owner", TaskStatus::Active, None).await.unwrap();
+        let log_path = a.board.task_dir(&task.id).join("log.md");
         let before = std::fs::read_to_string(&log_path).unwrap();
         let (tx, mut rx) = mpsc::channel(1);
         if blocked_send { tx.try_send(Event::Tick).unwrap() }
         let (finish, result) = tokio::sync::oneshot::channel();
         spawn_test_job(a, &task, tx, async { result.await.unwrap() });
         tokio::time::advance(Duration::from_secs(90 * 60)).await;
-        finish.send(research::Outcome {
+        finish.send(work::Outcome {
             task_id: task.id.clone(), title: task.title, ok: true, clarification: None,
-            paused: None, summary: "完成".into(), verdict: None,
+            paused: None, summary: "完成".into(), verdict: None, verdict_record: None,
         }).unwrap();
         tokio::task::yield_now().await;
         assert!(a.stop_job().await.is_none());
         a.watchdog().await.unwrap();
-        assert_eq!(a.board().get(&task.id).unwrap().status, TaskStatus::Active);
+        assert_eq!(a.board.get(&task.id).await.unwrap().unwrap().status, TaskStatus::Active);
         assert_eq!(std::fs::read_to_string(log_path).unwrap(), before);
         assert!(a.deliveries.is_empty());
         if blocked_send { assert!(matches!(rx.recv().await, Some(Event::Tick))) }
@@ -1111,7 +1117,7 @@ async fn watchdog_leaves_completed_and_pending_completion_events_alone() {
         a.on_job_done(o).await.unwrap();
         a.watchdog().await.unwrap();
         assert!(a.control.jobs().is_empty());
-        assert_eq!(a.board().get(&task.id).unwrap().status, TaskStatus::Done);
+        assert_eq!(a.board.get(&task.id).await.unwrap().unwrap().status, TaskStatus::Done);
         assert_eq!(a.deliveries.len(), 1);
         assert!(a.deliveries[0].paused.is_none());
     }
@@ -1121,13 +1127,13 @@ async fn watchdog_leaves_completed_and_pending_completion_events_alone() {
 async fn watchdog_without_running_job_does_nothing() {
     let mut test = TestBot::new("watchdog-idle").await;
     let a = &mut test.bot;
-    let task = a.board().add("waiting", TaskKind::Research, "owner", TaskStatus::Waiting, None).unwrap();
-    let log_path = a.board().task_dir(&task.id).join("log.md");
+    let task = a.board.add("waiting", TaskKind::Research, "owner", TaskStatus::Waiting, None).await.unwrap();
+    let log_path = a.board.task_dir(&task.id).join("log.md");
     let before = std::fs::read_to_string(&log_path).unwrap();
     tokio::time::advance(Duration::from_secs(100 * 60)).await;
     a.watchdog().await.unwrap();
     assert_eq!(std::fs::read_to_string(log_path).unwrap(), before);
-    assert_eq!(a.board().get(&task.id).unwrap().status, TaskStatus::Waiting);
+    assert_eq!(a.board.get(&task.id).await.unwrap().unwrap().status, TaskStatus::Waiting);
     assert!(a.control.jobs().is_empty() && a.deliveries.is_empty());
 }
 
@@ -1464,20 +1470,20 @@ async fn overnight_clears_only_completed_turns_and_retries_failures_next_wake() 
 }
 
 #[tokio::test]
-async fn reflection_switch_parks_work_and_wakes_the_mind_without_failure() {
+async fn paused_work_waits_and_wakes_the_mind_without_failure() {
     let mut test = TestBot::new("reflection-switch").await;
     let a = &mut test.bot;
     a.state.asleep = true; // Queue delivery without a model or network call.
-    let task = a.board().add("研究版本", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
+    let task = a.board.add("研究版本", TaskKind::Research, "owner", TaskStatus::Active, None).await.unwrap();
     spawn_test_job(a, &task, a.events.clone(), std::future::pending());
     let reason = "先处理主人的紧急事务";
-    a.on_job_done(research::Outcome {
+    a.on_job_done(work::Outcome {
         task_id: task.id.clone(), title: task.title, ok: true,
-        clarification: None, paused: Some(reason.into()), summary: reason.into(), verdict: None,
+        clarification: None, paused: Some(reason.into()), summary: reason.into(), verdict: None, verdict_record: None,
     }).await.unwrap();
     {
-        let board = a.board();
-        let saved = board.get(&task.id).unwrap();
+        let board = &a.board;
+        let saved = board.get(&task.id).await.unwrap().unwrap();
         assert_eq!(saved.status, TaskStatus::Waiting);
         assert_eq!(saved.note, reason);
     }
@@ -1494,16 +1500,16 @@ async fn clarification_completion_waits_without_failure_or_judge_review() {
     let mut test = TestBot::new("clarification").await;
     let a = &mut test.bot;
     a.state.asleep = true; // Queue delivery without a model or network call.
-    let task = a.board().add("研究版本", TaskKind::Research, "owner", TaskStatus::Active, None).unwrap();
+    let task = a.board.add("研究版本", TaskKind::Research, "owner", TaskStatus::Active, None).await.unwrap();
     spawn_test_job(a, &task, a.events.clone(), std::future::pending());
     let questions = "研究 A 还是 B？";
-    a.on_job_done(research::Outcome {
+    a.on_job_done(work::Outcome {
         task_id: task.id.clone(), title: task.title, ok: true,
-        clarification: Some(questions.into()), paused: None, summary: questions.into(), verdict: None,
+        clarification: Some(questions.into()), paused: None, summary: questions.into(), verdict: None, verdict_record: None,
     }).await.unwrap();
     {
-        let board = a.board();
-        let saved = board.get(&task.id).unwrap();
+        let board = &a.board;
+        let saved = board.get(&task.id).await.unwrap().unwrap();
         assert_eq!(saved.status, TaskStatus::Waiting);
         assert_eq!(saved.note, "等待主人澄清");
     }
@@ -1547,11 +1553,11 @@ async fn three_queued_owner_messages_prepare_one_turn_and_keep_individual_record
     assert_eq!(a.store.kv_get("owner_last_chat").await.unwrap().unwrap()["chat_id"], "42");
     let (frame, _) = a.frame(&ctx, batch.current, "").await.unwrap();
     assert!(!frame.contains("先查方案 A") && !frame.contains("给我结论"));
-    let task = a.board().add("研究", TaskKind::Research, "owner", TaskStatus::Inbox, Some(ctx.thread_ref())).unwrap();
+    let task = a.board.add("研究", TaskKind::Research, "owner", TaskStatus::Inbox, Some(ctx.thread_ref())).await.unwrap();
     let mut intent = parse_intent(&format!("<补充 任务=\"{}\">补充条件</补充>", task.id));
-    attach_followups(&mut a.board(), &ctx, &mut intent);
-    assert_eq!(a.board().get(&task.id).unwrap().origin, Some(ctx.thread_ref()));
-    assert_eq!(a.board().get(&task.id).unwrap().threads, [ctx.thread_ref()]);
+    attach_followups(&a.board, &ctx, &mut intent).await;
+    assert_eq!(a.board.get(&task.id).await.unwrap().unwrap().origin, Some(ctx.thread_ref()));
+    assert_eq!(a.board.get(&task.id).await.unwrap().unwrap().threads, [ctx.thread_ref()]);
 }
 
 #[tokio::test]
@@ -1647,6 +1653,99 @@ async fn readable_sources_are_limited_to_the_addressed_authors_input() {
 }
 
 #[tokio::test]
+async fn fast_search_runs_without_a_task_or_judge_and_audits_denials() -> Result<()> {
+    use axum::{Json, Router, routing::post};
+    use crate::hands::reader::Reader;
+
+    let app = Router::new().route("/v1/tools/search", post(|Json(body): Json<Value>| async move {
+        assert_eq!(body, json!({"query":"检索词", "count":5, "ori_question":"检索词", "need_content":false}));
+        Json(json!({"results":[{"title":"文章", "url":"https://example.org", "snippet":"摘要"}]}))
+    }));
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let origin = format!("http://{}", socket.local_addr()?);
+    let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap(); });
+    let mut test = TestBot::new("fast-search").await;
+    let a = &mut test.bot;
+    let ctx = owner_chat();
+    let reply = a.fast_search(&ctx, "检索词", Ok(Reader::at(origin).with_models(a.models.clone()))).await?;
+    assert_eq!(reply, "1. 文章\nhttps://example.org\n摘要");
+    assert!(a.run_command("/help", "", &ctx).await?.contains("/search"));
+    assert!(a.run_command("/search", "", &ctx).await?.contains("用法"));
+    let disallowed = ChatCtx { scope: Scope::SelfOnly, ..owner_chat() };
+    assert!(a.run_command("/search", "禁止", &disallowed).await?.contains("权限"));
+    let local = ChatCtx { audience: Audience::solo(), scope: Scope::SelfOnly, ..owner_chat() };
+    assert!(a.run_command("/search", "禁止", &local).await?.contains("处理策略"));
+    a.control.set_frozen(&a.store, true).await?;
+    assert!(a.run_command("/search", "冻结", &ctx).await?.contains("冻结"));
+    assert!(a.board.tasks().await?.is_empty());
+    assert!(a.store.reviews().await?.is_empty());
+    let calls = a.store.model_calls().await?;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].scenario, "search");
+    let audits: Vec<_> = a.store.audits().await?.into_iter().filter(|a| a.tool == "fast_search").collect();
+    assert_eq!(audits.iter().map(|a| a.outcome).collect::<Vec<_>>(), [Outcome::Sent, Outcome::Denied, Outcome::Denied, Outcome::Denied]);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn vision_and_ocr_share_the_turn_download() -> Result<()> {
+    use axum::{Json, Router, routing::{get, post}};
+    use crate::channels::{Attachment, AttachmentKind};
+    use crate::hands::reader::Reader;
+    use crate::mind::vision::{self, PendingMedia};
+    use std::sync::atomic::AtomicUsize;
+
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let seen = downloads.clone();
+    let app = Router::new()
+        .route("/bot-fixture/getFile", get(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            async { Json(json!({"result":{"file_path":"photo.bmp"}})) }
+        }))
+        .route("/v1/tools/ocr", post(|| async {
+            Json(json!({"page_count":1,"pages":[{"index":0,"finish_reason":"stop","text":"图片里的字"}]}))
+        }));
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let origin = format!("http://{}", socket.local_addr()?);
+    let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap(); });
+    let mut test = TestBot::new("turn-attachment-cache").await;
+    let a = &mut test.bot;
+    // A 1×1 24-bit BMP. The locked image crate is built without a BMP encoder.
+    let mut bmp = vec![0; 58];
+    bmp[..2].copy_from_slice(b"BM");
+    bmp[2] = 58;
+    bmp[10] = 54;
+    bmp[14] = 40;
+    bmp[18] = 1;
+    bmp[22] = 1;
+    bmp[26] = 1;
+    bmp[28] = 24;
+    bmp[34] = 4;
+    a.outlets.telegram = Some(crate::channels::telegram::Telegram::fixture(format!("{origin}/bot-fixture"))
+        .with_fixture_file("photo.bmp", bmp));
+    let file = Attachment { kind: AttachmentKind::Image, url: None, file_id: Some("bmp".into()),
+        name: None, size: None, quoted_from: None, media_id: None };
+    let ctx = owner_chat();
+    let mut env = private_message("42", "读图");
+    env.attachments.push(file.clone());
+    let mut inputs = reading::Inputs::default();
+    inputs.include(&env);
+    let mut cache = AttachmentCache::new();
+    let look = vision::look(&a.outlets, &a.media, &ctx.chat_id, vec![PendingMedia {
+        platform: "telegram", sender: "owner".into(), attachment: file, at: Instant::now(),
+    }], &mut cache).await;
+    assert_eq!(look.undecoded.len(), 1);
+    for purpose in [reading::Purpose::OcrFallback, reading::Purpose::Task] {
+        let read = a.read_inputs_with(&ctx, &ProcessingPolicy::Any, inputs.clone(), purpose, &mut cache, Ok(Reader::at(origin.clone()))).await;
+        assert!(read.note.contains("图片里的字"), "{}", read.note);
+    }
+    assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn bounded_source_reaches_same_chat_followup_and_matching_task_only() -> Result<()> {
     use axum::{Json, Router, routing::{get, post}};
     use crate::channels::{Attachment, AttachmentKind};
@@ -1686,12 +1785,13 @@ async fn bounded_source_reaches_same_chat_followup_and_matching_task_only() -> R
     assert!(batch.speak);
     let ctx = batch.ctx.unwrap();
     let policy = ProcessingPolicy::Any;
-    let disallowed = a.read_inputs_with(&ctx, &ProcessingPolicy::LocalOnly, batch.inputs.clone(), reading::Purpose::Chat, Ok(Reader::at(origin.clone()))).await;
+    let disallowed = a.read_inputs_with(&ctx, &ProcessingPolicy::LocalOnly, batch.inputs.clone(), reading::Purpose::Chat, &mut AttachmentCache::new(), Ok(Reader::at(origin.clone()))).await;
     assert!(disallowed.evidence.is_empty() && disallowed.note.contains("处理策略"));
-    let read = a.read_inputs_with(&ctx, &policy, batch.inputs, reading::Purpose::Chat, Ok(Reader::at(origin.clone()))).await;
-    let task_id = a.add_chat_task(&ctx, TaskKind::Research, "任务", &read.evidence)?;
-    reading::save(&a.board(), &task_id, &ctx, &read.evidence)?;
-    let input_dir = a.board().task_dir(&task_id).join("inputs");
+    let read = a.read_inputs_with(&ctx, &policy, batch.inputs, reading::Purpose::Chat, &mut AttachmentCache::new(), Ok(Reader::at(origin.clone()))).await;
+    let task_id = a.add_chat_task(&ctx, TaskKind::Research, "任务", &read.evidence).await?;
+    let task = a.board.get(&task_id).await?.unwrap();
+    reading::save(&a.board, &task, &ctx, &read.evidence)?;
+    let input_dir = a.board.task_dir(&task_id).join("inputs");
     let entries = std::fs::read_dir(input_dir)?.collect::<std::io::Result<Vec<_>>>()?;
     assert_eq!(entries.len(), 1);
     let entry = &entries[0];
@@ -1701,7 +1801,7 @@ async fn bounded_source_reaches_same_chat_followup_and_matching_task_only() -> R
     assert_eq!(saved["source_url"], "https://8.8.8.8/wiki?title=First");
     assert!(read.note.contains("https://8.8.8.8/wiki?title=First"));
     let other_ctx = ChatCtx { key: "telegram:other".into(), chat_id: "other".into(), ..owner_chat() };
-    assert!(reading::save(&a.board(), &task_id, &other_ctx, &read.evidence).is_err());
+    assert!(reading::save(&a.board, &task, &other_ctx, &read.evidence).is_err());
     for (key, body) in [(&*ctx.key, read.note.as_str()), (&*ctx.key, "补充一个没提过的细节？"), ("telegram:other", "另一个对话")] {
         a.speaker.say(&a.models, key, &policy, SayTurn { now: Utc::now(), text: body.into(), images: vec![], ephemeral: vec![] }, || Ok(String::new())).await?;
     }
@@ -1716,9 +1816,9 @@ async fn bounded_source_reaches_same_chat_followup_and_matching_task_only() -> R
     env.authored_text = env.text.clone();
     env.attachments.push(Attachment {kind:AttachmentKind::File, url:None, name:Some("drawing.png".into()), file_id:Some("f".into()), size:None, media_id:None, quoted_from:None});
     let batch = a.prepare_messages(vec![env.clone()]).await;
-    let visual = a.read_inputs_with(&ctx, &policy, batch.inputs.clone(), reading::Purpose::Task, Ok(Reader::at(origin.clone()))).await;
+    let visual = a.read_inputs_with(&ctx, &policy, batch.inputs.clone(), reading::Purpose::Task, &mut AttachmentCache::new(), Ok(Reader::at(origin.clone()))).await;
     assert!(visual.note.contains("模型视觉描述") && visual.note.contains("黑色方块"), "{}",visual.note);
-    let denied = a.read_inputs_with(&ctx, &ProcessingPolicy::LocalOnly, batch.inputs, reading::Purpose::Task, Ok(Reader::at(origin))).await;
+    let denied = a.read_inputs_with(&ctx, &ProcessingPolicy::LocalOnly, batch.inputs, reading::Purpose::Task, &mut AttachmentCache::new(), Ok(Reader::at(origin))).await;
     assert!(denied.evidence.is_empty());
     assert_eq!(prompts.lock().unwrap().len(), 4);
     env.attachments.push(Attachment {kind: AttachmentKind::File, url:None, file_id:None, name:Some("other.xyz".into()), size:None, quoted_from:None, media_id:None});
@@ -2084,7 +2184,7 @@ async fn read_only_group_batches_store_people_and_scope_without_replies_or_model
         assert_eq!(person.name, m.sender_name);
     }
     assert!(a.unseen.is_empty());
-    assert!(a.board().tasks().is_empty());
+    assert!(a.board.tasks().await.unwrap().is_empty());
     assert!(a.models.stub_prompts().is_empty());
     assert!(a.test_chat.as_ref().unwrap().sent_texts.lock().unwrap().is_empty());
     // None of the read-only messages advanced floor counters for a later allowlist edit.
@@ -2339,7 +2439,7 @@ async fn a_dropped_group_task_marker_is_told_to_him_on_the_next_turn() {
     let a = &mut test.bot;
     a.test_chat = Some(TestChat::new(&["好，我去看看。<任务>测一下基准</任务>", "[沉默]"], &[Outcome::Sent]));
     a.on_messages(group_messages(&["去测一下"], true)).await.unwrap();
-    assert!(a.board().tasks().is_empty());
+    assert!(a.board.tasks().await.unwrap().is_empty());
     a.on_messages(group_messages(&["测完没"], true)).await.unwrap();
     let turns = &a.test_chat.as_ref().unwrap().turns;
     assert!(!turns[0].1.contains("没有建立"), "{}", turns[0].1);
@@ -2371,15 +2471,16 @@ fn owner_chat() -> ChatCtx {
     }
 }
 
-#[test]
-fn research_followup_lands_in_selected_task_and_reply_names_it() {
+#[tokio::test]
+async fn research_followup_lands_in_selected_task_and_reply_names_it() {
     let dir = std::env::temp_dir().join(format!("aglibot-test-followup-{}", std::process::id()));
-    let mut b = Board::load(&dir).unwrap();
+    let store = Store::memory();
+    let b = Board::open(&dir, store.clone()).await.unwrap();
     let mut ctx = owner_chat();
-    let a = b.add("研究方案 A", TaskKind::Research, "owner", TaskStatus::Inbox, Some(ctx.thread_ref())).unwrap();
-    let other = b.add("另一项研究", TaskKind::Research, "owner", TaskStatus::Inbox, Some(ctx.thread_ref())).unwrap();
-    b.set_status(&a.id, TaskStatus::Active, "已开始").unwrap();
-    let cards = ctx.task_cards(&b);
+    let a = b.add("研究方案 A", TaskKind::Research, "owner", TaskStatus::Inbox, Some(ctx.thread_ref())).await.unwrap();
+    let other = b.add("另一项研究", TaskKind::Research, "owner", TaskStatus::Inbox, Some(ctx.thread_ref())).await.unwrap();
+    b.set_status(&a.id, TaskStatus::Active, "已开始").await.unwrap();
+    let cards = ctx.task_cards(&b).await.unwrap();
     let l2 = build_l2("私聊", "主人", "", &[], &cards);
     assert!(l2.contains(&a.id) && l2.contains(&other.id));
 
@@ -2388,75 +2489,79 @@ fn research_followup_lands_in_selected_task_and_reply_names_it() {
     ctx.chat_id = "private:7".into();
     ctx.message_id = Some("21".into());
     let mut intent = parse_intent(&format!("<补充 任务=\"{}\">刚才那个研究改成方案 B</补充>", a.id));
-    attach_followups(&mut b, &ctx, &mut intent);
+    attach_followups(&b, &ctx, &mut intent).await;
     assert!(!intent.silent);
     assert!(intent.text.contains(&a.id) && intent.text.contains(&a.title));
     assert!(!intent.text.contains("<补充"));
     let mut next = parse_intent(&format!("好。<补充 任务=\"{}\">保留方案 A 作对照</补充>", a.id));
-    attach_followups(&mut b, &ctx, &mut next);
-    for file in ["followups.md", "log.md"] {
-        let text = std::fs::read_to_string(b.task_dir(&a.id).join(file)).unwrap();
+    attach_followups(&b, &ctx, &mut next).await;
+    {
+        let text = std::fs::read_to_string(b.task_dir(&a.id).join("log.md")).unwrap();
         assert!(text.contains("刚才那个研究改成方案 B"));
         assert!(text.contains("保留方案 A 作对照"));
         assert!(text.contains("qq / private:7 / 21"));
     }
-    assert!(!b.task_dir(&other.id).join("followups.md").exists());
-    let b = Board::load(&dir).unwrap();
-    assert_eq!(b.tasks().len(), 2);
-    assert_eq!(b.get(&a.id).unwrap().threads, [ctx.thread_ref()]);
-    assert_eq!(b.get(&a.id).unwrap().origin, a.origin);
-    assert_eq!(ctx.task_cards(&b), cards);
+    assert!(b.get(&other.id).await.unwrap().unwrap().followups.is_empty());
+    let b = Board::open(&dir, store.clone()).await.unwrap();
+    assert_eq!(b.tasks().await.unwrap().len(), 2);
+    assert_eq!(b.get(&a.id).await.unwrap().unwrap().threads, [ctx.thread_ref()]);
+    assert_eq!(b.get(&a.id).await.unwrap().unwrap().origin, a.origin);
+    assert_eq!(ctx.task_cards(&b).await.unwrap(), cards);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-#[test]
-fn rejected_followups_stay_visible_and_do_not_create_tasks() {
+#[tokio::test]
+async fn rejected_followups_stay_visible_and_do_not_create_tasks() {
     let dir = std::env::temp_dir().join(format!("aglibot-test-followup-rejected-{}", std::process::id()));
-    let mut b = Board::load(&dir).unwrap();
+    let store = Store::memory();
+    let b = Board::open(&dir, store.clone()).await.unwrap();
     let ctx = owner_chat();
     for status in [TaskStatus::Done, TaskStatus::Dropped] {
-        let t = b.add("关闭的任务", TaskKind::Research, "owner", status, None).unwrap();
+        let t = b.add("关闭的任务", TaskKind::Research, "owner", status, None).await.unwrap();
         let mut i = parse_intent(&format!("[沉默]<补充 任务=\"{}\">改成 B</补充>", t.id));
-        attach_followups(&mut b, &ctx, &mut i);
+        attach_followups(&b, &ctx, &mut i).await;
         assert!(!i.silent && i.text.contains("任务已关闭") && i.text.contains("改成 B"));
-        assert!(!b.task_dir(&t.id).join("followups.md").exists());
-        assert!(b.get(&t.id).unwrap().threads.is_empty());
+        assert!(b.get(&t.id).await.unwrap().unwrap().followups.is_empty());
+        assert!(b.get(&t.id).await.unwrap().unwrap().threads.is_empty());
     }
     for attrs in ["任务=\"unknown\"", "任务=\"../escape\"", "没有编号"] {
         let mut i = parse_intent(&format!("<补充 {attrs}>改成 B</补充>"));
-        attach_followups(&mut b, &ctx, &mut i);
+        attach_followups(&b, &ctx, &mut i).await;
         assert!(!i.silent && i.text.contains("没有这个任务") && i.text.contains("改成 B"));
     }
-    assert_eq!(b.tasks().len(), 2);
+    assert_eq!(b.tasks().await.unwrap().len(), 2);
     assert_eq!(std::fs::read_dir(dir.join("tasks")).unwrap().count(), 2);
-    let t = b.add("无法写入补充的任务", TaskKind::Research, "owner", TaskStatus::Waiting, None).unwrap();
-    std::fs::create_dir(b.task_dir(&t.id).join("followups.md")).unwrap();
+    let t = b.add("无法写入补充的任务", TaskKind::Research, "owner", TaskStatus::Waiting, None).await.unwrap();
+    let log = b.task_dir(&t.id).join("log.md");
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir(&log).unwrap();
     let mut i = parse_intent(&format!("<补充 任务=\"{}\">改成 B</补充>", t.id));
-    attach_followups(&mut b, &ctx, &mut i);
+    attach_followups(&b, &ctx, &mut i).await;
     assert!(!i.silent && i.text.contains("未完整保存") && i.text.contains("改成 B"));
-    assert!(b.get(&t.id).unwrap().threads.is_empty());
+    assert_eq!(b.get(&t.id).await.unwrap().unwrap().followups.len(), 1);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-#[test]
-fn task_cards_and_followups_are_owner_private_only() {
+#[tokio::test]
+async fn task_cards_and_followups_are_owner_private_only() {
     let dir = std::env::temp_dir().join(format!("aglibot-test-task-privacy-{}", std::process::id()));
-    let mut b = Board::load(&dir).unwrap();
-    let t = b.add("主人的秘密研究", TaskKind::Research, "owner", TaskStatus::Inbox, None).unwrap();
+    let store = Store::memory();
+    let b = Board::open(&dir, store.clone()).await.unwrap();
+    let t = b.add("主人的秘密研究", TaskKind::Research, "owner", TaskStatus::Inbox, None).await.unwrap();
     for (is_group, owner) in [(true, true), (true, false), (false, false)] {
         let mut ctx = owner_chat();
         ctx.is_group = is_group;
         ctx.partner.as_mut().unwrap().is_owner = owner;
-        assert!(ctx.task_cards(&b).is_empty());
-        let l2 = build_l2("场合", "对方", "", &[], &ctx.task_cards(&b));
+        assert!(ctx.task_cards(&b).await.unwrap().is_empty());
+        let l2 = build_l2("场合", "对方", "", &[], &ctx.task_cards(&b).await.unwrap());
         assert!(!l2.contains(&t.title) && !l2.contains(&t.id));
         let mut i = parse_intent(&format!("<补充 任务=\"{}\">恶意改写</补充>", t.id));
-        attach_followups(&mut b, &ctx, &mut i);
+        attach_followups(&b, &ctx, &mut i).await;
         assert!(i.text.contains("只接受主人私聊"));
         assert!(!i.text.contains(&t.title));
     }
-    assert!(!b.task_dir(&t.id).join("followups.md").exists());
-    assert!(b.get(&t.id).unwrap().threads.is_empty());
+    assert!(b.get(&t.id).await.unwrap().unwrap().followups.is_empty());
+    assert!(b.get(&t.id).await.unwrap().unwrap().threads.is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -2693,11 +2798,11 @@ async fn owner_fast_controls_stop_workers_before_the_actor_updates_the_board() -
     assert!(replies.try_recv().is_err() && rx.try_recv().is_err());
 
     for (command, reason) in [("/stop", "主人让我停下"), ("/freeze", "冻结")] {
-        let task = fake_job(a);
+        let task = fake_job(a).await;
         let env = private_message("42", command);
         assert!(try_handle_fast_control(&a.cfg, &a.store, &a.outlets, &a.control, &tx, &env).await);
         assert!(a.control.jobs().is_empty());
-        assert_eq!(a.board().get(&task.id).unwrap().status, TaskStatus::Active);
+        assert_eq!(a.board.get(&task.id).await.unwrap().unwrap().status, TaskStatus::Active);
         assert_eq!(a.frozen(), command == "/freeze");
         let reply = replies.try_recv()?;
         if command == "/stop" {
@@ -2709,7 +2814,7 @@ async fn owner_fast_controls_stop_workers_before_the_actor_updates_the_board() -
         let event = rx.try_recv()?;
         assert!(matches!(event, Event::Control(_)));
         a.handle(event).await;
-        let saved = a.board().get(&task.id).unwrap().clone();
+        let saved = a.board.get(&task.id).await.unwrap().unwrap().clone();
         assert_eq!(saved.status, TaskStatus::Waiting);
         assert_eq!(saved.note, reason);
     }

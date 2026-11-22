@@ -250,7 +250,7 @@ impl Bot {
         let startable: Vec<String> = if self.control.jobs().len() >= self.cfg.runtime.hands.max_jobs {
             Vec::new()
         } else {
-            self.board().tasks().iter().filter(|t| t.status == TaskStatus::Inbox).map(|t| t.id.clone()).collect()
+            self.board.tasks().await?.into_iter().filter(|t| t.status == TaskStatus::Inbox).map(|t| t.id).collect()
         };
         if !may_message_owner && startable.is_empty() && !revisit {
             return Ok(());
@@ -266,7 +266,7 @@ impl Bot {
              今天花费 ${spent:.3} / ${limit:.2}\n正在做：{}\n\n## 看板\n{}",
             tail(now.with_timezone(&Local), s.asleep, None, &[]),
             self.running_jobs(),
-            self.board().summary(),
+            self.board.summary().await?,
         );
         let situation = Situation { text, startable, may_message_owner };
         let d = decide::decide(&self.models, &ProcessingPolicy::Any, self.speaker.l1(), &situation).await?;

@@ -5,7 +5,7 @@ use tracing::{error, info, warn};
 use super::{Bot, ChatCtx, chat::{parse_intent, resolve_mentions}, commands::attach_followups_with_sources, reading};
 use crate::channels::{ReplyPiece, reply_text};
 use crate::error_report::{Fault, report};
-use crate::mind::{context::{tail, user_turn}, speak::SayTurn};
+use crate::mind::{context::{tail, user_turn}, speak::SayTurn, vision::AttachmentCache};
 use crate::ns::ProcessingPolicy;
 use crate::store::{MediaStatus, MessageRecord, Outcome, StickerScope};
 
@@ -21,8 +21,9 @@ impl Bot {
     /// Append a chat turn, act on its markers, and send the visible reply.
     pub(super) async fn converse_with_options(&mut self, ctx: &ChatCtx, mut body: String, current: usize, unsolicited: bool, may_quit: bool) -> Result<()> {
         // Addressed turns only: chiming in never spends a look, and the images keep waiting.
+        let mut attachments = AttachmentCache::new();
         let mut look = match self.pending_media.remove(&ctx.key) {
-            Some(pending) if !unsolicited => crate::mind::vision::look(&self.outlets, &self.media, &ctx.chat_id, pending).await,
+            Some(pending) if !unsolicited => crate::mind::vision::look(&self.outlets, &self.media, &ctx.chat_id, pending, &mut attachments).await,
             Some(pending) => {
                 self.pending_media.insert(ctx.key.clone(), pending);
                 Default::default()
@@ -41,15 +42,15 @@ impl Bot {
         notes.extend(self.slang_note(ctx, &body, now).await);
         let turn_tail = tail(now.with_timezone(&Local), self.state.asleep, busy.as_deref(), &notes);
         // Recall runs on every turn (cheap at this volume) so the policy is known before routing.
-        let tasks = ctx.task_cards(&self.board());
+        let tasks = ctx.task_cards(&self.board).await?;
         let (l2, policy) = self.frame(ctx, current, &tasks).await?;
         let inputs = self.turn_inputs.take().filter(|(key, _)| key == &ctx.key && !unsolicited)
             .map(|(_, inputs)| inputs).unwrap_or_default();
         let mut task_images = inputs.images();
-        let mut read = self.read_inputs(ctx, &policy, inputs, reading::Purpose::Chat).await;
+        let mut read = self.read_inputs(ctx, &policy, inputs, reading::Purpose::Chat, &mut attachments).await;
         if !look.undecoded.is_empty() && policy.allows_executor("deepseek") {
             let unread = task_images.take_undecoded(&look.undecoded);
-            let ocr = self.read_inputs(ctx, &policy, unread, reading::Purpose::OcrFallback).await;
+            let ocr = self.read_inputs(ctx, &policy, unread, reading::Purpose::OcrFallback, &mut attachments).await;
             read.note.push_str(&ocr.note);
             read.evidence.extend(ocr.evidence);
             read.errors.extend(ocr.errors);
@@ -84,7 +85,7 @@ impl Bot {
                         warn!("reply with images failed, retrying without them: {e:#}");
                         readable_pixels = false;
                         if !task_images.is_empty() && policy.allows_executor("deepseek") {
-                            let transcription = self.read_inputs(ctx, &policy, std::mem::take(&mut task_images), reading::Purpose::OcrFallback).await;
+                            let transcription = self.read_inputs(ctx, &policy, std::mem::take(&mut task_images), reading::Purpose::OcrFallback, &mut attachments).await;
                             without_parts.push_str(&transcription.note);
                             readable_text |= !transcription.evidence.is_empty();
                             read_errors.extend(transcription.errors);
@@ -114,7 +115,7 @@ impl Bot {
         };
         let mut intent = parse_intent(&raw);
         if ctx.owner_private() && policy == ProcessingPolicy::Any && (!intent.tasks.is_empty() || !intent.followups.is_empty()) && !task_images.is_empty() {
-            let transcription = self.read_inputs(ctx, &policy, task_images, reading::Purpose::Task).await;
+            let transcription = self.read_inputs(ctx, &policy, task_images, reading::Purpose::Task, &mut attachments).await;
             evidence.extend(transcription.evidence);
             if !transcription.errors.is_empty() {
                 read_errors.push(format!("任务图片材料未完整保存：{}", transcription.errors.join(" ")));
@@ -133,7 +134,7 @@ impl Bot {
         let from_owner = ctx.partner.as_ref().is_some_and(|w| w.is_owner);
         for (kind, title) in &intent.tasks {
             if from_owner {
-                let id = self.add_chat_task(ctx, *kind, title, &evidence)?;
+                let id = self.add_chat_task(ctx, *kind, title, &evidence).await?;
                 info!("owner asked for a task: {title} ({id})");
             } else {
                 warn!("ignored a task marker outside an owner chat in {}: {title}", ctx.key);
@@ -146,7 +147,7 @@ impl Bot {
             self.relay_request(&requester, req).await?;
             self.push_urgent().await?;
         }
-        attach_followups_with_sources(&mut self.board(), ctx, &mut intent, &evidence);
+        attach_followups_with_sources(&self.board, ctx, &mut intent, &evidence).await;
         if intent.silent && read_errors.is_empty() {
             if ctx.is_group && !unsolicited {
                 warn!("stayed silent though addressed in {}", ctx.key);
