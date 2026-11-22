@@ -459,8 +459,8 @@ mod tests {
         });
         let chat = models.pick("chat", &policy).unwrap().id;
         let now = chrono::Utc::now();
-        let first = speaker.say(&models, "k", &policy, now, "甲：这动图依次是什么颜色？".into(), seen.parts, Vec::new(), || Ok(String::new())).await.unwrap();
-        let second = speaker.say(&models, "k", &policy, now, "甲：第一帧是什么颜色？".into(), Vec::new(), Vec::new(), || Ok(String::new())).await.unwrap();
+        let first = speaker.say(&models, "k", &policy, crate::mind::speak::SayTurn { now, text: "甲：这动图依次是什么颜色？".into(), images: seen.parts, ephemeral: Vec::new() }, || Ok(String::new())).await.unwrap();
+        let second = speaker.say(&models, "k", &policy, crate::mind::speak::SayTurn { now, text: "甲：第一帧是什么颜色？".into(), images: Vec::new(), ephemeral: Vec::new() }, || Ok(String::new())).await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         println!("model {chat}\nfirst: {first}\nsecond: {second}");
         assert!(first.contains('红') && first.contains('绿') && first.contains('蓝'), "{first}");

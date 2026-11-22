@@ -10,7 +10,7 @@ use chrono::{DateTime, Local, NaiveTime, Utc};
 use serde::de::DeserializeOwned;
 use tracing::warn;
 
-use super::llm::{LlmClient, Prompt, Reply, Turn, Usage, cost_usd};
+use super::llm::{JsonSchema, LlmClient, Prompt, Reply, Turn, Usage, cost_usd};
 use super::router::{Budget, Router};
 use crate::config::{Config, ModelEntry};
 use crate::ns::ProcessingPolicy;
@@ -107,6 +107,12 @@ impl Models {
     }
 
     #[cfg(test)]
+    pub(super) fn with_stub_router(mut self, router: Router) -> Self {
+        self.router = router;
+        self
+    }
+
+    #[cfg(test)]
     pub fn stub_prompts(&self) -> Vec<(String, ProcessingPolicy, String)> {
         self.stub.as_ref().unwrap().lock().unwrap().prompts.clone()
     }
@@ -134,7 +140,7 @@ impl Models {
         let model = self.pick("caption", policy)?;
         let turns = [Turn::UserParts(super::media::caption_parts(frames))];
         let effort = self.effort("caption");
-        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref() };
+        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref(), schema: None };
         Ok(self.call_once("caption", &model, &prompt, "caption", None).await?.text)
     }
 
@@ -242,6 +248,20 @@ impl Models {
         prompt: &Prompt<'_>,
         session_id: &str,
     ) -> Result<(Reply, String)> {
+        #[cfg(test)]
+        if self.stub.is_some() {
+            let text = match prompt.turns.last() {
+                Some(Turn::User(text)) => text.as_str(),
+                Some(Turn::UserParts(parts)) => match parts.first() {
+                    Some(super::llm::Part::Text(text)) => text,
+                    _ => "",
+                },
+                _ => "",
+            };
+            let text = self.stub_reply(scenario, policy, text)?;
+            let reply = Reply { text, raw: None, usage: Usage::default(), latency: Duration::ZERO };
+            return Ok((reply, model_id.into()));
+        }
         let model = self.router.select_for_call(scenario, policy, model_id, self.budget_exhausted())?.clone();
         match self.call_once(scenario, &model, prompt, session_id, None).await {
             Ok(r) => Ok((r, model.id)),
@@ -263,7 +283,7 @@ impl Models {
         let model = self.pick(scenario, policy)?;
         let turns = [Turn::User(user.to_string())];
         let effort = self.effort(scenario);
-        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref() };
+        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref(), schema: None };
         Ok(self.call_once(scenario, &model, &prompt, scenario, None).await?.text)
     }
 
@@ -274,9 +294,46 @@ impl Models {
         let model = self.pick(scenario, policy)?;
         let turns = [Turn::User(user.to_string())];
         let effort = self.effort(scenario);
-        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref() };
+        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref(), schema: None };
         let (reply, _) = self.run(scenario, policy, &model.id, &prompt, scenario).await?;
         Ok(reply.text)
+    }
+
+    pub async fn ask_structured<T: DeserializeOwned>(
+        &self, scenario: &str, policy: &ProcessingPolicy, system: &str, user: &str, schema: &JsonSchema,
+    ) -> Result<T> {
+        self.ask_structured_with_limit(scenario, policy, system, user, schema, None).await
+    }
+
+    pub async fn ask_structured_with_limit<T: DeserializeOwned>(
+        &self, scenario: &str, policy: &ProcessingPolicy, system: &str, user: &str, schema: &JsonSchema,
+        limit: Option<SpendLimit>,
+    ) -> Result<T> {
+        fn parse<T: DeserializeOwned>(text: &str) -> Result<T> {
+            serde_json::from_str(text.trim()).or_else(|_| extract_json(text))
+        }
+
+        if let Some(limit) = limit && limit.exhausted(self.store.as_ref())? {
+            return Err(super::router::BudgetDenied("read-only reflection cost budget exhausted".into()).into());
+        }
+        #[cfg(test)]
+        if self.stub.is_some() {
+            return parse(&self.stub_reply(scenario, policy, user)?);
+        }
+        let model = self.pick(scenario, policy)?;
+        let turns = [Turn::User(user.to_string())];
+        let effort = self.effort(scenario);
+        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref(), schema: Some(schema) };
+        let first = self.call_once(scenario, &model, &prompt, scenario, None).await
+            .and_then(|reply| parse(&reply.text));
+        let error = match first {
+            Err(e) if limit.is_none() => e,
+            result => return result,
+        };
+        let Some(next) = self.router.next_stronger(scenario, policy, &model.id) else { return Err(error) };
+        warn!(model = %model.id, next = %next.id, "structured call failed: {error:#}");
+        let reply = self.call_once(scenario, next, &prompt, scenario, Some(&model.id)).await?;
+        parse(&reply.text)
     }
 
     /// Like `ask`, but the reply must contain a JSON object of shape `T`. A reply that fails the
@@ -313,7 +370,7 @@ impl Models {
         let model = self.pick(scenario, policy)?;
         let turns = [Turn::User(user.to_string())];
         let effort = self.effort(scenario);
-        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref() };
+        let prompt = Prompt { l1: system, l2: "", turns: &turns, effort: effort.as_deref(), schema: None };
         let (reply, used) = self.run(scenario, policy, &model.id, &prompt, scenario).await?;
         match extract_json(&reply.text) {
             Ok(v) => Ok(v),

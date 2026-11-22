@@ -236,13 +236,18 @@ pub struct SessionCfg {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct DebounceCfg {
-    /// 0 disables both waiting and adaptive learning.
+    /// Fixed quiet window, with 0 disabling the wait.
     pub quiet_ms: u64,
     pub cap_ms: u64,
+    #[allow(dead_code)] // Retained for existing runtime YAML.
     pub adaptive: bool,
+    #[allow(dead_code)] // Retained for existing runtime YAML.
     pub alpha: f64,
+    #[allow(dead_code)] // Retained for existing runtime YAML.
     pub factor: f64,
+    #[allow(dead_code)] // Retained for existing runtime YAML.
     pub min_ms: u64,
+    #[allow(dead_code)] // Retained for existing runtime YAML.
     pub max_ms: u64,
 }
 
@@ -256,13 +261,6 @@ impl DebounceCfg {
     fn validate(&self) -> Result<()> {
         if self.quiet_ms == 0 { return Ok(()) }
         anyhow::ensure!(self.cap_ms > 0, "session.debounce.cap_ms must be positive (quiet_ms: 0 disables debouncing)");
-        if self.adaptive {
-            anyhow::ensure!(self.alpha.is_finite() && self.alpha > 0.0 && self.alpha <= 1.0,
-                "session.debounce.alpha must be in (0, 1]");
-            anyhow::ensure!(self.factor.is_finite() && self.factor > 0.0, "session.debounce.factor must be positive and finite");
-            anyhow::ensure!(self.min_ms > 0 && self.min_ms <= self.max_ms && self.max_ms <= self.cap_ms,
-                "session.debounce requires 0 < min_ms <= max_ms <= cap_ms");
-        }
         Ok(())
     }
 }
@@ -655,12 +653,12 @@ timeout_min: 30
     }
 
     #[test]
-    fn debounce_rejects_invalid_adaptive_parameters() {
-        for yaml in ["alpha: 0", "alpha: 1.1", "alpha: .nan", "factor: -1", "factor: .inf",
-            "min_ms: 0", "min_ms: 7000", "max_ms: 10001", "cap_ms: 0"] {
-            let cfg: DebounceCfg = serde_yaml::from_str(yaml).unwrap();
-            assert!(cfg.validate().is_err(), "{yaml}");
+    fn debounce_validates_only_the_fixed_window() {
+        for yaml in ["alpha: 0", "factor: .inf", "min_ms: 0", "cap_ms: 100"] {
+            serde_yaml::from_str::<DebounceCfg>(yaml).unwrap().validate().unwrap();
         }
+        assert!(serde_yaml::from_str::<DebounceCfg>("cap_ms: 0").unwrap().validate().is_err());
+        serde_yaml::from_str::<DebounceCfg>("quiet_ms: 0\ncap_ms: 0").unwrap().validate().unwrap();
     }
 
     #[test]

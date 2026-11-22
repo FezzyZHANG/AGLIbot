@@ -31,11 +31,18 @@ pub enum Part {
     Jpeg(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct JsonSchema {
+    pub name: &'static str,
+    pub schema: Value,
+}
+
 pub struct Prompt<'a> {
     pub l1: &'a str,
     pub l2: &'a str,
     pub turns: &'a [Turn],
     pub effort: Option<&'a str>,
+    pub schema: Option<&'a JsonSchema>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -93,6 +100,9 @@ pub fn anthropic_body(m: &ModelEntry, p: &Prompt<'_>) -> Value {
         "system": system,
         "messages": messages,
     });
+    // The 2026-11-22 gemini_relay probe succeeded without output_config.format and
+    // returned HTTP 502 or timed out at 25s with it. Anthropic-compatible callers
+    // extract JSON from the text. Bailian's OpenAI-compatible API uses response_format.
     if let Some(effort) = p.effort {
         body["output_config"] = json!({"effort": effort});
     }
@@ -117,6 +127,12 @@ pub fn openai_body(m: &ModelEntry, p: &Prompt<'_>) -> Value {
         Turn::Assistant { text, .. } => json!({"role": "assistant", "content": text}),
     }));
     let mut body = json!({"model": m.model, "messages": messages, "stream": m.stream});
+    if let Some(schema) = p.schema {
+        body["response_format"] = json!({
+            "type": "json_schema",
+            "json_schema": { "name": schema.name, "strict": true, "schema": schema.schema },
+        });
+    }
     if m.stream {
         body["stream_options"] = json!({"include_usage": true});
     }
@@ -418,7 +434,7 @@ mod tests {
     #[test]
     fn multimodal_turns_use_each_providers_image_shape() {
         let turns = [Turn::UserParts(vec![Part::Text("看".into()), Part::Jpeg("QUJD".into())])];
-        let prompt = Prompt { l1: "L1", l2: "", turns: &turns, effort: None };
+        let prompt = Prompt { l1: "L1", l2: "", turns: &turns, effort: None, schema: None };
         let openai = openai_body(&model(None), &prompt);
         assert_eq!(openai["messages"][1]["content"][0], json!({"type": "text", "text": "看"}));
         assert_eq!(openai["messages"][1]["content"][1]["image_url"]["url"], "data:image/jpeg;base64,QUJD");
@@ -429,23 +445,38 @@ mod tests {
         assert!(request_shape(&openai).ends_with("u[2]]"), "{}", request_shape(&openai));
     }
 
+    #[test]
+    fn openai_adds_strict_response_format_only_when_requested() {
+        let schema = JsonSchema { name: "decision", schema: json!({"type": "object"}) };
+        let prompt = Prompt { l1: "L1", l2: "", turns: &[], effort: None, schema: Some(&schema) };
+        let m = model(None);
+        assert_eq!(openai_body(&m, &prompt)["response_format"], json!({
+            "type": "json_schema",
+            "json_schema": { "name": "decision", "strict": true, "schema": {"type": "object"} },
+        }));
+        assert!(openai_body(&m, &Prompt { schema: None, ..prompt }).get("response_format").is_none());
+    }
+
     /// Turn n's request must be a byte prefix of turn n+1's: same system, same earlier messages.
     #[test]
     fn anthropic_requests_are_append_only() {
+        let schema = JsonSchema { name: "decision", schema: json!({"type": "object"}) };
         let m = model(Some("default"));
         let raw = json!([{"type": "thinking", "thinking": "", "signature": "sig"}, {"type": "text", "text": "嗯"}]);
         let mut turns = vec![Turn::User("t1".into())];
-        let first = anthropic_body(&m, &Prompt { l1: "L1", l2: "L2", turns: &turns, effort: Some("low") });
+        let first = anthropic_body(&m, &Prompt { l1: "L1", l2: "L2", turns: &turns, effort: Some("low"), schema: Some(&schema) });
         turns.push(Turn::Assistant { text: "嗯".into(), raw: Some(raw.clone()) });
         turns.push(Turn::User("t2".into()));
-        let second = anthropic_body(&m, &Prompt { l1: "L1", l2: "L2", turns: &turns, effort: Some("low") });
+        let second = anthropic_body(&m, &Prompt { l1: "L1", l2: "L2", turns: &turns, effort: Some("low"), schema: Some(&schema) });
 
         assert_eq!(first["system"], second["system"]);
         assert_eq!(first["messages"][0], second["messages"][0]);
         // Thinking blocks are replayed unchanged, never stripped.
         assert_eq!(second["messages"][1]["content"], raw);
         assert_eq!(second["fallbacks"], "default");
-        assert_eq!(second["output_config"]["effort"], "low");
+        assert_eq!(first["output_config"], json!({"effort": "low"}));
+        assert_eq!(second["output_config"], first["output_config"]);
+        assert!(second.get("response_format").is_none());
         assert_eq!(second["system"][1]["cache_control"]["type"], "ephemeral");
     }
 
@@ -456,7 +487,7 @@ mod tests {
             Turn::User("hi".into()),
             Turn::Assistant { text: "嗯".into(), raw: Some(json!([{"type": "text", "text": "嗯"}])) },
         ];
-        let body = openai_body(&m, &Prompt { l1: "L1", l2: "L2", turns: &turns, effort: None });
+        let body = openai_body(&m, &Prompt { l1: "L1", l2: "L2", turns: &turns, effort: None, schema: None });
         assert_eq!(body["messages"][0]["content"], "L1\n\nL2");
         assert_eq!(body["messages"][2]["content"], "嗯");
     }
@@ -491,7 +522,7 @@ mod tests {
     #[test]
     fn streaming_thinking_request_keeps_provider_options_separate() {
         let mut m = model(None);
-        let prompt = Prompt { l1: "system", l2: "", turns: &[], effort: Some("low") };
+        let prompt = Prompt { l1: "system", l2: "", turns: &[], effort: Some("low"), schema: None };
         let plain = openai_body(&m, &prompt);
         assert_eq!(plain["stream"], false);
         assert!(plain.get("enable_thinking").is_none());
@@ -512,7 +543,7 @@ mod tests {
     fn reasoning_effort_follows_the_scenario_when_the_model_opts_in() {
         let mut m = model(None);
         m.reasoning_effort = true;
-        let prompt = Prompt { l1: "system", l2: "", turns: &[], effort: Some("low") };
+        let prompt = Prompt { l1: "system", l2: "", turns: &[], effort: Some("low"), schema: None };
         assert_eq!(openai_body(&m, &prompt)["reasoning_effort"], "low");
         assert!(openai_body(&m, &Prompt { effort: None, ..prompt }).get("reasoning_effort").is_none());
         assert!(openai_body(&m, &prompt).get("enable_thinking").is_none());
@@ -583,7 +614,7 @@ mod tests {
         let cfg = crate::config::Config::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))?;
         let client = LlmClient::new(cfg.models.providers.clone())?;
         let turns = [Turn::User("Reply with exactly OK.".into())];
-        let prompt = Prompt { l1: "This is a connection test. Keep the answer minimal.", l2: "", turns: &turns, effort: None };
+        let prompt = Prompt { l1: "This is a connection test. Keep the answer minimal.", l2: "", turns: &turns, effort: None, schema: None };
         for m in cfg.models.models.iter().filter(|m| m.provider == "bailian") {
             let reply = client.complete(m, &prompt).await.with_context(|| format!("testing {}", m.model))?;
             assert!(!reply.text.trim().is_empty(), "{} returned no text", m.model);

@@ -1,7 +1,8 @@
-mod agli;
+mod bot;
 mod channels;
 mod config;
 mod config_watch;
+mod control;
 mod error_report;
 mod evolution;
 mod hands;
@@ -21,7 +22,8 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
 
-use agli::{Agli, Event, WorkItem, WorkQueue, next_work};
+use bot::{Bot, Event};
+use bot::ingress::{WorkItem, WorkQueue, next_work, try_handle_fast_control};
 use channels::Outlets;
 use channels::telegram::Telegram;
 use config::Config;
@@ -30,12 +32,12 @@ use mind::models::Models;
 
 async fn recv_work(events: &mut mpsc::Receiver<Event>, queued: &mut WorkQueue, acl: &config::AclCfg, session: &config::SessionCfg) -> Option<WorkItem> {
     if queued.is_empty() {
-        queued.push(events.recv().await?, &session.debounce);
+        queued.push(events.recv().await?);
     }
     // Drain only the current backlog, so a busy producer cannot postpone Ctrl+C or the cap.
     for _ in 0..events.len() {
         if let Ok(ev) = events.try_recv() {
-            queued.push(ev, &session.debounce);
+            queued.push(ev);
         }
     }
     while let Some(deadline) = queued.deadline(acl, session) {
@@ -43,7 +45,7 @@ async fn recv_work(events: &mut mpsc::Receiver<Event>, queued: &mut WorkQueue, a
             biased;
             _ = tokio::time::sleep_until(deadline) => break,
             ev = events.recv() => match ev {
-                Some(ev) => queued.push(ev, &session.debounce),
+                Some(ev) => queued.push(ev),
                 None => break,
             },
         }
@@ -150,16 +152,42 @@ async fn run(cfg: Arc<Config>, telegram: Result<Telegram>) -> Result<()> {
         anyhow::bail!("没有可用的聊天渠道：请配置 TELEGRAM_BOT_TOKEN 或 ONEBOT_URL");
     }
 
-    {
+    let control = control::ControlPlane::load(store.as_ref());
+    let (cfg_tx, cfg_rx) = tokio::sync::watch::channel(cfg.clone());
+    let mut bot = Bot::new(cfg.clone(), control.clone(), store.clone(), models, outlets.clone(), events_tx.clone())
+        .inspect_err(|_| report(Fault::StartupRuntime))?;
+    let watchdog_handle = control::spawn_watchdog(control.clone(), cfg_rx.clone(), events_tx.clone(), Duration::from_secs(15));
+
+    // The bounded actor channel can fill while a turn is running. Keep that backpressure
+    // in the relay so ingress continues looking for owner controls in arrival order.
+    let (dispatch, mut pending) = mpsc::unbounded_channel();
+    let relay = {
         let tx = events_tx.clone();
         tokio::spawn(async move {
-            while let Some(env) = inbound.recv().await {
-                if tx.send(Event::Inbound(env)).await.is_err() {
-                    break;
-                }
+            while let Some(event) = pending.recv().await {
+                if tx.send(event).await.is_err() { break }
             }
-        });
-    }
+        })
+    };
+    let forwarder = {
+        let control = control.clone();
+        tokio::spawn(async move {
+            let mut shutdown = control.shutdown_token();
+            loop {
+                let env = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    env = inbound.recv() => env,
+                };
+                let Some(env) = env else { break };
+                let cfg = cfg_rx.borrow().clone();
+                if try_handle_fast_control(&cfg, store.as_ref(), &outlets, &control, &dispatch, &env).await {
+                    continue;
+                }
+                if dispatch.send(Event::Inbound(env)).is_err() { break }
+            }
+        })
+    };
     {
         let tx = events_tx.clone();
         let every = Duration::from_secs(cfg.runtime.heartbeat.tick_s.max(10));
@@ -174,26 +202,35 @@ async fn run(cfg: Arc<Config>, telegram: Result<Telegram>) -> Result<()> {
         });
     }
 
-    let mut queued = WorkQueue::with_store(store.clone());
-    let mut agli = Agli::new(cfg.clone(), store, models, outlets, events_tx)
-        .inspect_err(|_| report(Fault::StartupRuntime))?;
+    let mut queued = WorkQueue::new();
     let mut config_poll = tokio::time::interval(Duration::from_secs(2));
     config_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    agli.start_media();
+    bot.start_media();
     info!("{}", evolution::describe_release(&cfg.data_dir()));
     info!("AGLI is up");
+    let signal = tokio::signal::ctrl_c();
+    tokio::pin!(signal);
     loop {
+        let active_cfg = bot.cfg();
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut signal => break,
             _ = config_poll.tick() => {
-                agli.reload_config(&mut config_watcher);
+                if bot.reload_config(&mut config_watcher) { cfg_tx.send_replace(bot.cfg()); }
             },
-            work = recv_work(&mut events, &mut queued, &cfg.acl, &cfg.runtime.session) => match work {
-                Some(work) => agli.handle(work).await,
+            work = recv_work(&mut events, &mut queued, &active_cfg.acl, &active_cfg.runtime.session) => match work {
+                Some(work) => tokio::select! {
+                    _ = &mut signal => break,
+                    _ = bot.handle(work) => {}
+                },
                 None => break,
             },
         }
     }
+    control.shutdown();
+    relay.abort();
+    control.jobs().stop_all().await;
+    let _ = watchdog_handle.await;
+    let _ = forwarder.await;
     info!("bye");
     Ok(())
 }
