@@ -1,0 +1,33 @@
+---
+id: n-agli-dec-deepseek-paid-api
+graph_id: default
+version: 1
+title: Owner is willing to pay for official DeepSeek APIs
+kind: decision
+state: accepted
+in_graph: true
+summary: '主人于 2026-11-17 确认愿意为 DeepSeek 付费。官方直连付费能力可作为 AGLIbot 方案候选；金额、默认模型、部署与隐私范围尚无新决定。
+
+
+  Paid direct DeepSeek services are eligible for project planning. The owner specified
+  no spending amount or default route.'
+created_at: '2026-11-23T05:36:44Z'
+updated_at: '2026-11-23T05:36:44Z'
+adopted_body_hash: null
+links:
+- relation: relates
+  target_type: note
+  target_id: n-agli-q-dsh-search
+- relation: relates
+  target_type: note
+  target_id: n-agli-q-dsh-tokens
+- relation: relates
+  target_type: note
+  target_id: n-src-deepseek-app-api-20261113
+- relation: relates
+  target_type: ticket
+  target_id: 100
+---
+On 2026-11-17 the owner confirmed willingness to pay for DeepSeek and requested a feature-by-feature assessment and Moldloft plan. Cost is a comparison and accounting input. Paid availability is an acceptable premise for evaluating the official services.
+
+Keep separate accounts of direct DeepSeek usage, Alibaba Cloud Token Plan inference and the existing DSH search credential. The historical DSH model/key decision and its parked daily cap address a different billing path. No new budget, blanket cloud disclosure, routing change or rollout was chosen in this decision.

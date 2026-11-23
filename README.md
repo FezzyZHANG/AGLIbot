@@ -74,10 +74,12 @@ Telegram 的收发消息走环境变量 `TELEGRAM_PROXY` 指定的代理（例�
 
 ## 开发管理（Moldloft）
 
-[Moldloft](https://github.com/FezzyZHANG/Moldloft) 以 submodule 形式放在 `Moldloft/`，记录待办 ticket 和决策笔记：
+[Moldloft](https://github.com/FezzyZHANG/Moldloft) v2 以 submodule 形式放在 `Moldloft/`，记录待办 ticket 和决策笔记：
 
-```bash
-python Moldloft/tools/project.py run --project .
+```powershell
+ops/moldloft.ps1
 ```
 
-打开 http://127.0.0.1:8787/graph 。agent 只能提交提案，在图谱页面由你审批后才生效。
+打开 http://127.0.0.1:8787 。数据库在 `workspace/moldloft/data/moldloft.db`（已 gitignore）；
+`workspace/moldloft/archive/` 是用 `ops/moldloft.ps1 export workspace/moldloft/archive` 导出的快照，随 git 提交。
+agent 只能提交提案，在工作台的“待审提案”里由你审批后才生效。
