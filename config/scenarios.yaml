@@ -7,7 +7,7 @@
 #   vision: 只路由到 models.yaml 里 vision: true 的模型
 
 triage:        { q_min: 4, priority: cheap,   effort: low }
-chat:          { model: gemini-4-argon, q_min: 6, priority: fast, effort: low, vision: true }
+chat:          { model: gemini-4-neon, q_min: 6, priority: fast, effort: low, vision: true }
 extract:       { q_min: 5, priority: cheap }
 consolidate:   { q_min: 6, priority: cheap }
 research_plan: { q_min: 8, priority: quality }
@@ -15,7 +15,7 @@ work_review:   { model: bailian-deepseek-flash, q_min: 8, priority: quality }
 verify:        { q_min: 8, priority: quality, review: true, budget_exempt: true }
 synthesize:    { q_min: 8, priority: quality }
 act:           { q_min: 8, priority: quality, review: true, budget_exempt: true }
-caption:       { model: gemini-4-argon, q_min: 6, priority: cheap, vision: true, effort: low }
+caption:       { model: gemini-4-neon, q_min: 6, priority: cheap, vision: true, effort: low }
 # 发出前的格式整理：单独一次调用，不进聊天会话，只看草稿。
 format:        { model: bailian-deepseek-flash, q_min: 6, priority: cheap }
 evolve:        { model: opus, q_min: 8.8, priority: quality, review: true, budget_exempt: true }

@@ -331,12 +331,15 @@ mod tests {
                 assert_eq!(r.select(name, &ProcessingPolicy::Any, exhausted).unwrap().provider, "bailian");
             }
         }
-        // Chat needs vision, and only the Gemini models are confirmed to have it.
-        assert!(r.select("chat", &ProcessingPolicy::Any, false).is_err());
-        // The pin means no budget fallback or escalation for chat.
-        assert_eq!(full.select("chat", &ProcessingPolicy::Any, false).unwrap().id, "gemini-4-argon");
-        assert!(full.select("chat", &ProcessingPolicy::Any, true).is_err());
-        assert!(full.next_stronger("chat", &ProcessingPolicy::Any, "gemini-4-argon").is_none());
-        assert!(full.select("chat", &ProcessingPolicy::LocalOnly, false).is_err());
+        // The vision scenarios require the pinned Gemini relay model.
+        for scenario in ["chat", "caption"] {
+            assert!(r.select(scenario, &ProcessingPolicy::Any, false).is_err());
+            let model = full.select(scenario, &ProcessingPolicy::Any, false).unwrap();
+            assert_eq!(model.id, "gemini-4-neon");
+            assert_eq!(model.model, "gemini-4-neon");
+            assert!(full.select(scenario, &ProcessingPolicy::Any, true).is_err());
+            assert!(full.next_stronger(scenario, &ProcessingPolicy::Any, &model.id).is_none());
+            assert!(full.select(scenario, &ProcessingPolicy::LocalOnly, false).is_err());
+        }
     }
 }

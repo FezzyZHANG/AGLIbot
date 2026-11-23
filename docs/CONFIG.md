@@ -27,7 +27,7 @@
 | `models[].provider` | 字符串 | 必填 | 引用 providers 中的名称，未知名称启动失败 |
 | `models[].model` | 字符串 | 必填 | 发送给 API 的模型名称 |
 | `models[].q` | f64 | 必填 | 主人估计的质量分；按场景 q_min 过滤 |
-| `models[].vision` | bool | false | 已实测能收图；`vision: true` 的场景只路由到这些模型 |
+| `models[].vision` | bool | false | 声明模型可接收图片；`vision: true` 的场景只路由到这些模型 |
 | `models[].c` | 对象 | 必填 | token 价格表 |
 | `models[].c.input` | f64 | 必填 | 未缓存输入价格；路由成本比较使用 input + output |
 | `models[].c.cached` | f64 | 必填 | 缓存命中输入价格，用于计费记录 |
@@ -79,11 +79,11 @@ embedding:
 | `*.review` | bool | false | 记录设计意图；**不自动接入 judge**，实际审查由调用处显式执行 |
 | `*.budget_exempt` | bool | false | 超预算时仍保留原优先项；当前 verify / act / evolve 为 true |
 | `*.effort` | 可空字符串 | 无 | Anthropic 发 output_config.effort；启用 reasoning_effort 的兼容模型发同名参数；low 还会关闭兼容模型显式配置的 thinking |
-| `*.vision` | bool | false | 只路由到 `vision: true` 的模型，固定 `model` 时也检查；当前 `chat` 为 true 并固定到 `gemini-4-argon`，[看图](../src/mind/vision.rs)把图片直接放进被叫到的那一轮 |
+| `*.vision` | bool | false | 只路由到 `vision: true` 的模型，固定 `model` 时也检查；当前 `chat` 为 true 并固定到 `gemini-4-neon`，[看图](../src/mind/vision.rs)把图片直接放进被叫到的那一轮 |
 
 当前部分场景省略 q_min 以外的可选字段，按上述默认值处理；effort 的字符串不在配置层校验。依据：[Scenario](../src/config.rs)、[router.rs](../src/mind/router.rs)、[llm.rs](../src/mind/llm.rs)、[judge.rs](../src/mind/judge.rs)。
 
-仓库默认 `chat` / `caption` 固定到 Gemini Argon，`format` 固定到百炼 DeepSeek Flash，`evolve` 固定到 Opus。启动只验证聊天模型可选，不证明其他场景或提供商可用。另有已确认缺陷：只要默认本地 `qwen3:8b` 可用，日记/成长就选择 LocalOnly，但其 Q=5 不满足 consolidate 的 Q≥6；人格探针的 LocalOnly 又与远程 chat 固定项冲突。具体触发及修复边界见审查报告。
+仓库默认 `chat` / `caption` 固定到 Gemini Neon，`format` 固定到百炼 DeepSeek Flash，`evolve` 固定到 Opus。启动只验证聊天模型可选，不证明其他场景或提供商可用。另有已确认缺陷：只要默认本地 `qwen3:8b` 可用，日记/成长就选择 LocalOnly，但其 Q=5 不满足 consolidate 的 Q≥6；人格探针的 LocalOnly 又与远程 chat 固定项冲突。具体触发及修复边界见审查报告。
 
 ## runtime.yaml（全部需重启）
 
