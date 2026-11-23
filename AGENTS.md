@@ -14,7 +14,9 @@ Before changing Moldloft source, read [its development contract](Moldloft/AGENTS
 ## Who may write core code
 
 Core code is `src/` and anything at L3 or above in [DESIGN section 6](docs/DESIGN.md#6-自进化与安全).
-L4 (`config/`, boundaries, `evolution/gate.rs`) is owner-only regardless of model.
+L4 (`config/`, boundaries) is owner-only regardless of model. The in-process evolution gate
+(`evolution/gate.rs`) was retired with the owner's sign-off on 2026-11-23; core code now ships only
+through Git and `ops/deploy.ps1`, and bringing a gate back is itself an L4 change the owner starts.
 
 - **Direct writers:** Astra (`gpt-6-astra`, via Codex) and Opus (via the owner's Claude Code).
 - **Directed writer:** `deepseek-v4.1-flash-1017`, only for well-defined tasks. A task is

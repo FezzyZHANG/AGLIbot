@@ -1,1 +1,1162 @@
-[]
+- rowid: 2
+  id: 123db19c6c704130b05a4252405975f2
+  graph_id: default
+  request_id: agli-signoff-20261123-b
+  source: mcp
+  base_revision: 177
+  operations_json: '{"operations": [{"op": "ticket_update", "ticket_id": 38, "fields":
+    {"status": "closed", "tech_notes": "Report: work/tasks/layerfs-eval/report.md.
+    Related: #25 DSH install, #26 evolution gate, #27 L4 write protection.\n\n2026-11-23:
+    closed with #25. DSH is not the research executor (n-agli-dec-research-native);
+    reopen only if DSH comes back."}}, {"op": "ticket_update", "ticket_id": 43, "fields":
+    {"status": "closed", "tech_notes": "Report: work/tasks/dsh-subagent-codex-eval/report.md.
+    Owner decisions: whose Codex login/quota the child uses (n-agli-q-dsh-tokens covers
+    only DSH).\n\n2026-11-23: closed with #25. DSH is not the research executor (n-agli-dec-research-native);
+    reopen only if DSH comes back."}}, {"op": "ticket_update", "ticket_id": 86, "fields":
+    {"tech_notes": "src/mind/expression.rs; src/agli.rs::send_sticker; src/mind/media.rs;
+    src/stickers_web.rs; Store media methods and both backends. A05 combines audit
+    backend B01/B02. A07 is the related JSONL cross-process file-level problem. Related
+    product backlog: #57/#60, not a claim that their broader acceptance is complete.\n\n2026-11-15
+    evidence \u2014 The production Store probe reproduced a stale sighting write undoing
+    Disabled/Origin. Dispatch using a stale offer is independently traced. Also see
+    A07 (different-hash JSONL writes) and A09 (orphan bytes).\n\n2026-11-23 review
+    of 463363c (R11): the delete race remains. A worker that already read a record
+    re-upserts it as a new description after an admin delete, so the record can return
+    without its file. src/mind/media.rs:465, :469, :508; src/store/mongo.rs:237, :463.
+    Distinguish a first sighting from a deleted observed version, and create with
+    a conditional insert."}}, {"op": "ticket_update", "ticket_id": 87, "fields": {"tech_notes":
+    "src/main.rs select branch awaits Agli::handle; src/agli.rs message/tick/command/job
+    lifecycle and watchdog; src/mind/llm.rs long request timeout; hands/evolution/media
+    cancellation boundaries. DESIGN 10a acknowledged serial calls, but DESIGN 9 immediate-freeze
+    acceptance is unmet. #36 only implemented a tick-driven watchdog, not independent
+    supervision. Coordinate with reworked #26. Do not revive parked OS-isolation ticket
+    #27 implicitly.\n\n2026-11-15 design review \u2014 See n-agli-idea-control-handoff
+    for candidate acceptance tests, late completions and independent deadlines shared
+    with #26. The owner has requested the super switch and raised possible refactoring.
+    Latency, exact scope and architecture are still open.\n\n2026-11-17 DeepSeek planning
+    update \u2014 Remote OCR/Files parsing can continue and accrue charges after the
+    client disconnects. Add a freeze fixture that stops new dispatch and rejects late
+    results while accounting for a remote operation of unknown outcome. Include TTL
+    and orphan cleanup for an upload whose response was lost. See n-agli-idea-deepseek-app-integration.\n\n2026-11-23
+    review of 463363c: partial. ControlPlane, a job registry with cancel tokens, the
+    watchdog and fast /stop and /freeze outside the actor now exist (6808481). Still
+    open: R03 /stop races admission (src/bot/jobs.rs:50, :62; src/control.rs:152);
+    R04 the frozen flag fails open on a read error (now a release blocker); R19 the
+    unbounded relay can delay control events and QQ''s bounded buffer can drop them
+    (src/main.rs:123; src/channels/qq.rs:641)."}}, {"op": "ticket_update", "ticket_id":
+    94, "fields": {"tech_notes": "2026-11-15 repository audit, P2 A17/A20. Evidence:
+    src/social/people.rs observe/add_fact, src/mind/reflect.rs extraction watermarks;
+    mind-social-privacy.md MS-04/MS-07. Report and fixtures under docs/reviews/2026-11-15/.
+    Owner P1 decisions are recorded separately.\n\n2026-11-23 review of 463363c (R18):
+    A20 is not fixed. last_seen refreshes the cache on every message and the persistence
+    throttle compares against that cache time, so storage keeps the first sighting.
+    src/social/people.rs:66, :87. Track last observed and last persisted separately
+    and throttle on the latter."}}, {"op": "ticket_update", "ticket_id": 95, "fields":
+    {"tech_notes": "2026-11-15 repository audit, P2 A18. Evidence: src/mind/judge.rs
+    digest(), src/agli.rs digest routing/delivery; mind-social-privacy.md MS-05. Report
+    and fixtures under docs/reviews/2026-11-15/. Owner P1 decisions are recorded separately.\n\n2026-11-23
+    review of 463363c (R17): automatic digests now mark items after a successful send,
+    but manual /digest still sets notified=true before returning the text. src/bot/commands.rs:153;
+    src/bot/ingress.rs:447."}}, {"op": "ticket_update", "ticket_id": 98, "fields":
+    {"tech_notes": "2026-11-15 repository audit, P2 M01. Evidence: Moldloft/src/tickets/proposals.py
+    and review.py; moldloft-backend.md M01. Temporary database and production renderer.
+    Report and fixtures under docs/reviews/2026-11-15/. Owner P1 decisions are recorded
+    separately.\n\n2026-11-23: the evidence paths above are Moldloft v1 files, which
+    v2 (0.3.0a1, src/moldloft/) removed. Re-verify against v2 proposal storage and
+    review rendering before fixing; not re-checked yet."}}, {"op": "ticket_update",
+    "ticket_id": 99, "fields": {"tech_notes": "2026-11-15 repository audit, P2 M02.
+    Evidence: Moldloft/src/tickets/app.py local_boundary, mcp_surface.py and project_runtime.py;
+    moldloft-backend.md M02. Report and fixtures under docs/reviews/2026-11-15/. Owner
+    P1 decisions are recorded separately.\n\n2026-11-23: the evidence paths above
+    are Moldloft v1 files, which v2 (0.3.0a1) removed. An Opus reading of v2 src/moldloft/app.py,
+    not a test: the HTTP write check still compares Origin with the request''s own
+    Host while MCP uses allowed_hosts, so the divergence likely persists. Re-verify
+    with isolated middleware tests."}}], "versions": {"ticket:38": 2, "ticket:43":
+    1, "ticket:86": 2, "ticket:87": 3, "ticket:94": 1, "ticket:95": 1, "ticket:98":
+    1, "ticket:99": 1}}'
+  summary: 清理：DSH 后续工单结案，463363c 审查发现补记到审计工单，M01/M02 标注按 v2 重新核实
+  rationale: '只改字段（ticket_update），A 批落库后仍可单独批准或驳回。#38、#43 随 #25 结案；R11、R17、R18、R03/R04/R19
+    分别补记到 #86、#95、#94、#87；#98、#99 的证据指向已删除的 v1 文件。'
+  status: applied
+  decision_note: ''
+  result_json: '{"graph_id": "default", "revision": 179, "created": {}, "versions":
+    {"ticket:38": 3, "ticket:43": 2, "ticket:86": 3, "ticket:87": 4, "ticket:94":
+    2, "ticket:95": 2, "ticket:98": 2, "ticket:99": 2}, "anchors_created": [], "operations":
+    [{"op": "ticket_update", "ticket_id": 38, "fields": {"status": "closed", "tech_notes":
+    "Report: work/tasks/layerfs-eval/report.md. Related: #25 DSH install, #26 evolution
+    gate, #27 L4 write protection.\n\n2026-11-23: closed with #25. DSH is not the
+    research executor (n-agli-dec-research-native); reopen only if DSH comes back."}},
+    {"op": "ticket_update", "ticket_id": 43, "fields": {"status": "closed", "tech_notes":
+    "Report: work/tasks/dsh-subagent-codex-eval/report.md. Owner decisions: whose
+    Codex login/quota the child uses (n-agli-q-dsh-tokens covers only DSH).\n\n2026-11-23:
+    closed with #25. DSH is not the research executor (n-agli-dec-research-native);
+    reopen only if DSH comes back."}}, {"op": "ticket_update", "ticket_id": 86, "fields":
+    {"tech_notes": "src/mind/expression.rs; src/agli.rs::send_sticker; src/mind/media.rs;
+    src/stickers_web.rs; Store media methods and both backends. A05 combines audit
+    backend B01/B02. A07 is the related JSONL cross-process file-level problem. Related
+    product backlog: #57/#60, not a claim that their broader acceptance is complete.\n\n2026-11-15
+    evidence \u2014 The production Store probe reproduced a stale sighting write undoing
+    Disabled/Origin. Dispatch using a stale offer is independently traced. Also see
+    A07 (different-hash JSONL writes) and A09 (orphan bytes).\n\n2026-11-23 review
+    of 463363c (R11): the delete race remains. A worker that already read a record
+    re-upserts it as a new description after an admin delete, so the record can return
+    without its file. src/mind/media.rs:465, :469, :508; src/store/mongo.rs:237, :463.
+    Distinguish a first sighting from a deleted observed version, and create with
+    a conditional insert."}}, {"op": "ticket_update", "ticket_id": 87, "fields": {"tech_notes":
+    "src/main.rs select branch awaits Agli::handle; src/agli.rs message/tick/command/job
+    lifecycle and watchdog; src/mind/llm.rs long request timeout; hands/evolution/media
+    cancellation boundaries. DESIGN 10a acknowledged serial calls, but DESIGN 9 immediate-freeze
+    acceptance is unmet. #36 only implemented a tick-driven watchdog, not independent
+    supervision. Coordinate with reworked #26. Do not revive parked OS-isolation ticket
+    #27 implicitly.\n\n2026-11-15 design review \u2014 See n-agli-idea-control-handoff
+    for candidate acceptance tests, late completions and independent deadlines shared
+    with #26. The owner has requested the super switch and raised possible refactoring.
+    Latency, exact scope and architecture are still open.\n\n2026-11-17 DeepSeek planning
+    update \u2014 Remote OCR/Files parsing can continue and accrue charges after the
+    client disconnects. Add a freeze fixture that stops new dispatch and rejects late
+    results while accounting for a remote operation of unknown outcome. Include TTL
+    and orphan cleanup for an upload whose response was lost. See n-agli-idea-deepseek-app-integration.\n\n2026-11-23
+    review of 463363c: partial. ControlPlane, a job registry with cancel tokens, the
+    watchdog and fast /stop and /freeze outside the actor now exist (6808481). Still
+    open: R03 /stop races admission (src/bot/jobs.rs:50, :62; src/control.rs:152);
+    R04 the frozen flag fails open on a read error (now a release blocker); R19 the
+    unbounded relay can delay control events and QQ''s bounded buffer can drop them
+    (src/main.rs:123; src/channels/qq.rs:641)."}}, {"op": "ticket_update", "ticket_id":
+    94, "fields": {"tech_notes": "2026-11-15 repository audit, P2 A17/A20. Evidence:
+    src/social/people.rs observe/add_fact, src/mind/reflect.rs extraction watermarks;
+    mind-social-privacy.md MS-04/MS-07. Report and fixtures under docs/reviews/2026-11-15/.
+    Owner P1 decisions are recorded separately.\n\n2026-11-23 review of 463363c (R18):
+    A20 is not fixed. last_seen refreshes the cache on every message and the persistence
+    throttle compares against that cache time, so storage keeps the first sighting.
+    src/social/people.rs:66, :87. Track last observed and last persisted separately
+    and throttle on the latter."}}, {"op": "ticket_update", "ticket_id": 95, "fields":
+    {"tech_notes": "2026-11-15 repository audit, P2 A18. Evidence: src/mind/judge.rs
+    digest(), src/agli.rs digest routing/delivery; mind-social-privacy.md MS-05. Report
+    and fixtures under docs/reviews/2026-11-15/. Owner P1 decisions are recorded separately.\n\n2026-11-23
+    review of 463363c (R17): automatic digests now mark items after a successful send,
+    but manual /digest still sets notified=true before returning the text. src/bot/commands.rs:153;
+    src/bot/ingress.rs:447."}}, {"op": "ticket_update", "ticket_id": 98, "fields":
+    {"tech_notes": "2026-11-15 repository audit, P2 M01. Evidence: Moldloft/src/tickets/proposals.py
+    and review.py; moldloft-backend.md M01. Temporary database and production renderer.
+    Report and fixtures under docs/reviews/2026-11-15/. Owner P1 decisions are recorded
+    separately.\n\n2026-11-23: the evidence paths above are Moldloft v1 files, which
+    v2 (0.3.0a1, src/moldloft/) removed. Re-verify against v2 proposal storage and
+    review rendering before fixing; not re-checked yet."}}, {"op": "ticket_update",
+    "ticket_id": 99, "fields": {"tech_notes": "2026-11-15 repository audit, P2 M02.
+    Evidence: Moldloft/src/tickets/app.py local_boundary, mcp_surface.py and project_runtime.py;
+    moldloft-backend.md M02. Report and fixtures under docs/reviews/2026-11-15/. Owner
+    P1 decisions are recorded separately.\n\n2026-11-23: the evidence paths above
+    are Moldloft v1 files, which v2 (0.3.0a1) removed. An Opus reading of v2 src/moldloft/app.py,
+    not a test: the HTTP write check still compares Origin with the request''s own
+    Host while MCP uses allowed_hosts, so the divergence likely persists. Re-verify
+    with isolated middleware tests."}}]}'
+  created_at: '2026-11-23T17:25:14Z'
+  decided_at: '2026-11-23T17:28:53Z'
+- rowid: 1
+  id: 39dc53cba3cc4f3eb50afc331827c65d
+  graph_id: default
+  request_id: agli-signoff-20261123-a
+  source: mcp
+  base_revision: 177
+  operations_json: '{"operations": [{"op": "ticket_create", "temp_id": "new:blockers",
+    "fields": {"title": "Make 463363c deployable on existing data (release blockers)",
+    "group_name": "Refactor 2026-11-22", "priority": "high", "description": "Gemini''s
+    six-phase refactor (590a346..463363c) passes tests and clippy, but deploying it
+    onto the live store would lose data or leave no bot running. Fix the child tickets
+    before deploying or restoring any deleted feature. Source: docs/reviews/2026-11-23/astra-code-review.md
+    (findings R01-R25, cross-checked by Opus) and docs/reviews/2026-11-23/FEATURE-TRIAGE.md.\n\nAcceptance:
+    on a mongodump copy of the live store, the deploy path migrates, starts and serves
+    with no lost episodes, task follow-ups or review state; a frozen instance stays
+    frozen when the flag cannot be read; Telegram attachments download through the
+    proxy.\n\nWriter: the owner assigns one under root AGENTS.md.", "tech_notes":
+    "Live store, read-only, 2026-11-23: 698 episodes, none archived; 47 open Widen
+    reviews; no Evolve or probe reviews. The live bot still runs 590a346 from the
+    xiaozhuang-20261103 runtime."}}, {"op": "ticket_create", "temp_id": "new:r07",
+    "fields": {"title": "Run a backed-up, verified migrate-bson step before switching
+    releases (R07)", "group_name": "Refactor 2026-11-22", "priority": "high", "description":
+    "The new build refuses the legacy Mongo schema at startup, but ops/deploy.ps1
+    and DEPLOY.md write the new release pointer and stop the old bot first, so a normal
+    deploy ends with no bot running. migrate-bson --apply has no backup step.\n\nAdd
+    a read-only schema preflight before switching. When migration is needed: stop
+    both writers (bot and stickers-web), mongodump, migrate, verify the round trip
+    on a copy, then switch the pointer and check readiness. Also fold in R08 (unknown
+    or retired subcommands such as import-jsonl must exit non-zero instead of starting
+    the bot) and R24 (deploy -Commit 590a346 fails because it always builds the stickers-web
+    bin).", "tech_notes": "src/store/mod.rs:412; ops/deploy.ps1:22, :50, :69; ops/start-bot.ps1:26;
+    src/main.rs:26, :68; src/store/migrate.rs:73, :158.", "parent_id": "new:blockers"}},
+    {"op": "ticket_create", "temp_id": "new:r01", "fields": {"title": "Keep Episode.sources
+    and archive state through migrate-bson (R01)", "group_name": "Refactor 2026-11-22",
+    "priority": "high", "description": "migrate-bson round-trips legacy Episode records
+    through the new struct and drops sources, and the new episodes() returns archived
+    originals to recall. No episode is archived in the live store yet (2026-11-23),
+    so nothing is lost today, but the field and the archive state must survive before
+    archiving comes back.\n\nAcceptance: a legacy fixture with a summary and its originals
+    keeps the same effective recall set after migration, and running the migration
+    twice changes nothing.", "tech_notes": "src/store/migrate.rs:176, :227, :284;
+    src/store/mongo.rs:326. The current migration test asserts that the field disappears.",
+    "parent_id": "new:blockers"}}, {"op": "ticket_create", "temp_id": "new:r02", "fields":
+    {"title": "Import legacy followups.md into task records (R02)", "group_name":
+    "Refactor 2026-11-22", "priority": "high", "description": "Board import reads
+    only board.yaml. Owner follow-ups stored in work/tasks/<id>/followups.md are dropped,
+    so /run executes the original title and can still pass review.\n\nImport them
+    idempotently and restore the consumed position from reviewed_followups_bytes.
+    Follow-ups that cannot be matched stay unprocessed.", "tech_notes": "src/work/board.rs:56,
+    :64; src/store/mod.rs:350; src/work/mod.rs:155. An offline probe reproduced an
+    empty import.", "parent_id": "new:blockers"}}, {"op": "ticket_create", "temp_id":
+    "new:r14", "fields": {"title": "Route Telegram file downloads through TELEGRAM_PROXY
+    (R14)", "group_name": "Refactor 2026-11-22", "priority": "high", "description":
+    "getFile uses the configured proxy, but the file download goes through urls::download
+    with no_proxy. Where Telegram is reachable only through the proxy, chat works
+    and attachments fail.\n\nKeep the proxy for Telegram''s trusted file endpoint,
+    keep destination checks on redirects, and add a proxy fixture over the real download
+    branch.", "tech_notes": "src/channels/telegram.rs:121, :130; src/channels/urls.rs:55.",
+    "parent_id": "new:blockers"}}, {"op": "ticket_create", "temp_id": "new:r04", "fields":
+    {"title": "Fail closed when the frozen flag cannot be read (R04)", "group_name":
+    "Refactor 2026-11-22", "priority": "high", "description": "ControlPlane::load
+    treats a read error or a wrong type as not frozen, so a frozen instance can resume
+    proactive work after a restart. /freeze also holds the admission lock and must
+    write Mongo before it closes admission and cancels work.\n\nKeep the bot disabled,
+    or abort startup, when the flag cannot be read. On /freeze, close local admission
+    and cancel first, then report persistence and termination separately.", "tech_notes":
+    "src/control.rs:199, :212, :223; src/bot/ingress.rs:82. Related: #87 (A06).",
+    "parent_id": "new:blockers"}}, {"op": "ticket_create", "temp_id": "new:r10", "fields":
+    {"title": "Close or migrate legacy Widen review items before deploying (R10)",
+    "group_name": "Refactor 2026-11-22", "priority": "medium", "description": "463363c
+    removed the Widen branch of /approve, so approving a legacy item replies ''\u8bb0\u4e0b\u4e86''
+    and does nothing. The live store has 47 open Widen items and no Evolve or probe
+    items.\n\nBefore deploying, migrate them into the restored Widen flow or close
+    them with a recorded outcome. Retired review kinds must be rejected, not marked
+    Approved.\n\nPer-item recommendations (28 approve, 2 reject, 17 approve after
+    rewrite): data/reviews/2026-11-23-lessons-widen.md, which is gitignored because
+    it paraphrases private chats. Approving on 590a346 today has no conversational
+    effect, because public lessons have no chat reader.", "tech_notes": "src/bot/commands.rs:128,
+    :226, :247. Evidence: n-agli-ev-lessons-widen-20261123.", "parent_id": "new:blockers"}},
+    {"op": "ticket_create", "temp_id": "new:remaining", "fields": {"title": "Fix the
+    remaining 463363c review findings", "group_name": "Refactor 2026-11-22", "priority":
+    "medium", "description": "Not release blockers, but fix them before or soon after
+    deploying 463363c. Details and suggested fixes: docs/reviews/2026-11-23/astra-code-review.md.\n\n-
+    R03: /stop races task admission (P2 after Opus review).\n- R05: task workers do
+    not validate the full path from the trusted root; junctions can escape the task
+    directory.\n- R06: Anthropic-compatible requests omit the output schema, so structured
+    calls through the Gemini relay can fail to parse.\n- R09: active task titles enter
+    every chat prompt without an audience check.\n- R13: Speaker keeps unsent drafts
+    in the conversation history.\n- R15: task state transitions do not check the expected
+    previous state.\n- R16: the reflection watermark skips messages that share a millisecond.\n-
+    R19: the unbounded relay can delay control events behind ordinary traffic.\n-
+    R23: chat recall loads all episodes, and the urgent check loads full reviews.\n-
+    R25: README, DEPLOY and skill-line docs have drifted.\n\nTracked elsewhere: R01,
+    R02, R04, R07, R08, R10, R14, R24 under the release-blocker ticket; R11 in #86;
+    R17 in #95; R18 in #94; R20-R22 in the research-executor ticket; R12 in n-agli-dec-triage-20261123.\n\nWriter:
+    the owner assigns one under root AGENTS.md.", "tech_notes": ""}}, {"op": "ticket_create",
+    "temp_id": "new:lessons", "fields": {"title": "Restore lessons and Widen with
+    a chat reader and revocable public copies", "group_name": "Memory", "priority":
+    "medium", "description": "Owner sign-off 2026-11-23: restore lessons and Widen
+    together. At 590a346 only solo thinking and the journal read lessons, and only
+    with a local model; chat recall passed include_lessons: false, so the 255 public
+    copies never reached a conversation. Restoring therefore includes building the
+    first chat reader.\n\nDesign changes from the live-data review (n-agli-ev-lessons-widen-20261123):\n1.
+    Auto-pass only on an allowlist: group-sourced, low-sensitivity lessons that stand
+    on their own without the original event. Always send to the owner: private-chat
+    sources; identifiable health, relationship, family, finance or workplace-conflict
+    content; group nicknames or jokes; unpublished research; anything that guesses
+    someone''s wishes. Stop lessons that encourage deception, mockery or bypassing
+    permissions at the private stage.\n2. Make the judgement checkable. Verify answers
+    three questions: which two clues would let an acquaintance recognize the source;
+    what the original teller might mind; whether it labels people or encourages misconduct.
+    The review obeys processing policy instead of ProcessingPolicy::Any. Record forwarded,
+    call failure, unparseable output and verdict/reason mismatch separately, with
+    the raw output. For each new model or prompt version, compare 50 items by hand,
+    then sample 20% of auto-passes. These are starting values, not proven thresholds.\n3.
+    Make copies revocable before any chat reader. A pass creates one derived item
+    bound to source, text version, audience and processing policy; a rewrite approves
+    only the new text; revocation also clears search indexes and session caches.\n\nAcceptance:
+    a synthetic private chat yields a private lesson; after review only the public
+    copy enters a group-chat prompt; restricted source text, review reasons and revoked
+    copies never enter that prompt. Cover a processor change, a restart reload and
+    the no-reviewer case.\n\nExisting data: keep the lessons collection. 48 of the
+    250 auto-passed public copies should not stay public as written (7 retract, 41
+    rewrite); retire them before the chat reader goes live. Per-item list: data/reviews/2026-11-23-lessons-widen.md
+    (gitignored).\n\nWriter: the owner assigns one under root AGENTS.md.", "tech_notes":
+    "590a346: src/mind/reflect.rs:95-210, :376 (widened), :412; src/social/privacy.rs:141;
+    src/agli.rs:1371, :2495; src/mind/judge.rs. Deleted in 0fe9648. Related: #84,
+    #85, n-agli-dec-widen."}}, {"op": "ticket_create", "temp_id": "new:commitments",
+    "fields": {"title": "Restore commitments as an input to solo decisions", "group_name":
+    "Memory", "priority": "medium", "description": "Owner sign-off 2026-11-23 (n-agli-dec-triage-20261123).
+    At 590a346, commitments rode on the extract call and decide read up to five items
+    due within three days; deleted in 0fe9648.\n\nMinimal version: record only explicit
+    promises (quoted wording, target, due date, state), updated per target. Proactive
+    outreach passes decide only the target and the action; the wording uses only material
+    that target may see.\n\nAcceptance: a promise made in a synthetic private chat
+    appears in solo decision when it is due; when he reaches out to the owner, the
+    wording contains nothing from other private chats.\n\nData: keep agenda:commitments
+    and check scopes before reading it again.\n\nWriter: the owner assigns one under
+    root AGENTS.md.", "tech_notes": "590a346: src/mind/commitments.rs; src/mind/decide.rs:53-137.
+    Audit A02 leak path closed by the fixed opening in 31dab7b."}}, {"op": "ticket_create",
+    "temp_id": "new:groupobs", "fields": {"title": "Learned group observations: confirm
+    scope and design gaps, then restore", "group_name": "Social", "priority": "low",
+    "description": "Owner sign-off 2026-11-23: restore learned group observations,
+    but first write down what the feature should do and settle its open design questions.
+    At 590a346 they rode on the extract call and fed the group prompt; deleted in
+    0fe9648. Today the group prompt reads the hand-written card mind/social/groups/<id>.md
+    and the owner-maintained lexicon (#80).\n\nQuestions to settle first:\n- Which
+    observations are learned: norms, roles, running topics?\n- May model-inferred
+    norms enter the group prompt directly, or only as lexicon entries the owner confirms?\n-
+    How are one group''s observations kept out of other chats?\n- How does relation
+    inference, which stays parked, stay out?\n\nData: keep the groups and relations
+    collections.", "tech_notes": "590a346: src/social/groups.rs, src/social/cards.rs;
+    read in who_section (src/agli.rs:1404)."}}, {"op": "ticket_create", "temp_id":
+    "new:flow", "fields": {"title": "Flow: busy-time reply continuation (parked)",
+    "group_name": "Orchestration", "priority": "low", "description": "Owner sign-off
+    2026-11-23: keep flow / flow_metrics (deleted in 0fe9648) as a TODO. Hands v2
+    already covers background work, numbered follow-ups and /stop. What remains is
+    replying later when busy and continuing afterwards, interruptible by the owner.
+    Until this is picked up, DESIGN section 4 should keep only prompt layering and
+    cache-prefix discipline.\n\nThe audience leak of task titles (R09) is a bug in
+    the remaining 463363c findings, not part of this ticket.", "tech_notes": "590a346:
+    src/mind/flow.rs, src/mind/flow_metrics.rs."}}, {"op": "ticket_create", "temp_id":
+    "new:executor", "fields": {"title": "Plan the research executor before re-enabling
+    research (native chosen)", "group_name": "Hands", "priority": "low", "description":
+    "Owner decision 2026-11-23 (n-agli-dec-research-native): the native ResearchWorker
+    replaces DSH, but research stays parked until the upstream APIs are stable, and
+    the executor needs its own plan first. The owner considers DSH''s own instability
+    the biggest obstacle to development.\n\nBefore re-enabling: fix R20 (config research:
+    dsh is silently treated as native and reads DEEPSEEK_API_KEY), R21 (a revise verdict
+    does not trigger re-planning; legacy DSH source files are skipped) and R22 (the
+    fetch service''s HTTP status is recorded as the target page''s status). Migrate
+    executor config and credentials explicitly, with an upgrade preflight that reports
+    the real backend and required variables.\n\nKnowledge cards wait for this ticket.",
+    "tech_notes": "src/config.rs:323, :337; src/work/research.rs:130, :150, :159;
+    src/work/research/sources.rs:93, :196; src/hands/reader/web.rs:163; config/runtime.yaml:32
+    (L4, owner-only)."}}, {"op": "ticket_create", "temp_id": "new:knowledge", "fields":
+    {"title": "Knowledge cards: cite earlier research results in later answers", "group_name":
+    "Memory", "priority": "low", "description": "Owner sign-off 2026-11-23: after
+    the research executor. Do not restore the 547-line clusterer from 590a346: knowledge.rs
+    had no reader, and its claims.yaml input came from DSH. Build per-task claim cards
+    with sources plus a reader, so a later question can cite the relevant card (DESIGN
+    section 9 acceptance).\n\nData: leave knowledge:checkpoint and knowledge/notes
+    unread until their scopes are checked.", "tech_notes": "590a346: src/mind/knowledge.rs
+    (deleted in 0fe9648)."}}, {"op": "note_create", "id": "n-agli-dec-triage-20261123",
+    "fields": {"title": "Feature triage after the Gemini refactor (owner sign-off
+    2026-11-23)", "kind": "decision", "state": "accepted", "summary": "\u4e3b\u4eba
+    2026-11-23 \u7b7e\u5b57\uff1a\u6062\u590d lessons + Widen\u3001commitments\u3001\u5b66\u4e60\u578b\u7fa4\u89c2\u5bdf\uff1b\u5468\u6210\u957f\u548c\u63a2\u9488\u7b49
+    #84\uff1b\u77e5\u8bc6\u5361\u6392\u5728\u7814\u7a76\u6267\u884c\u5668\u4e4b\u540e\uff1breciprocity
+    \u548c\u4eba\u7269\u5361\u5bfc\u51fa\u5220\u9664\uff1bflow\u3001\u5411\u91cf\u53ec\u56de\u3001watchlist
+    \u8bb0\u5f85\u529e\uff1b\u8fdb\u5316\u95f8\u95e8\u9000\u5f79\uff1b\u7814\u7a76\u6267\u884c\u5668\u9009
+    native \u5e76\u6401\u7f6e\u3002\n\nOwner sign-off 2026-11-23 on the features Gemini
+    deleted in 0fe9648 and replaced in 463363c: restore lessons+Widen, commitments
+    and learned group observations; growth and probes wait for #84; knowledge cards
+    follow the research executor; delete reciprocity and person-card export; park
+    flow, embeddings and watchlist; retire the gate; research goes native and is parked.",
+    "body": "Source: docs/reviews/2026-11-23/FEATURE-TRIAGE.md (Opus and Astra assessed
+    each feature independently, then merged). Features without an owner change follow
+    the merged recommendation.\n\n| Feature | Disposition |\n|---|---|\n| Weekly growth
+    (#5) | Restore simplified: bounded numeric/style deltas (about \u00b10.02 a week,
+    \u00b10.15 in total) with source IDs and versions, revertible; no free text into
+    L1; the narrative stays private. Waits for #84. |\n| Persona probes (#28) | Restore
+    with #5; run when the persona version changes; judge boundary questions separately;
+    bind approvals to that run''s answers. |\n| Knowledge cards | New feature after
+    the research executor, not the old clusterer. |\n| Reciprocity | Delete the scorer.
+    Evidence-backed help or broken promises may go into person facts, with no scoring
+    call. |\n| Person-card export | Delete; build a read-only page later if needed.
+    |\n| Learned group observations | Restore (owner changed the ''park'' recommendation)
+    after confirming scope and design gaps. |\n| Archive and Episode.sources | Keep
+    sources through migration (release blocker); model summaries can wait until a
+    backlog appears. |\n| Episode embeddings | TODO: collect missed-recall cases first.
+    |\n| Watchlist | Park. A later minimal version: explicit subscriptions with one
+    reminder when due, no automatic paid research. |\n| Commitments | Restore explicit
+    promises as a solo-decision input. |\n| Lessons and Widen | Restore together,
+    including the first chat reader. |\n| Evolution pipeline | Retired: n-agli-dec-gate-retired.
+    |\n| flow / flow_metrics | TODO (owner changed the ''keep deleted'' recommendation).
+    |\n| Research executor | Native chosen, parked: n-agli-dec-research-native. |\n\nOrder:
+    release blockers first; then lessons+Widen and commitments (which goes first is
+    still the owner''s call); then learned group observations. Growth and probes start
+    after #84. Knowledge cards follow the executor.\n\nData: until each feature is
+    settled, stop writing the old collections but do not delete them (lessons, relations,
+    groups, embeddings, agenda:commitments, life:watchlist, persona_probe_*, knowledge:checkpoint).
+    Do not reconnect the old drift.yaml, probe changelog or raw delegate logs directly;
+    they could give private experience new readers. Run mongodump before any migration
+    and verify the round trip on a copy.\n\nStill undecided: #84, which growth fields
+    may change automatically.", "links": [{"relation": "relates", "target_type": "ticket",
+    "target_id": 5}, {"relation": "relates", "target_type": "ticket", "target_id":
+    28}, {"relation": "relates", "target_type": "ticket", "target_id": 84}, {"relation":
+    "relates", "target_type": "ticket", "target_id": "new:blockers"}, {"relation":
+    "relates", "target_type": "ticket", "target_id": "new:lessons"}, {"relation":
+    "relates", "target_type": "ticket", "target_id": "new:commitments"}, {"relation":
+    "relates", "target_type": "ticket", "target_id": "new:groupobs"}, {"relation":
+    "relates", "target_type": "ticket", "target_id": "new:flow"}, {"relation": "relates",
+    "target_type": "ticket", "target_id": "new:executor"}, {"relation": "relates",
+    "target_type": "ticket", "target_id": "new:knowledge"}, {"relation": "relates",
+    "target_type": "note", "target_id": "n-agli-dec-gate-retired"}, {"relation": "relates",
+    "target_type": "note", "target_id": "n-agli-dec-research-native"}]}}, {"op": "note_create",
+    "id": "n-agli-dec-gate-retired", "fields": {"title": "The in-process evolution
+    gate is retired; L4 is config/ and boundaries", "kind": "decision", "state": "accepted",
+    "summary": "\u4e3b\u4eba 2026-11-23 \u7b7e\u5b57\u63a5\u53d7 0fe9648 \u5220\u9664
+    gate.rs\uff1abot \u4e0d\u518d\u81ea\u5df1\u63d0\u4ea4\u3001\u53d1\u5e03\u6216\u91cd\u542f\uff1b\u6838\u5fc3\u4ee3\u7801\u8d70
+    Moldloft \u2192 \u4e3b\u4eba\u6307\u5b9a\u5b9e\u73b0\u8005 \u2192 Git \u2192 ops/deploy.ps1\uff1bL4
+    \u53ea\u5269 config/ \u548c boundaries\uff0c\u6062\u590d\u95f8\u95e8\u672c\u8eab\u662f\u4e3b\u4eba\u53d1\u8d77\u7684
+    L4 \u53d8\u66f4\u3002\n\nThe owner accepted the deletion of src/evolution/gate.rs
+    in 0fe9648. The bot no longer commits, publishes or restarts itself; core code
+    goes through Moldloft, an owner-assigned writer, Git and ops/deploy.ps1. L4 is
+    config/ and boundaries.", "body": "Retired with the gate: src/evolution/{gate,process,restart}.rs
+    and src/agli/evolution.rs. /evolve and /evolve-status reply ''\u6682\u672a\u5f00\u653e''.\n\nCore
+    code (L3): AGLI or anyone files a Moldloft ticket or proposal; the owner assigns
+    a writer under root AGENTS.md; the writer builds and tests in their own environment;
+    the owner reviews the diff; Git commit; ops/deploy.ps1. The writer allowlist is
+    upheld by the owner''s assignment and review, not by code. Bringing any in-process
+    gate back is itself an L4 change the owner starts.\n\nDocs synced 2026-11-23:
+    AGENTS.md, DESIGN sections 2a/6/9, EVOLUTION.md, README.md, DEPLOY.md, CONFIG.md.
+    The live store has no legacy Evolve review items. #27 (OS write protection) keeps
+    its narrower scope and stays parked.", "links": [{"relation": "relates", "target_type":
+    "ticket", "target_id": 26}, {"relation": "relates", "target_type": "ticket", "target_id":
+    27}, {"relation": "relates", "target_type": "note", "target_id": "n-agli-dec-hands"}]}},
+    {"op": "note_create", "id": "n-agli-dec-research-native", "fields": {"title":
+    "Research executor: native, parked until upstream APIs are stable; DSH closed",
+    "kind": "decision", "state": "accepted", "summary": "\u4e3b\u4eba 2026-11-23 \u51b3\u5b9a\uff1a\u7814\u7a76\u6267\u884c\u5668\u9009
+    native \u800c\u4e0d\u662f DSH\uff1b\u4e0a\u6e38 API \u4e0d\u7a33\u5b9a\uff0c\u5148\u6401\u7f6e\u4e3a\u5f85\u529e\uff0c\u6267\u884c\u5668\u53e6\u4f5c\u6253\u7b97\u3002\u4e3b\u4eba\u8ba4\u4e3a
+    DSH \u672c\u8eab\u7684\u4e0d\u7a33\u5b9a\u662f\u5f00\u53d1\u7684\u6700\u5927\u963b\u788d\u3002\u53d6\u4ee3
+    n-agli-dec-hands \u4e2d DSH \u4e3a\u4e3b\u8981\u53cc\u624b\u7684\u6761\u6b3e\u3002\n\nOwner
+    decision 2026-11-23: research uses the native worker, not DSH, and stays parked
+    until upstream APIs are stable; the executor needs its own plan. Supersedes the
+    DSH-as-main-hand clause of n-agli-dec-hands.", "body": "463363c replaced the DSH
+    research path (src/hands/delegate.rs) with the native ResearchWorker (src/work/research.rs).
+    The owner chose native over restoring DSH as an explicit option, but parks research
+    execution because the upstream APIs are unstable, and wants a separate plan for
+    the executor. The owner considers DSH''s own instability the biggest obstacle
+    to development, so #25 and the DSH follow-ups #38 and #43 close.\n\nThe rest of
+    n-agli-dec-hands stands: Claude Code is the owner''s tool, core code goes through
+    Moldloft, and the writer allowlist in root AGENTS.md applies.\n\nBefore research
+    is re-enabled: fix R20-R22 from the 463363c review and migrate executor config
+    and credentials explicitly. Never treat `research: dsh` as native silently.",
+    "links": [{"relation": "relates", "target_type": "ticket", "target_id": 25}, {"relation":
+    "relates", "target_type": "ticket", "target_id": "new:executor"}, {"relation":
+    "relates", "target_type": "note", "target_id": "n-agli-dec-hands"}]}}, {"op":
+    "note_create", "id": "n-agli-ev-refactor-review-20261123", "fields": {"title":
+    "Review of Gemini''s six-phase refactor 590a346..463363c", "kind": "evidence",
+    "state": "recorded", "summary": "Opus \u4e0e Astra \u72ec\u7acb\u5ba1\u67e5\u540e\u5408\u5e76\uff1a\u6d4b\u8bd5\u548c
+    clippy \u901a\u8fc7\uff0c\u4f46 463363c \u4e0d\u80fd\u76f4\u63a5\u90e8\u7f72\u5230\u73b0\u6709\u6570\u636e\u4e0a\uff0c\u6709
+    5 \u9879\u4e0a\u7ebf\u963b\u65ad\u3002\n\nOpus and Astra reviewed 0fe9648..463363c
+    independently and merged: tests and clippy pass, but 463363c cannot be deployed
+    onto existing data as is; five release blockers.", "body": "Reports: docs/reviews/2026-11-23/astra-code-review.md
+    (25 findings R01-R25) and FEATURE-TRIAGE.md. Opus spot-checked Astra''s unique
+    high-severity claims before merging, and after comparing evidence revised its
+    own reading of audit items A06, A15 and A18 from closed to partial.\n\nRelease
+    blockers: R07 deploy has no migration step and migrate-bson --apply has no backup;
+    R01 migration drops Episode.sources; R02 legacy followups.md is not imported;
+    R14 Telegram downloads bypass TELEGRAM_PROXY; R04 the frozen flag fails open.
+    R10 (legacy approvals) is a deploy precondition too.\n\nLive-store facts checked
+    read-only on 2026-11-23: 698 episodes, none archived, so R01 loses nothing yet.",
+    "links": [{"relation": "relates", "target_type": "ticket", "target_id": "new:blockers"},
+    {"relation": "relates", "target_type": "ticket", "target_id": "new:remaining"},
+    {"relation": "relates", "target_type": "note", "target_id": "n-agli-dec-triage-20261123"}]}},
+    {"op": "note_create", "id": "n-agli-ev-lessons-widen-20261123", "fields": {"title":
+    "Live lessons review: single-pass auto-widening is not safe as is", "kind": "evidence",
+    "state": "recorded", "summary": "\u7ebf\u4e0a 250 \u6761\u81ea\u52a8\u516c\u5f00\u7684
+    lessons \u4e2d 48 \u6761\u4e0d\u5e94\u539f\u6837\u516c\u5f00\uff1b\u5ba1\u67e5\u7406\u7531\u591a\u4e3a\u5957\u8bdd\uff1b\u516c\u5f00\u526f\u672c\u5728
+    590a346 \u4ece\u672a\u8fdb\u5165\u804a\u5929\u3002\n\nOf 250 lessons the reviewer
+    auto-widened, 48 should not stay public as written; reasons are mostly boilerplate;
+    at 590a346 the public copies never reached a chat.", "body": "Read-only export
+    of the live store (590a346), 2026-11-23: 565 lessons (310 self, 255 public copies);
+    306 Widen reviews: 250 auto-passed, 53 forwarded (5 approved, 1 rejected, 47 open),
+    3 revise. gemini-4-argon made 308 of 313 verify calls. Astra (gpt-6.2-astra, xhigh)
+    reviewed all 297 auto-passed or open items; Opus checked the four items that needed
+    source context locally, without sending source text to an outside model.\n\nResults:
+    auto-passed 202 keep, 7 retract, 41 rewrite; open 28 approve, 2 reject, 17 approve
+    after rewrite. Fifteen open items are reviewer call failures (10 were HTTP 524),
+    not judgements.\n\nFailure pattern: the reviewer looks for explicit identifiers
+    (232 of 250 reasons mention time, 173 list time, relationship and event together)
+    but does not check whether acquaintances could reassemble the event, never reasons
+    about what the original teller would mind, and passes lessons that label people,
+    turn someone''s private life into a social technique, treat bypassing safety limits
+    as a lesson, or treat privately discussed research as public knowledge. Verdict::parse
+    folds unclear output into ''forward to owner'', and the raw output is not stored.\n\nExposure:
+    chat recall at 590a346 passes include_lessons: false and privacy::recall reads
+    lessons only for a solo audience, so the public copies gained permission but were
+    never said in a chat.\n\nSummary: docs/reviews/2026-11-23/lessons-widen-review.md.
+    Per-item list (paraphrases private chats, gitignored): data/reviews/2026-11-23-lessons-widen.md.",
+    "links": [{"relation": "challenges", "target_type": "note", "target_id": "n-agli-dec-widen"},
+    {"relation": "relates", "target_type": "ticket", "target_id": "new:lessons"},
+    {"relation": "relates", "target_type": "ticket", "target_id": "new:r10"}]}}, {"op":
+    "note_update", "note_id": "n-agli-dec-hands", "fields": {"title": "Delegation:
+    Claude Code is the owner''s; core code goes through Moldloft (DSH and gate clauses
+    superseded 2026-11-23)", "summary": "2026-11-23 \u90e8\u5206\u88ab\u53d6\u4ee3\uff1aDSH
+    \u6761\u6b3e\u89c1 n-agli-dec-research-native\uff0c\u95f8\u95e8\u6267\u884c\u89c1
+    n-agli-dec-gate-retired\u3002Partly superseded 2026-11-23 (DSH clause, gate enforcement).\n\nClaude
+    Code \u53ea\u5f52\u4e3b\u4eba\u7528\uff0cAGLI \u4e0d\u8c03\u7528\u3002DSH \u662f\u4e3b\u8981\u7684\u53ef\u7f16\u7a0b\u5bf9\u8c61\uff0c\u5e38\u89c4\u7814\u7a76\u3001\u95f2\u901b\u548c\u5de5\u4f5c\u533a\u4efb\u52a1\u4ea4\u7ed9\u5b83\uff1bCodex
+    \u4f5c\u4e3a\u8fc7\u6e21\u8def\u5f84\u4fdd\u7559\u3002\u6d89\u53ca\u6838\u5fc3\u4ee3\u7801\u7684\u5de5\u4f5c\u8d70
+    Moldloft \u8f85\u52a9\u5c42\uff1aAGLI \u53ea\u63d0\u4ea4\u5de5\u5355/\u63d0\u6848\uff0c\u4e3b\u4eba\u5ba1\u9605\u540e\u518d\u52a8\u624b\u3002\u53ea\u6709
+    Astra \u548c Opus \u80fd\u76f4\u63a5\u5199\u6838\u5fc3\u4ee3\u7801\uff1bdeepseek-v4.1-flash-1017
+    \u53ea\u80fd\u505a\u7531 Astra \u6216 Opus \u6307\u5bfc\u7684\u826f\u5b9a\u4e49\u4efb\u52a1\u3002\n\nClaude
+    Code is reserved for the owner. DSH is the main programmable hand for routine
+    research, browsing and workspace tasks; Codex stays as a transitional path. Core-code
+    work goes through the Moldloft layer as reviewed tickets/proposals. Only Astra
+    and Opus write core code directly; deepseek-v4.1-flash-1017 only for well-defined
+    tasks directed by Astra or Opus.", "body": "Layers, from AGLI outward:\n\n1. AGLI
+    (persona) talks and dispatches; never executes (n-agli-dec-two-layer).\n2. DSH
+    is his main hand and the main programmable target (owner decision 2026-11-01):
+    routine research, browsing and workspace tasks. Invoked as `dsh --profile <AGLI
+    profile> headless` with the prompt on stdin, `--json` run events and `--session-id`
+    to resume; each task kind''s tool allowlist lives in a profile patch layer and
+    must be enforced by DSH, not by the prompt. It runs isolated (separate user, WSL
+    or container) and writes only in the task dir. Codex (subprocess, --sandbox workspace-write,
+    --search) stays as a transitional path until DSH covers the same tasks; whether
+    Codex is then reached through DSH is evaluated in #39. Only owner-approved tasks
+    reach delegation; requests from others become review items.\n3. Moldloft is the
+    auxiliary layer for core code (src/, L3 and up): AGLI may file tickets and submit
+    ticket/note proposals through Moldloft MCP, with evidence and a scoped spec. He
+    gets no approval tool; the owner reviews and decides who implements.\n4. Claude
+    Code is the owner''s tool. AGLI does not invoke the claude CLI at all; that quota
+    and authority stay with the owner.\n\nCore-code writer allowlist (enforced in
+    delegation code, not by prompt):\n- Astra (gpt-6-astra via Codex) and Opus (via
+    the owner''s Claude Code) may write core code directly, after owner approval of
+    the Moldloft ticket.\n- deepseek-v4.1-flash-1017 only for well-defined tasks,
+    meaning tasks directed by an advanced model: Astra or Opus writes the plan, names
+    files, interfaces and deciding tests, and reviews the diff before the owner sees
+    it. On ambiguity the directed model stops and hands back.\n- Any other model may
+    read and propose, never write core code.\nThe working rule lives in the root AGENTS.md
+    so every coding agent sees it.\n\nConsequences: ticket 22 (re-enable claude for
+    research) becomes removing the claude path from src/hands/delegate.rs. AGLI''s
+    hands only write in work/tasks/<id>/, so the allowlist is enforced where core
+    code is actually changed: the evolution gate (ticket 26). The L3 row of DESIGN
+    section 6 routes proposals through Moldloft review.\n\nUpdate 2026-11-01: DSH
+    replaces Codex as the main hand (#25). Token source and budget for DSH runs are
+    the owner''s call: n-agli-q-dsh-tokens.\n\nUpdate 2026-11-23: superseded in part.
+    Layer 2 (DSH as the main hand and programmable target) is replaced by n-agli-dec-research-native:
+    research uses the native worker, parked for now, and DSH is closed. Enforcing
+    the allowlist ''in the evolution gate (ticket 26)'' is replaced by n-agli-dec-gate-retired:
+    the owner upholds it by assigning writers and reviewing diffs. The rest stands:
+    AGLI does not invoke claude, core code goes through Moldloft, and the writer allowlist
+    lives in root AGENTS.md.", "links": [{"relation": "relates", "target_type": "note",
+    "target_id": "n-agli-dec-two-layer"}, {"relation": "relates", "target_type": "ticket",
+    "target_id": 22}, {"relation": "relates", "target_type": "ticket", "target_id":
+    25}, {"relation": "relates", "target_type": "ticket", "target_id": 26}, {"relation":
+    "relates", "target_type": "note", "target_id": "n-agli-dec-research-native"},
+    {"relation": "relates", "target_type": "note", "target_id": "n-agli-dec-gate-retired"}]}},
+    {"op": "ticket_update", "ticket_id": 26, "fields": {"status": "closed", "description":
+    "Owner disposition \u2014 2026-11-23: retired. The owner accepted the deletion
+    of the evolution gate in 0fe9648 (n-agli-dec-gate-retired). Core code ships through
+    Git and ops/deploy.ps1. Closed, not done: none of the re-acceptance items below
+    was met, and none remains in scope.\n\nOwner disposition \u2014 2026-11-15: return
+    the evolution feature to rework; the owner judged its current completion inadequate.
+    The earlier Done status is no longer accepted. Rework the end-to-end feature rather
+    than treating A04 as an isolated ancestor-check patch.\n\nRequired re-acceptance
+    scope:\n1. Pin the current running release identity/base at candidate preparation;
+    reject candidates that omit it. Recheck lineage and release drift at approval/commit/handoff,
+    and review the complete diff relative to the active release. Cover stale bases,
+    two unmerged evolutions and a release changed after checking.\n2. Unify evolution/manual
+    deployment runtime identity: release pointer, process identity, PID/log receipt
+    and data root. A successful evolution must remain manageable by the next normal
+    manual restart/deploy, including PID reuse protection and custom data_dir handling.\n3.
+    Perform candidate/executable/hash/path preflight before stopping a healthy process.
+    Preserve truthful pending/running/failed outcomes; a failed handoff must not leave
+    a pointer falsely implying the new version is running. Define recovery explicitly
+    without blind replay of unknown effects.\n4. Revalidate cancellation/freeze/shutdown
+    across checking, build trees, commit and restart, in coordination with A06''s
+    independent backend master switch. Existing serial command handling is not immediate-stop
+    evidence.\n5. Refresh EVOLUTION/DEPLOY/DESIGN contracts and add synthetic end-to-end
+    and failure-injection acceptance. Preserve the existing writer allowlist, owner-only
+    approval, exact approved tree, scope/path protections and immutable evidence.\n\nOnly
+    mark Done after the feature-level evidence and owner re-acceptance. No runtime
+    switch, rollout, L4 edit or writer assignment is performed by this maintenance
+    entry. #27 OS write isolation remains separately parked by the owner and is not
+    silently reactivated.\n\nOriginal implementation scope (historical, retained):\nImplement
+    evolution/gate.rs: proposals enter through Moldloft (ticket or proposal; AGLI
+    has no approval tool), owner picks the implementer, changes are applied in a sandbox
+    worktree, cargo build + cargo test + evals, judge (evolve), owner approval in
+    chat, commit and restart.\n\nThe gate enforces the core-code writer allowlist
+    from the root AGENTS.md: gpt-6-astra and Opus write directly; deepseek-v4.1-flash-1017
+    only on tasks directed by Astra or Opus (director''s plan, file scope, deciding
+    tests, director review of the diff recorded with the proposal); anything else
+    is rejected before build. Record the writer model and the director in the proposal
+    record."}}, {"op": "ticket_update", "ticket_id": 25, "fields": {"status": "closed",
+    "description": "Owner disposition \u2014 2026-11-23: closed. Research uses the
+    native worker, parked until upstream APIs are stable, instead of DSH; the owner
+    considers DSH''s own instability the biggest obstacle to development (n-agli-dec-research-native).
+    Follow-up: the ticket ''Plan the research executor before re-enabling research''.
+    The record below is historical.\n\nOwner decision 2026-11-01: DSH, not Codex,
+    is the main programmable target for AGLI''s hands (research, browsing, workspace
+    tasks). The Codex path stays as it is until DSH covers it.\n\nInstalled: C:/dev/DSH
+    (desktop app); CLI 0.2.1-rc.5 at C:/dev/DSH/resources/runtime/cli/bin/dsh.cmd;
+    profiles desktop, headless and web under ~/.dsh/profiles. `dsh --profile headless`
+    answers one task given as arguments or on stdin (`-`), `--json` writes newline-delimited
+    run events, and `--session-id` resumes a persisted Session. This maps onto hands/delegate.rs:
+    prompt on stdin, timeout, resume.\n\nRemaining:\n- A dedicated AGLI profile (patch
+    layer) with an explicit tool allowlist per task kind. Verify the allowlist is
+    enforced by DSH, not only stated in the prompt (the superagent prototype ran danger-full-access).\n-
+    Where it runs: DESIGN section 6 requires a separate user, WSL or container, writing
+    only work/tasks/*/scratch/. Related: #27.\n- A hard token/cost cap, and reading
+    usage from the --json events. Owner decision 2026-11-01 (n-agli-q-dsh-tokens):
+    a dedicated Bailian key held only in the AGLI DSH profile, daily cap (CNY 20)
+    parked because Bailian has no official per-key limit; record usage from --json
+    events, do not block runs.\n- Timeout, stop and /freeze terminate the run, including
+    background jobs.\n- Check whether --json events carry tool calls and their targets,
+    so AGLI can verify results against what was actually fetched or read.\n- First
+    task: read-only browsing (web_search/web_fetch only). See work/tasks/social-browsing-research/report.md."}},
+    {"op": "ticket_update", "ticket_id": 27, "fields": {"title": "Filesystem write
+    protection for L4 (boundaries, config)", "tech_notes": "Parked by the owner 2026-11-02;
+    do not raise again until the owner picks it up.\n\n2026-11-23: the evolution gate
+    is retired (n-agli-dec-gate-retired), so L4 is config/ and boundaries. Still parked
+    by the owner."}}, {"op": "ticket_update", "ticket_id": 5, "fields": {"tech_notes":
+    "2026-11-15 owner audit follow-up: A01/A02: the owner requested design reconciliation
+    before selecting a privacy/growth fix; see n-agli-q-growth-deidentification. This
+    historical implementation completion does not establish the derived-text disclosure
+    contract.\n\n2026-11-15 re-acceptance \u2014 Acceptance failed. The weekly narrative,
+    bounded drift, changelog and weekly gate pass growth/tests.rs::weekly_persisted_gate_caps_seed_changelog_and_effective_personality.
+    Original weekly delivery fails in a supported configuration: growth::weekly and
+    reflect::write_journal select LocalOnly whenever any local chat model is available.
+    With the shipped Q5 model, consolidate requires Q6 and cannot run (A22 router
+    probe). Restore a feasible, privacy-preserving journal/growth path and explicitly
+    handle restricted material when no legal processor exists. Validate the real configured
+    router in both local-available and unavailable cases. #28 owns the probe-specific
+    acceptance. The A01/A02 abstraction decision remains open in #84.\n\n2026-11-23
+    owner triage (n-agli-dec-triage-20261123): growth.rs was deleted in 0fe9648. Restore
+    simplified: bounded numeric/style deltas with source IDs and versions, revertible;
+    no free text into L1; the narrative stays private. Blocked by #84 (which fields
+    may change automatically is undecided) and by the 463363c release blockers."}},
+    {"op": "ticket_update", "ticket_id": 28, "fields": {"tech_notes": "\n\nDependency
+    adjusted 2026-11-02 (Opus): #26 -> #28 replaced by #5 -> #28. The probes watch
+    the L2 persona drift that #5 applies weekly; they do not need the L3 code gate.
+    If the gate later wants probes as evals, it can consume them.\n\n2026-11-15 re-acceptance
+    \u2014 Acceptance failed. Original requirement: periodic fixed prompts compared
+    over time. src/mind/probes.rs PROMPTS/weekly persist five answers, baseline/current
+    scores and low-score review after weekly growth; mind::probes::tests::baseline_low_score_once_approval_latest_and_week_gate
+    covers week gating, comparison and rebaseline; agli::tests::persona_probe_approve_rebaselines_latest_and_reject_preserves_baseline
+    covers owner disposition. Linked dependency adjustment explicitly concerns L2
+    growth, not #26 gate readiness; no claim of full privacy/growth acceptance. However
+    original periodic operation fails for a supported available-local-model setup:
+    probes::weekly line 47 chooses LocalOnly on has_local, then asks the fixed remote/vision
+    chat route. Audit A22 and docs/reviews/2026-11-15/REVIEW.md:125 production-Router
+    probe prove no eligible local chat candidate, and nightly journal failure may
+    prevent reaching probes. Stub test lacks real routing. Reopen periodic-probe feature
+    for scenario-compatible routing; privacy/growth design remains separate #84.\n\n2026-11-23
+    owner triage: probes.rs was deleted in 0fe9648. Restore with #5; run when the
+    persona version changes rather than weekly; judge boundary questions separately;
+    bind approvals to that run''s answers. The live store has no probe review items."}},
+    {"op": "ticket_update", "ticket_id": 84, "fields": {"tech_notes": "A01: growth::weekly
+    -> free-text overlay -> global L1. A02: solo decision reason -> owner chat. These
+    paths are audit evidence; treatment of safe abstraction remains unresolved. Related
+    historical implementation: #5, #20, #28. Question note: n-agli-q-growth-deidentification.\n\n2026-11-15
+    design review \u2014 n-agli-q-growth-deidentification now includes a proposed
+    source/artifact/audience/processor matrix and synthetic direct, indirect, combined,
+    and allowed-growth examples. Design selection remains with the owner.\n\n2026-11-23:
+    still undecided by the owner. #5 now depends on this ticket: the minimal growth
+    design in n-agli-dec-triage-20261123 needs the list of fields that may change
+    without per-change approval. The live lessons review (n-agli-ev-lessons-widen-20261123)
+    is input for the widening side."}}, {"op": "edge_add", "blocker_id": 84, "blocked_id":
+    5}, {"op": "edge_add", "blocker_id": "new:blockers", "blocked_id": 5}, {"op":
+    "edge_add", "blocker_id": "new:blockers", "blocked_id": "new:lessons"}, {"op":
+    "edge_add", "blocker_id": "new:blockers", "blocked_id": "new:commitments"}, {"op":
+    "edge_add", "blocker_id": "new:blockers", "blocked_id": "new:groupobs"}, {"op":
+    "edge_add", "blocker_id": "new:executor", "blocked_id": "new:knowledge"}], "versions":
+    null}'
+  summary: 记录 2026-11-23 主人签字：Phase 0/5 功能取舍、进化闸门退役、研究执行器选 native 并搁置
+  rationale: '来源：docs/reviews/2026-11-23/FEATURE-TRIAGE.md 和 lessons-widen-review.md。新增
+    3 条决策和 2 条证据笔记；n-agli-dec-hands 标注部分被取代；#26、#25 结案，#27 缩小范围，#5 依赖 #84；新增上线阻断项（父工单加
+    6 个子工单）、其余审查发现，以及 lessons+Widen、commitments、群观察、flow、研究执行器、知识卡 6 张工单。不涉及代码和 L4
+    文件。'
+  status: applied
+  decision_note: ''
+  result_json: '{"graph_id": "default", "revision": 178, "created": {"new:blockers":
+    104, "new:r07": 105, "new:r01": 106, "new:r02": 107, "new:r14": 108, "new:r04":
+    109, "new:r10": 110, "new:remaining": 111, "new:lessons": 112, "new:commitments":
+    113, "new:groupobs": 114, "new:flow": 115, "new:executor": 116, "new:knowledge":
+    117, "n-agli-dec-triage-20261123": "n-agli-dec-triage-20261123", "n-agli-dec-gate-retired":
+    "n-agli-dec-gate-retired", "n-agli-dec-research-native": "n-agli-dec-research-native",
+    "n-agli-ev-refactor-review-20261123": "n-agli-ev-refactor-review-20261123", "n-agli-ev-lessons-widen-20261123":
+    "n-agli-ev-lessons-widen-20261123"}, "versions": {"ticket:5": 6, "ticket:25":
+    12, "ticket:26": 7, "ticket:27": 4, "ticket:28": 6, "ticket:84": 3, "ticket:104":
+    1, "ticket:105": 1, "ticket:106": 1, "ticket:107": 1, "ticket:108": 1, "ticket:109":
+    1, "ticket:110": 1, "ticket:111": 1, "ticket:112": 1, "ticket:113": 1, "ticket:114":
+    1, "ticket:115": 1, "ticket:116": 1, "ticket:117": 1, "note:n-agli-dec-hands":
+    2, "note:n-agli-dec-triage-20261123": 1, "note:n-agli-dec-gate-retired": 1, "note:n-agli-dec-research-native":
+    1, "note:n-agli-ev-refactor-review-20261123": 1, "note:n-agli-ev-lessons-widen-20261123":
+    1}, "anchors_created": [], "operations": [{"op": "ticket_create", "temp_id": "new:blockers",
+    "fields": {"title": "Make 463363c deployable on existing data (release blockers)",
+    "group_name": "Refactor 2026-11-22", "priority": "high", "description": "Gemini''s
+    six-phase refactor (590a346..463363c) passes tests and clippy, but deploying it
+    onto the live store would lose data or leave no bot running. Fix the child tickets
+    before deploying or restoring any deleted feature. Source: docs/reviews/2026-11-23/astra-code-review.md
+    (findings R01-R25, cross-checked by Opus) and docs/reviews/2026-11-23/FEATURE-TRIAGE.md.\n\nAcceptance:
+    on a mongodump copy of the live store, the deploy path migrates, starts and serves
+    with no lost episodes, task follow-ups or review state; a frozen instance stays
+    frozen when the flag cannot be read; Telegram attachments download through the
+    proxy.\n\nWriter: the owner assigns one under root AGENTS.md.", "tech_notes":
+    "Live store, read-only, 2026-11-23: 698 episodes, none archived; 47 open Widen
+    reviews; no Evolve or probe reviews. The live bot still runs 590a346 from the
+    xiaozhuang-20261103 runtime."}}, {"op": "ticket_create", "temp_id": "new:r07",
+    "fields": {"title": "Run a backed-up, verified migrate-bson step before switching
+    releases (R07)", "group_name": "Refactor 2026-11-22", "priority": "high", "description":
+    "The new build refuses the legacy Mongo schema at startup, but ops/deploy.ps1
+    and DEPLOY.md write the new release pointer and stop the old bot first, so a normal
+    deploy ends with no bot running. migrate-bson --apply has no backup step.\n\nAdd
+    a read-only schema preflight before switching. When migration is needed: stop
+    both writers (bot and stickers-web), mongodump, migrate, verify the round trip
+    on a copy, then switch the pointer and check readiness. Also fold in R08 (unknown
+    or retired subcommands such as import-jsonl must exit non-zero instead of starting
+    the bot) and R24 (deploy -Commit 590a346 fails because it always builds the stickers-web
+    bin).", "tech_notes": "src/store/mod.rs:412; ops/deploy.ps1:22, :50, :69; ops/start-bot.ps1:26;
+    src/main.rs:26, :68; src/store/migrate.rs:73, :158.", "parent_id": "new:blockers"}},
+    {"op": "ticket_create", "temp_id": "new:r01", "fields": {"title": "Keep Episode.sources
+    and archive state through migrate-bson (R01)", "group_name": "Refactor 2026-11-22",
+    "priority": "high", "description": "migrate-bson round-trips legacy Episode records
+    through the new struct and drops sources, and the new episodes() returns archived
+    originals to recall. No episode is archived in the live store yet (2026-11-23),
+    so nothing is lost today, but the field and the archive state must survive before
+    archiving comes back.\n\nAcceptance: a legacy fixture with a summary and its originals
+    keeps the same effective recall set after migration, and running the migration
+    twice changes nothing.", "tech_notes": "src/store/migrate.rs:176, :227, :284;
+    src/store/mongo.rs:326. The current migration test asserts that the field disappears.",
+    "parent_id": "new:blockers"}}, {"op": "ticket_create", "temp_id": "new:r02", "fields":
+    {"title": "Import legacy followups.md into task records (R02)", "group_name":
+    "Refactor 2026-11-22", "priority": "high", "description": "Board import reads
+    only board.yaml. Owner follow-ups stored in work/tasks/<id>/followups.md are dropped,
+    so /run executes the original title and can still pass review.\n\nImport them
+    idempotently and restore the consumed position from reviewed_followups_bytes.
+    Follow-ups that cannot be matched stay unprocessed.", "tech_notes": "src/work/board.rs:56,
+    :64; src/store/mod.rs:350; src/work/mod.rs:155. An offline probe reproduced an
+    empty import.", "parent_id": "new:blockers"}}, {"op": "ticket_create", "temp_id":
+    "new:r14", "fields": {"title": "Route Telegram file downloads through TELEGRAM_PROXY
+    (R14)", "group_name": "Refactor 2026-11-22", "priority": "high", "description":
+    "getFile uses the configured proxy, but the file download goes through urls::download
+    with no_proxy. Where Telegram is reachable only through the proxy, chat works
+    and attachments fail.\n\nKeep the proxy for Telegram''s trusted file endpoint,
+    keep destination checks on redirects, and add a proxy fixture over the real download
+    branch.", "tech_notes": "src/channels/telegram.rs:121, :130; src/channels/urls.rs:55.",
+    "parent_id": "new:blockers"}}, {"op": "ticket_create", "temp_id": "new:r04", "fields":
+    {"title": "Fail closed when the frozen flag cannot be read (R04)", "group_name":
+    "Refactor 2026-11-22", "priority": "high", "description": "ControlPlane::load
+    treats a read error or a wrong type as not frozen, so a frozen instance can resume
+    proactive work after a restart. /freeze also holds the admission lock and must
+    write Mongo before it closes admission and cancels work.\n\nKeep the bot disabled,
+    or abort startup, when the flag cannot be read. On /freeze, close local admission
+    and cancel first, then report persistence and termination separately.", "tech_notes":
+    "src/control.rs:199, :212, :223; src/bot/ingress.rs:82. Related: #87 (A06).",
+    "parent_id": "new:blockers"}}, {"op": "ticket_create", "temp_id": "new:r10", "fields":
+    {"title": "Close or migrate legacy Widen review items before deploying (R10)",
+    "group_name": "Refactor 2026-11-22", "priority": "medium", "description": "463363c
+    removed the Widen branch of /approve, so approving a legacy item replies ''\u8bb0\u4e0b\u4e86''
+    and does nothing. The live store has 47 open Widen items and no Evolve or probe
+    items.\n\nBefore deploying, migrate them into the restored Widen flow or close
+    them with a recorded outcome. Retired review kinds must be rejected, not marked
+    Approved.\n\nPer-item recommendations (28 approve, 2 reject, 17 approve after
+    rewrite): data/reviews/2026-11-23-lessons-widen.md, which is gitignored because
+    it paraphrases private chats. Approving on 590a346 today has no conversational
+    effect, because public lessons have no chat reader.", "tech_notes": "src/bot/commands.rs:128,
+    :226, :247. Evidence: n-agli-ev-lessons-widen-20261123.", "parent_id": "new:blockers"}},
+    {"op": "ticket_create", "temp_id": "new:remaining", "fields": {"title": "Fix the
+    remaining 463363c review findings", "group_name": "Refactor 2026-11-22", "priority":
+    "medium", "description": "Not release blockers, but fix them before or soon after
+    deploying 463363c. Details and suggested fixes: docs/reviews/2026-11-23/astra-code-review.md.\n\n-
+    R03: /stop races task admission (P2 after Opus review).\n- R05: task workers do
+    not validate the full path from the trusted root; junctions can escape the task
+    directory.\n- R06: Anthropic-compatible requests omit the output schema, so structured
+    calls through the Gemini relay can fail to parse.\n- R09: active task titles enter
+    every chat prompt without an audience check.\n- R13: Speaker keeps unsent drafts
+    in the conversation history.\n- R15: task state transitions do not check the expected
+    previous state.\n- R16: the reflection watermark skips messages that share a millisecond.\n-
+    R19: the unbounded relay can delay control events behind ordinary traffic.\n-
+    R23: chat recall loads all episodes, and the urgent check loads full reviews.\n-
+    R25: README, DEPLOY and skill-line docs have drifted.\n\nTracked elsewhere: R01,
+    R02, R04, R07, R08, R10, R14, R24 under the release-blocker ticket; R11 in #86;
+    R17 in #95; R18 in #94; R20-R22 in the research-executor ticket; R12 in n-agli-dec-triage-20261123.\n\nWriter:
+    the owner assigns one under root AGENTS.md.", "tech_notes": ""}}, {"op": "ticket_create",
+    "temp_id": "new:lessons", "fields": {"title": "Restore lessons and Widen with
+    a chat reader and revocable public copies", "group_name": "Memory", "priority":
+    "medium", "description": "Owner sign-off 2026-11-23: restore lessons and Widen
+    together. At 590a346 only solo thinking and the journal read lessons, and only
+    with a local model; chat recall passed include_lessons: false, so the 255 public
+    copies never reached a conversation. Restoring therefore includes building the
+    first chat reader.\n\nDesign changes from the live-data review (n-agli-ev-lessons-widen-20261123):\n1.
+    Auto-pass only on an allowlist: group-sourced, low-sensitivity lessons that stand
+    on their own without the original event. Always send to the owner: private-chat
+    sources; identifiable health, relationship, family, finance or workplace-conflict
+    content; group nicknames or jokes; unpublished research; anything that guesses
+    someone''s wishes. Stop lessons that encourage deception, mockery or bypassing
+    permissions at the private stage.\n2. Make the judgement checkable. Verify answers
+    three questions: which two clues would let an acquaintance recognize the source;
+    what the original teller might mind; whether it labels people or encourages misconduct.
+    The review obeys processing policy instead of ProcessingPolicy::Any. Record forwarded,
+    call failure, unparseable output and verdict/reason mismatch separately, with
+    the raw output. For each new model or prompt version, compare 50 items by hand,
+    then sample 20% of auto-passes. These are starting values, not proven thresholds.\n3.
+    Make copies revocable before any chat reader. A pass creates one derived item
+    bound to source, text version, audience and processing policy; a rewrite approves
+    only the new text; revocation also clears search indexes and session caches.\n\nAcceptance:
+    a synthetic private chat yields a private lesson; after review only the public
+    copy enters a group-chat prompt; restricted source text, review reasons and revoked
+    copies never enter that prompt. Cover a processor change, a restart reload and
+    the no-reviewer case.\n\nExisting data: keep the lessons collection. 48 of the
+    250 auto-passed public copies should not stay public as written (7 retract, 41
+    rewrite); retire them before the chat reader goes live. Per-item list: data/reviews/2026-11-23-lessons-widen.md
+    (gitignored).\n\nWriter: the owner assigns one under root AGENTS.md.", "tech_notes":
+    "590a346: src/mind/reflect.rs:95-210, :376 (widened), :412; src/social/privacy.rs:141;
+    src/agli.rs:1371, :2495; src/mind/judge.rs. Deleted in 0fe9648. Related: #84,
+    #85, n-agli-dec-widen."}}, {"op": "ticket_create", "temp_id": "new:commitments",
+    "fields": {"title": "Restore commitments as an input to solo decisions", "group_name":
+    "Memory", "priority": "medium", "description": "Owner sign-off 2026-11-23 (n-agli-dec-triage-20261123).
+    At 590a346, commitments rode on the extract call and decide read up to five items
+    due within three days; deleted in 0fe9648.\n\nMinimal version: record only explicit
+    promises (quoted wording, target, due date, state), updated per target. Proactive
+    outreach passes decide only the target and the action; the wording uses only material
+    that target may see.\n\nAcceptance: a promise made in a synthetic private chat
+    appears in solo decision when it is due; when he reaches out to the owner, the
+    wording contains nothing from other private chats.\n\nData: keep agenda:commitments
+    and check scopes before reading it again.\n\nWriter: the owner assigns one under
+    root AGENTS.md.", "tech_notes": "590a346: src/mind/commitments.rs; src/mind/decide.rs:53-137.
+    Audit A02 leak path closed by the fixed opening in 31dab7b."}}, {"op": "ticket_create",
+    "temp_id": "new:groupobs", "fields": {"title": "Learned group observations: confirm
+    scope and design gaps, then restore", "group_name": "Social", "priority": "low",
+    "description": "Owner sign-off 2026-11-23: restore learned group observations,
+    but first write down what the feature should do and settle its open design questions.
+    At 590a346 they rode on the extract call and fed the group prompt; deleted in
+    0fe9648. Today the group prompt reads the hand-written card mind/social/groups/<id>.md
+    and the owner-maintained lexicon (#80).\n\nQuestions to settle first:\n- Which
+    observations are learned: norms, roles, running topics?\n- May model-inferred
+    norms enter the group prompt directly, or only as lexicon entries the owner confirms?\n-
+    How are one group''s observations kept out of other chats?\n- How does relation
+    inference, which stays parked, stay out?\n\nData: keep the groups and relations
+    collections.", "tech_notes": "590a346: src/social/groups.rs, src/social/cards.rs;
+    read in who_section (src/agli.rs:1404)."}}, {"op": "ticket_create", "temp_id":
+    "new:flow", "fields": {"title": "Flow: busy-time reply continuation (parked)",
+    "group_name": "Orchestration", "priority": "low", "description": "Owner sign-off
+    2026-11-23: keep flow / flow_metrics (deleted in 0fe9648) as a TODO. Hands v2
+    already covers background work, numbered follow-ups and /stop. What remains is
+    replying later when busy and continuing afterwards, interruptible by the owner.
+    Until this is picked up, DESIGN section 4 should keep only prompt layering and
+    cache-prefix discipline.\n\nThe audience leak of task titles (R09) is a bug in
+    the remaining 463363c findings, not part of this ticket.", "tech_notes": "590a346:
+    src/mind/flow.rs, src/mind/flow_metrics.rs."}}, {"op": "ticket_create", "temp_id":
+    "new:executor", "fields": {"title": "Plan the research executor before re-enabling
+    research (native chosen)", "group_name": "Hands", "priority": "low", "description":
+    "Owner decision 2026-11-23 (n-agli-dec-research-native): the native ResearchWorker
+    replaces DSH, but research stays parked until the upstream APIs are stable, and
+    the executor needs its own plan first. The owner considers DSH''s own instability
+    the biggest obstacle to development.\n\nBefore re-enabling: fix R20 (config research:
+    dsh is silently treated as native and reads DEEPSEEK_API_KEY), R21 (a revise verdict
+    does not trigger re-planning; legacy DSH source files are skipped) and R22 (the
+    fetch service''s HTTP status is recorded as the target page''s status). Migrate
+    executor config and credentials explicitly, with an upgrade preflight that reports
+    the real backend and required variables.\n\nKnowledge cards wait for this ticket.",
+    "tech_notes": "src/config.rs:323, :337; src/work/research.rs:130, :150, :159;
+    src/work/research/sources.rs:93, :196; src/hands/reader/web.rs:163; config/runtime.yaml:32
+    (L4, owner-only)."}}, {"op": "ticket_create", "temp_id": "new:knowledge", "fields":
+    {"title": "Knowledge cards: cite earlier research results in later answers", "group_name":
+    "Memory", "priority": "low", "description": "Owner sign-off 2026-11-23: after
+    the research executor. Do not restore the 547-line clusterer from 590a346: knowledge.rs
+    had no reader, and its claims.yaml input came from DSH. Build per-task claim cards
+    with sources plus a reader, so a later question can cite the relevant card (DESIGN
+    section 9 acceptance).\n\nData: leave knowledge:checkpoint and knowledge/notes
+    unread until their scopes are checked.", "tech_notes": "590a346: src/mind/knowledge.rs
+    (deleted in 0fe9648)."}}, {"op": "note_create", "id": "n-agli-dec-triage-20261123",
+    "fields": {"title": "Feature triage after the Gemini refactor (owner sign-off
+    2026-11-23)", "kind": "decision", "state": "accepted", "summary": "\u4e3b\u4eba
+    2026-11-23 \u7b7e\u5b57\uff1a\u6062\u590d lessons + Widen\u3001commitments\u3001\u5b66\u4e60\u578b\u7fa4\u89c2\u5bdf\uff1b\u5468\u6210\u957f\u548c\u63a2\u9488\u7b49
+    #84\uff1b\u77e5\u8bc6\u5361\u6392\u5728\u7814\u7a76\u6267\u884c\u5668\u4e4b\u540e\uff1breciprocity
+    \u548c\u4eba\u7269\u5361\u5bfc\u51fa\u5220\u9664\uff1bflow\u3001\u5411\u91cf\u53ec\u56de\u3001watchlist
+    \u8bb0\u5f85\u529e\uff1b\u8fdb\u5316\u95f8\u95e8\u9000\u5f79\uff1b\u7814\u7a76\u6267\u884c\u5668\u9009
+    native \u5e76\u6401\u7f6e\u3002\n\nOwner sign-off 2026-11-23 on the features Gemini
+    deleted in 0fe9648 and replaced in 463363c: restore lessons+Widen, commitments
+    and learned group observations; growth and probes wait for #84; knowledge cards
+    follow the research executor; delete reciprocity and person-card export; park
+    flow, embeddings and watchlist; retire the gate; research goes native and is parked.",
+    "body": "Source: docs/reviews/2026-11-23/FEATURE-TRIAGE.md (Opus and Astra assessed
+    each feature independently, then merged). Features without an owner change follow
+    the merged recommendation.\n\n| Feature | Disposition |\n|---|---|\n| Weekly growth
+    (#5) | Restore simplified: bounded numeric/style deltas (about \u00b10.02 a week,
+    \u00b10.15 in total) with source IDs and versions, revertible; no free text into
+    L1; the narrative stays private. Waits for #84. |\n| Persona probes (#28) | Restore
+    with #5; run when the persona version changes; judge boundary questions separately;
+    bind approvals to that run''s answers. |\n| Knowledge cards | New feature after
+    the research executor, not the old clusterer. |\n| Reciprocity | Delete the scorer.
+    Evidence-backed help or broken promises may go into person facts, with no scoring
+    call. |\n| Person-card export | Delete; build a read-only page later if needed.
+    |\n| Learned group observations | Restore (owner changed the ''park'' recommendation)
+    after confirming scope and design gaps. |\n| Archive and Episode.sources | Keep
+    sources through migration (release blocker); model summaries can wait until a
+    backlog appears. |\n| Episode embeddings | TODO: collect missed-recall cases first.
+    |\n| Watchlist | Park. A later minimal version: explicit subscriptions with one
+    reminder when due, no automatic paid research. |\n| Commitments | Restore explicit
+    promises as a solo-decision input. |\n| Lessons and Widen | Restore together,
+    including the first chat reader. |\n| Evolution pipeline | Retired: n-agli-dec-gate-retired.
+    |\n| flow / flow_metrics | TODO (owner changed the ''keep deleted'' recommendation).
+    |\n| Research executor | Native chosen, parked: n-agli-dec-research-native. |\n\nOrder:
+    release blockers first; then lessons+Widen and commitments (which goes first is
+    still the owner''s call); then learned group observations. Growth and probes start
+    after #84. Knowledge cards follow the executor.\n\nData: until each feature is
+    settled, stop writing the old collections but do not delete them (lessons, relations,
+    groups, embeddings, agenda:commitments, life:watchlist, persona_probe_*, knowledge:checkpoint).
+    Do not reconnect the old drift.yaml, probe changelog or raw delegate logs directly;
+    they could give private experience new readers. Run mongodump before any migration
+    and verify the round trip on a copy.\n\nStill undecided: #84, which growth fields
+    may change automatically.", "links": [{"relation": "relates", "target_type": "ticket",
+    "target_id": 5}, {"relation": "relates", "target_type": "ticket", "target_id":
+    28}, {"relation": "relates", "target_type": "ticket", "target_id": 84}, {"relation":
+    "relates", "target_type": "ticket", "target_id": "new:blockers"}, {"relation":
+    "relates", "target_type": "ticket", "target_id": "new:lessons"}, {"relation":
+    "relates", "target_type": "ticket", "target_id": "new:commitments"}, {"relation":
+    "relates", "target_type": "ticket", "target_id": "new:groupobs"}, {"relation":
+    "relates", "target_type": "ticket", "target_id": "new:flow"}, {"relation": "relates",
+    "target_type": "ticket", "target_id": "new:executor"}, {"relation": "relates",
+    "target_type": "ticket", "target_id": "new:knowledge"}, {"relation": "relates",
+    "target_type": "note", "target_id": "n-agli-dec-gate-retired"}, {"relation": "relates",
+    "target_type": "note", "target_id": "n-agli-dec-research-native"}]}}, {"op": "note_create",
+    "id": "n-agli-dec-gate-retired", "fields": {"title": "The in-process evolution
+    gate is retired; L4 is config/ and boundaries", "kind": "decision", "state": "accepted",
+    "summary": "\u4e3b\u4eba 2026-11-23 \u7b7e\u5b57\u63a5\u53d7 0fe9648 \u5220\u9664
+    gate.rs\uff1abot \u4e0d\u518d\u81ea\u5df1\u63d0\u4ea4\u3001\u53d1\u5e03\u6216\u91cd\u542f\uff1b\u6838\u5fc3\u4ee3\u7801\u8d70
+    Moldloft \u2192 \u4e3b\u4eba\u6307\u5b9a\u5b9e\u73b0\u8005 \u2192 Git \u2192 ops/deploy.ps1\uff1bL4
+    \u53ea\u5269 config/ \u548c boundaries\uff0c\u6062\u590d\u95f8\u95e8\u672c\u8eab\u662f\u4e3b\u4eba\u53d1\u8d77\u7684
+    L4 \u53d8\u66f4\u3002\n\nThe owner accepted the deletion of src/evolution/gate.rs
+    in 0fe9648. The bot no longer commits, publishes or restarts itself; core code
+    goes through Moldloft, an owner-assigned writer, Git and ops/deploy.ps1. L4 is
+    config/ and boundaries.", "body": "Retired with the gate: src/evolution/{gate,process,restart}.rs
+    and src/agli/evolution.rs. /evolve and /evolve-status reply ''\u6682\u672a\u5f00\u653e''.\n\nCore
+    code (L3): AGLI or anyone files a Moldloft ticket or proposal; the owner assigns
+    a writer under root AGENTS.md; the writer builds and tests in their own environment;
+    the owner reviews the diff; Git commit; ops/deploy.ps1. The writer allowlist is
+    upheld by the owner''s assignment and review, not by code. Bringing any in-process
+    gate back is itself an L4 change the owner starts.\n\nDocs synced 2026-11-23:
+    AGENTS.md, DESIGN sections 2a/6/9, EVOLUTION.md, README.md, DEPLOY.md, CONFIG.md.
+    The live store has no legacy Evolve review items. #27 (OS write protection) keeps
+    its narrower scope and stays parked.", "links": [{"relation": "relates", "target_type":
+    "ticket", "target_id": 26}, {"relation": "relates", "target_type": "ticket", "target_id":
+    27}, {"relation": "relates", "target_type": "note", "target_id": "n-agli-dec-hands"}]}},
+    {"op": "note_create", "id": "n-agli-dec-research-native", "fields": {"title":
+    "Research executor: native, parked until upstream APIs are stable; DSH closed",
+    "kind": "decision", "state": "accepted", "summary": "\u4e3b\u4eba 2026-11-23 \u51b3\u5b9a\uff1a\u7814\u7a76\u6267\u884c\u5668\u9009
+    native \u800c\u4e0d\u662f DSH\uff1b\u4e0a\u6e38 API \u4e0d\u7a33\u5b9a\uff0c\u5148\u6401\u7f6e\u4e3a\u5f85\u529e\uff0c\u6267\u884c\u5668\u53e6\u4f5c\u6253\u7b97\u3002\u4e3b\u4eba\u8ba4\u4e3a
+    DSH \u672c\u8eab\u7684\u4e0d\u7a33\u5b9a\u662f\u5f00\u53d1\u7684\u6700\u5927\u963b\u788d\u3002\u53d6\u4ee3
+    n-agli-dec-hands \u4e2d DSH \u4e3a\u4e3b\u8981\u53cc\u624b\u7684\u6761\u6b3e\u3002\n\nOwner
+    decision 2026-11-23: research uses the native worker, not DSH, and stays parked
+    until upstream APIs are stable; the executor needs its own plan. Supersedes the
+    DSH-as-main-hand clause of n-agli-dec-hands.", "body": "463363c replaced the DSH
+    research path (src/hands/delegate.rs) with the native ResearchWorker (src/work/research.rs).
+    The owner chose native over restoring DSH as an explicit option, but parks research
+    execution because the upstream APIs are unstable, and wants a separate plan for
+    the executor. The owner considers DSH''s own instability the biggest obstacle
+    to development, so #25 and the DSH follow-ups #38 and #43 close.\n\nThe rest of
+    n-agli-dec-hands stands: Claude Code is the owner''s tool, core code goes through
+    Moldloft, and the writer allowlist in root AGENTS.md applies.\n\nBefore research
+    is re-enabled: fix R20-R22 from the 463363c review and migrate executor config
+    and credentials explicitly. Never treat `research: dsh` as native silently.",
+    "links": [{"relation": "relates", "target_type": "ticket", "target_id": 25}, {"relation":
+    "relates", "target_type": "ticket", "target_id": "new:executor"}, {"relation":
+    "relates", "target_type": "note", "target_id": "n-agli-dec-hands"}]}}, {"op":
+    "note_create", "id": "n-agli-ev-refactor-review-20261123", "fields": {"title":
+    "Review of Gemini''s six-phase refactor 590a346..463363c", "kind": "evidence",
+    "state": "recorded", "summary": "Opus \u4e0e Astra \u72ec\u7acb\u5ba1\u67e5\u540e\u5408\u5e76\uff1a\u6d4b\u8bd5\u548c
+    clippy \u901a\u8fc7\uff0c\u4f46 463363c \u4e0d\u80fd\u76f4\u63a5\u90e8\u7f72\u5230\u73b0\u6709\u6570\u636e\u4e0a\uff0c\u6709
+    5 \u9879\u4e0a\u7ebf\u963b\u65ad\u3002\n\nOpus and Astra reviewed 0fe9648..463363c
+    independently and merged: tests and clippy pass, but 463363c cannot be deployed
+    onto existing data as is; five release blockers.", "body": "Reports: docs/reviews/2026-11-23/astra-code-review.md
+    (25 findings R01-R25) and FEATURE-TRIAGE.md. Opus spot-checked Astra''s unique
+    high-severity claims before merging, and after comparing evidence revised its
+    own reading of audit items A06, A15 and A18 from closed to partial.\n\nRelease
+    blockers: R07 deploy has no migration step and migrate-bson --apply has no backup;
+    R01 migration drops Episode.sources; R02 legacy followups.md is not imported;
+    R14 Telegram downloads bypass TELEGRAM_PROXY; R04 the frozen flag fails open.
+    R10 (legacy approvals) is a deploy precondition too.\n\nLive-store facts checked
+    read-only on 2026-11-23: 698 episodes, none archived, so R01 loses nothing yet.",
+    "links": [{"relation": "relates", "target_type": "ticket", "target_id": "new:blockers"},
+    {"relation": "relates", "target_type": "ticket", "target_id": "new:remaining"},
+    {"relation": "relates", "target_type": "note", "target_id": "n-agli-dec-triage-20261123"}]}},
+    {"op": "note_create", "id": "n-agli-ev-lessons-widen-20261123", "fields": {"title":
+    "Live lessons review: single-pass auto-widening is not safe as is", "kind": "evidence",
+    "state": "recorded", "summary": "\u7ebf\u4e0a 250 \u6761\u81ea\u52a8\u516c\u5f00\u7684
+    lessons \u4e2d 48 \u6761\u4e0d\u5e94\u539f\u6837\u516c\u5f00\uff1b\u5ba1\u67e5\u7406\u7531\u591a\u4e3a\u5957\u8bdd\uff1b\u516c\u5f00\u526f\u672c\u5728
+    590a346 \u4ece\u672a\u8fdb\u5165\u804a\u5929\u3002\n\nOf 250 lessons the reviewer
+    auto-widened, 48 should not stay public as written; reasons are mostly boilerplate;
+    at 590a346 the public copies never reached a chat.", "body": "Read-only export
+    of the live store (590a346), 2026-11-23: 565 lessons (310 self, 255 public copies);
+    306 Widen reviews: 250 auto-passed, 53 forwarded (5 approved, 1 rejected, 47 open),
+    3 revise. gemini-4-argon made 308 of 313 verify calls. Astra (gpt-6.2-astra, xhigh)
+    reviewed all 297 auto-passed or open items; Opus checked the four items that needed
+    source context locally, without sending source text to an outside model.\n\nResults:
+    auto-passed 202 keep, 7 retract, 41 rewrite; open 28 approve, 2 reject, 17 approve
+    after rewrite. Fifteen open items are reviewer call failures (10 were HTTP 524),
+    not judgements.\n\nFailure pattern: the reviewer looks for explicit identifiers
+    (232 of 250 reasons mention time, 173 list time, relationship and event together)
+    but does not check whether acquaintances could reassemble the event, never reasons
+    about what the original teller would mind, and passes lessons that label people,
+    turn someone''s private life into a social technique, treat bypassing safety limits
+    as a lesson, or treat privately discussed research as public knowledge. Verdict::parse
+    folds unclear output into ''forward to owner'', and the raw output is not stored.\n\nExposure:
+    chat recall at 590a346 passes include_lessons: false and privacy::recall reads
+    lessons only for a solo audience, so the public copies gained permission but were
+    never said in a chat.\n\nSummary: docs/reviews/2026-11-23/lessons-widen-review.md.
+    Per-item list (paraphrases private chats, gitignored): data/reviews/2026-11-23-lessons-widen.md.",
+    "links": [{"relation": "challenges", "target_type": "note", "target_id": "n-agli-dec-widen"},
+    {"relation": "relates", "target_type": "ticket", "target_id": "new:lessons"},
+    {"relation": "relates", "target_type": "ticket", "target_id": "new:r10"}]}}, {"op":
+    "note_update", "note_id": "n-agli-dec-hands", "fields": {"title": "Delegation:
+    Claude Code is the owner''s; core code goes through Moldloft (DSH and gate clauses
+    superseded 2026-11-23)", "summary": "2026-11-23 \u90e8\u5206\u88ab\u53d6\u4ee3\uff1aDSH
+    \u6761\u6b3e\u89c1 n-agli-dec-research-native\uff0c\u95f8\u95e8\u6267\u884c\u89c1
+    n-agli-dec-gate-retired\u3002Partly superseded 2026-11-23 (DSH clause, gate enforcement).\n\nClaude
+    Code \u53ea\u5f52\u4e3b\u4eba\u7528\uff0cAGLI \u4e0d\u8c03\u7528\u3002DSH \u662f\u4e3b\u8981\u7684\u53ef\u7f16\u7a0b\u5bf9\u8c61\uff0c\u5e38\u89c4\u7814\u7a76\u3001\u95f2\u901b\u548c\u5de5\u4f5c\u533a\u4efb\u52a1\u4ea4\u7ed9\u5b83\uff1bCodex
+    \u4f5c\u4e3a\u8fc7\u6e21\u8def\u5f84\u4fdd\u7559\u3002\u6d89\u53ca\u6838\u5fc3\u4ee3\u7801\u7684\u5de5\u4f5c\u8d70
+    Moldloft \u8f85\u52a9\u5c42\uff1aAGLI \u53ea\u63d0\u4ea4\u5de5\u5355/\u63d0\u6848\uff0c\u4e3b\u4eba\u5ba1\u9605\u540e\u518d\u52a8\u624b\u3002\u53ea\u6709
+    Astra \u548c Opus \u80fd\u76f4\u63a5\u5199\u6838\u5fc3\u4ee3\u7801\uff1bdeepseek-v4.1-flash-1017
+    \u53ea\u80fd\u505a\u7531 Astra \u6216 Opus \u6307\u5bfc\u7684\u826f\u5b9a\u4e49\u4efb\u52a1\u3002\n\nClaude
+    Code is reserved for the owner. DSH is the main programmable hand for routine
+    research, browsing and workspace tasks; Codex stays as a transitional path. Core-code
+    work goes through the Moldloft layer as reviewed tickets/proposals. Only Astra
+    and Opus write core code directly; deepseek-v4.1-flash-1017 only for well-defined
+    tasks directed by Astra or Opus.", "body": "Layers, from AGLI outward:\n\n1. AGLI
+    (persona) talks and dispatches; never executes (n-agli-dec-two-layer).\n2. DSH
+    is his main hand and the main programmable target (owner decision 2026-11-01):
+    routine research, browsing and workspace tasks. Invoked as `dsh --profile <AGLI
+    profile> headless` with the prompt on stdin, `--json` run events and `--session-id`
+    to resume; each task kind''s tool allowlist lives in a profile patch layer and
+    must be enforced by DSH, not by the prompt. It runs isolated (separate user, WSL
+    or container) and writes only in the task dir. Codex (subprocess, --sandbox workspace-write,
+    --search) stays as a transitional path until DSH covers the same tasks; whether
+    Codex is then reached through DSH is evaluated in #39. Only owner-approved tasks
+    reach delegation; requests from others become review items.\n3. Moldloft is the
+    auxiliary layer for core code (src/, L3 and up): AGLI may file tickets and submit
+    ticket/note proposals through Moldloft MCP, with evidence and a scoped spec. He
+    gets no approval tool; the owner reviews and decides who implements.\n4. Claude
+    Code is the owner''s tool. AGLI does not invoke the claude CLI at all; that quota
+    and authority stay with the owner.\n\nCore-code writer allowlist (enforced in
+    delegation code, not by prompt):\n- Astra (gpt-6-astra via Codex) and Opus (via
+    the owner''s Claude Code) may write core code directly, after owner approval of
+    the Moldloft ticket.\n- deepseek-v4.1-flash-1017 only for well-defined tasks,
+    meaning tasks directed by an advanced model: Astra or Opus writes the plan, names
+    files, interfaces and deciding tests, and reviews the diff before the owner sees
+    it. On ambiguity the directed model stops and hands back.\n- Any other model may
+    read and propose, never write core code.\nThe working rule lives in the root AGENTS.md
+    so every coding agent sees it.\n\nConsequences: ticket 22 (re-enable claude for
+    research) becomes removing the claude path from src/hands/delegate.rs. AGLI''s
+    hands only write in work/tasks/<id>/, so the allowlist is enforced where core
+    code is actually changed: the evolution gate (ticket 26). The L3 row of DESIGN
+    section 6 routes proposals through Moldloft review.\n\nUpdate 2026-11-01: DSH
+    replaces Codex as the main hand (#25). Token source and budget for DSH runs are
+    the owner''s call: n-agli-q-dsh-tokens.\n\nUpdate 2026-11-23: superseded in part.
+    Layer 2 (DSH as the main hand and programmable target) is replaced by n-agli-dec-research-native:
+    research uses the native worker, parked for now, and DSH is closed. Enforcing
+    the allowlist ''in the evolution gate (ticket 26)'' is replaced by n-agli-dec-gate-retired:
+    the owner upholds it by assigning writers and reviewing diffs. The rest stands:
+    AGLI does not invoke claude, core code goes through Moldloft, and the writer allowlist
+    lives in root AGENTS.md.", "links": [{"relation": "relates", "target_type": "note",
+    "target_id": "n-agli-dec-two-layer"}, {"relation": "relates", "target_type": "ticket",
+    "target_id": 22}, {"relation": "relates", "target_type": "ticket", "target_id":
+    25}, {"relation": "relates", "target_type": "ticket", "target_id": 26}, {"relation":
+    "relates", "target_type": "note", "target_id": "n-agli-dec-research-native"},
+    {"relation": "relates", "target_type": "note", "target_id": "n-agli-dec-gate-retired"}]}},
+    {"op": "ticket_update", "ticket_id": 26, "fields": {"status": "closed", "description":
+    "Owner disposition \u2014 2026-11-23: retired. The owner accepted the deletion
+    of the evolution gate in 0fe9648 (n-agli-dec-gate-retired). Core code ships through
+    Git and ops/deploy.ps1. Closed, not done: none of the re-acceptance items below
+    was met, and none remains in scope.\n\nOwner disposition \u2014 2026-11-15: return
+    the evolution feature to rework; the owner judged its current completion inadequate.
+    The earlier Done status is no longer accepted. Rework the end-to-end feature rather
+    than treating A04 as an isolated ancestor-check patch.\n\nRequired re-acceptance
+    scope:\n1. Pin the current running release identity/base at candidate preparation;
+    reject candidates that omit it. Recheck lineage and release drift at approval/commit/handoff,
+    and review the complete diff relative to the active release. Cover stale bases,
+    two unmerged evolutions and a release changed after checking.\n2. Unify evolution/manual
+    deployment runtime identity: release pointer, process identity, PID/log receipt
+    and data root. A successful evolution must remain manageable by the next normal
+    manual restart/deploy, including PID reuse protection and custom data_dir handling.\n3.
+    Perform candidate/executable/hash/path preflight before stopping a healthy process.
+    Preserve truthful pending/running/failed outcomes; a failed handoff must not leave
+    a pointer falsely implying the new version is running. Define recovery explicitly
+    without blind replay of unknown effects.\n4. Revalidate cancellation/freeze/shutdown
+    across checking, build trees, commit and restart, in coordination with A06''s
+    independent backend master switch. Existing serial command handling is not immediate-stop
+    evidence.\n5. Refresh EVOLUTION/DEPLOY/DESIGN contracts and add synthetic end-to-end
+    and failure-injection acceptance. Preserve the existing writer allowlist, owner-only
+    approval, exact approved tree, scope/path protections and immutable evidence.\n\nOnly
+    mark Done after the feature-level evidence and owner re-acceptance. No runtime
+    switch, rollout, L4 edit or writer assignment is performed by this maintenance
+    entry. #27 OS write isolation remains separately parked by the owner and is not
+    silently reactivated.\n\nOriginal implementation scope (historical, retained):\nImplement
+    evolution/gate.rs: proposals enter through Moldloft (ticket or proposal; AGLI
+    has no approval tool), owner picks the implementer, changes are applied in a sandbox
+    worktree, cargo build + cargo test + evals, judge (evolve), owner approval in
+    chat, commit and restart.\n\nThe gate enforces the core-code writer allowlist
+    from the root AGENTS.md: gpt-6-astra and Opus write directly; deepseek-v4.1-flash-1017
+    only on tasks directed by Astra or Opus (director''s plan, file scope, deciding
+    tests, director review of the diff recorded with the proposal); anything else
+    is rejected before build. Record the writer model and the director in the proposal
+    record."}}, {"op": "ticket_update", "ticket_id": 25, "fields": {"status": "closed",
+    "description": "Owner disposition \u2014 2026-11-23: closed. Research uses the
+    native worker, parked until upstream APIs are stable, instead of DSH; the owner
+    considers DSH''s own instability the biggest obstacle to development (n-agli-dec-research-native).
+    Follow-up: the ticket ''Plan the research executor before re-enabling research''.
+    The record below is historical.\n\nOwner decision 2026-11-01: DSH, not Codex,
+    is the main programmable target for AGLI''s hands (research, browsing, workspace
+    tasks). The Codex path stays as it is until DSH covers it.\n\nInstalled: C:/dev/DSH
+    (desktop app); CLI 0.2.1-rc.5 at C:/dev/DSH/resources/runtime/cli/bin/dsh.cmd;
+    profiles desktop, headless and web under ~/.dsh/profiles. `dsh --profile headless`
+    answers one task given as arguments or on stdin (`-`), `--json` writes newline-delimited
+    run events, and `--session-id` resumes a persisted Session. This maps onto hands/delegate.rs:
+    prompt on stdin, timeout, resume.\n\nRemaining:\n- A dedicated AGLI profile (patch
+    layer) with an explicit tool allowlist per task kind. Verify the allowlist is
+    enforced by DSH, not only stated in the prompt (the superagent prototype ran danger-full-access).\n-
+    Where it runs: DESIGN section 6 requires a separate user, WSL or container, writing
+    only work/tasks/*/scratch/. Related: #27.\n- A hard token/cost cap, and reading
+    usage from the --json events. Owner decision 2026-11-01 (n-agli-q-dsh-tokens):
+    a dedicated Bailian key held only in the AGLI DSH profile, daily cap (CNY 20)
+    parked because Bailian has no official per-key limit; record usage from --json
+    events, do not block runs.\n- Timeout, stop and /freeze terminate the run, including
+    background jobs.\n- Check whether --json events carry tool calls and their targets,
+    so AGLI can verify results against what was actually fetched or read.\n- First
+    task: read-only browsing (web_search/web_fetch only). See work/tasks/social-browsing-research/report.md."}},
+    {"op": "ticket_update", "ticket_id": 27, "fields": {"title": "Filesystem write
+    protection for L4 (boundaries, config)", "tech_notes": "Parked by the owner 2026-11-02;
+    do not raise again until the owner picks it up.\n\n2026-11-23: the evolution gate
+    is retired (n-agli-dec-gate-retired), so L4 is config/ and boundaries. Still parked
+    by the owner."}}, {"op": "ticket_update", "ticket_id": 5, "fields": {"tech_notes":
+    "2026-11-15 owner audit follow-up: A01/A02: the owner requested design reconciliation
+    before selecting a privacy/growth fix; see n-agli-q-growth-deidentification. This
+    historical implementation completion does not establish the derived-text disclosure
+    contract.\n\n2026-11-15 re-acceptance \u2014 Acceptance failed. The weekly narrative,
+    bounded drift, changelog and weekly gate pass growth/tests.rs::weekly_persisted_gate_caps_seed_changelog_and_effective_personality.
+    Original weekly delivery fails in a supported configuration: growth::weekly and
+    reflect::write_journal select LocalOnly whenever any local chat model is available.
+    With the shipped Q5 model, consolidate requires Q6 and cannot run (A22 router
+    probe). Restore a feasible, privacy-preserving journal/growth path and explicitly
+    handle restricted material when no legal processor exists. Validate the real configured
+    router in both local-available and unavailable cases. #28 owns the probe-specific
+    acceptance. The A01/A02 abstraction decision remains open in #84.\n\n2026-11-23
+    owner triage (n-agli-dec-triage-20261123): growth.rs was deleted in 0fe9648. Restore
+    simplified: bounded numeric/style deltas with source IDs and versions, revertible;
+    no free text into L1; the narrative stays private. Blocked by #84 (which fields
+    may change automatically is undecided) and by the 463363c release blockers."}},
+    {"op": "ticket_update", "ticket_id": 28, "fields": {"tech_notes": "\n\nDependency
+    adjusted 2026-11-02 (Opus): #26 -> #28 replaced by #5 -> #28. The probes watch
+    the L2 persona drift that #5 applies weekly; they do not need the L3 code gate.
+    If the gate later wants probes as evals, it can consume them.\n\n2026-11-15 re-acceptance
+    \u2014 Acceptance failed. Original requirement: periodic fixed prompts compared
+    over time. src/mind/probes.rs PROMPTS/weekly persist five answers, baseline/current
+    scores and low-score review after weekly growth; mind::probes::tests::baseline_low_score_once_approval_latest_and_week_gate
+    covers week gating, comparison and rebaseline; agli::tests::persona_probe_approve_rebaselines_latest_and_reject_preserves_baseline
+    covers owner disposition. Linked dependency adjustment explicitly concerns L2
+    growth, not #26 gate readiness; no claim of full privacy/growth acceptance. However
+    original periodic operation fails for a supported available-local-model setup:
+    probes::weekly line 47 chooses LocalOnly on has_local, then asks the fixed remote/vision
+    chat route. Audit A22 and docs/reviews/2026-11-15/REVIEW.md:125 production-Router
+    probe prove no eligible local chat candidate, and nightly journal failure may
+    prevent reaching probes. Stub test lacks real routing. Reopen periodic-probe feature
+    for scenario-compatible routing; privacy/growth design remains separate #84.\n\n2026-11-23
+    owner triage: probes.rs was deleted in 0fe9648. Restore with #5; run when the
+    persona version changes rather than weekly; judge boundary questions separately;
+    bind approvals to that run''s answers. The live store has no probe review items."}},
+    {"op": "ticket_update", "ticket_id": 84, "fields": {"tech_notes": "A01: growth::weekly
+    -> free-text overlay -> global L1. A02: solo decision reason -> owner chat. These
+    paths are audit evidence; treatment of safe abstraction remains unresolved. Related
+    historical implementation: #5, #20, #28. Question note: n-agli-q-growth-deidentification.\n\n2026-11-15
+    design review \u2014 n-agli-q-growth-deidentification now includes a proposed
+    source/artifact/audience/processor matrix and synthetic direct, indirect, combined,
+    and allowed-growth examples. Design selection remains with the owner.\n\n2026-11-23:
+    still undecided by the owner. #5 now depends on this ticket: the minimal growth
+    design in n-agli-dec-triage-20261123 needs the list of fields that may change
+    without per-change approval. The live lessons review (n-agli-ev-lessons-widen-20261123)
+    is input for the widening side."}}, {"op": "edge_add", "blocker_id": 84, "blocked_id":
+    5}, {"op": "edge_add", "blocker_id": "new:blockers", "blocked_id": 5}, {"op":
+    "edge_add", "blocker_id": "new:blockers", "blocked_id": "new:lessons"}, {"op":
+    "edge_add", "blocker_id": "new:blockers", "blocked_id": "new:commitments"}, {"op":
+    "edge_add", "blocker_id": "new:blockers", "blocked_id": "new:groupobs"}, {"op":
+    "edge_add", "blocker_id": "new:executor", "blocked_id": "new:knowledge"}]}'
+  created_at: '2026-11-23T17:25:14Z'
+  decided_at: '2026-11-23T17:28:44Z'

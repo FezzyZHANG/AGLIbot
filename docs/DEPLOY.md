@@ -8,7 +8,7 @@
 
 | 目录 | 作用 | 例子 |
 |---|---|---|
-| 源码仓库（`AGLI_SOURCE`） | git、Moldloft、开发；进化闸门在这里建 worktree 和提交 | `C:\dev\AGLIbot` |
+| 源码仓库（`AGLI_SOURCE`） | git、Moldloft、开发；`ops/deploy.ps1` 从这里构建发布 | `C:\dev\AGLIbot` |
 | 运行时根（`AGLI_ROOT`） | 在线 bot 的 `config/`、`mind/`、`data/`、`work/`、`.env` | `C:\dev\AGLIbot-runtime\<名字>` |
 
 运行时根里有两个本机文件，都不进版本库：

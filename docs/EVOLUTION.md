@@ -1,7 +1,8 @@
 # L3 进化闸门（#26）
 
 > **状态（2026-11-23）**：闸门代码已在 0fe9648（重构 phase 0）中删除，`/evolve`、`/evolve-status`
-> 目前只回复“暂未开放”，核心代码通过 Git 与 `ops/deploy.ps1` 发布。是否恢复由主人决定（L4）。
+> 目前只回复“暂未开放”，核心代码通过 Git 与 `ops/deploy.ps1` 发布。主人已于 2026-11-23 签字接受
+> 删除，闸门退役；以后若要恢复，须作为由主人发起的 L4 变更重新设计。
 > 本文记录删除前的协议。其中的 Moldloft 来源校验按 v1 编写（读 `.moldloft/project.json` 的端口和
 > Drydock）；Moldloft 已升级到 v2，这两者都不存在了：单一 SQLite，按图谱（graph）划分，见
 > [Moldloft README](../Moldloft/README.md)。恢复闸门时，来源读取须改用 v2 的接口，

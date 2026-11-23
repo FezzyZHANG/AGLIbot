@@ -140,7 +140,7 @@ AGLIbot/
     ├── work/{scheduler,research}.rs
     ├── hands/{delegate,web}.rs
     ├── store/{mod,jsonl,mongo}.rs # Store trait；配置了 Mongo URL 就用 Mongo，否则用 JSONL
-    └── evolution/gate.rs
+    └── evolution/gate.rs         # 已退役（0fe9648 删除，主人 2026-11-23 签字），见第 6 节
 ```
 
 ### 2b. MongoDB 集合设计
@@ -348,7 +348,7 @@ AGLIbot/
 
 ## 6. 自进化与安全
 
-> **状态（2026-11-23）**：下一条所述闸门已在 0fe9648 删除，L3 暂无自动通道：核心代码改动仍先进 Moldloft（v2）由主人指定实现者，再经 Git 与 `ops/deploy.ps1` 发布。见[进化闸门](EVOLUTION.md)顶部说明。
+> **状态（2026-11-23）**：下一条所述闸门已在 0fe9648 删除，主人同日签字接受，闸门退役。L3 没有自动通道：核心代码改动先进 Moldloft（v2）由主人指定实现者，再经 Git 与 `ops/deploy.ps1` 发布；AGLI 只能提交提案。L4 只剩 `config/` 和 boundaries；以后若要恢复闸门，本身就是一项由主人发起的 L4 变更。见[进化闸门](EVOLUTION.md)顶部说明。
 
 > **状态（2026-11-03，#26）**：L3 已接入主人私聊启动的进化闸门：Moldloft 来源、实现者白名单、独立 worktree 检查、`evolve` 审查、主人审批、精确 tree 提交与重启交接；初始闸门实现由主人明确授权，运行时仍拒绝 L4 修改。使用方式与边界见[进化闸门](EVOLUTION.md)。
 
@@ -365,8 +365,8 @@ AGLIbot/
 | L0 | state | 自动 |
 | L1 | Mongo 记忆、skills、knowledge | 自动，这是最安全、收益最高的进化区 |
 | L2 | personality / voice / interests / templates | reflect 流程负责，每次变化有上限，写入 changelog |
-| L3 | `src/` 代码 | 提案先进 Moldloft（工单 / 笔记提案，AGLI 没有批准权）→ 主人审阅并指定实现者 → 在沙箱 worktree 中 `cargo build` + `cargo test` + evals → judge 审查 → 主人审批 → git commit → 重新编译并重启 |
-| L4 | boundaries、config/、`evolution/gate.rs` | 只有你能改，在文件系统层面限制 agent 的写权限 |
+| L3 | `src/` 代码 | 提案先进 Moldloft（工单 / 笔记提案，AGLI 没有批准权）→ 主人审阅并指定实现者 → 实现者在自己的环境里 `cargo build` + `cargo test` + evals → 主人审阅 → git commit → `ops/deploy.ps1` 发布（bot 进程内不再提交或重启） |
+| L4 | boundaries、config/ | 只有你能改，在文件系统层面限制 agent 的写权限 |
 
 选 Rust 的一个附带好处：编译器和类型系统本身就是 L3 的第一道自动过滤，提案连编译都过不了就不必送审。
 
@@ -375,7 +375,7 @@ AGLIbot/
 - DSH 是主要的可编程对象，常规研究取证已使用它；闲逛浏览和其他工作区任务仍按相应流程的实现范围判断。当前调用形式是 `dsh --profile <AGLI 的 profile> --json [--session-id <id>] -`，prompt 走 stdin；`headless` 是建立 profile 时使用的模板名，不是此处执行子命令。每类任务的工具白名单写在 profile 的补丁层里，并且要验证由 DSH 强制执行，不靠提示词。
 - codex 保留为过渡路径，DSH 覆盖对应任务后再退役；Astra 写核心代码仍经 codex（见下一条）。
 - DSH 用哪个 token 来源、预算多少，由主人管理（见笔记 n-agli-q-dsh-tokens）。
-- 核心代码只有 Astra（gpt-6-astra，经 codex）和 Opus（经主人的 Claude Code）能直接写；deepseek-v4.1-flash-1017 只能做良定义任务，即由 Astra 或 Opus 指导的任务：高级模型写计划、指定文件、接口和判定测试，并在送主人前审查 diff。其他模型只能读和提案。工作规则写在根目录 `AGENTS.md`；白名单在进化闸门里由代码强制，不靠提示词。
+- 核心代码只有 Astra（gpt-6-astra，经 codex）和 Opus（经主人的 Claude Code）能直接写；deepseek-v4.1-flash-1017 只能做良定义任务，即由 Astra 或 Opus 指导的任务：高级模型写计划、指定文件、接口和判定测试，并在送主人前审查 diff。其他模型只能读和提案。工作规则写在根目录 `AGENTS.md`。白名单原先由进化闸门在代码里强制；闸门退役后，由主人在 Moldloft 指定实现者、审阅 diff 并亲自发布来保证。
 
 **社交化带来的新攻击面**：
 - **权限只认主人的平台 ID**（`acl.yaml`），不认昵称，也不认对方的说法。
@@ -419,7 +419,7 @@ AGLIbot/
 6. **研究流水线与知识层**：从澄清到交付的完整流程、claims 台账、sources 信誉表、watchlist 主动跟进。
 7. **心流**：按 namespace 分桶、即时反思、缓存命中计量。
 8. **级联与综合审查**：自检失败时升级重做；`judge.rs` 覆盖 5d 的四类事项，并实现每日汇总。自动打分等内容见 5c′，不在本计划范围内。
-9. **进化闸门**：在已接入的 DSH 上完成 proposal → cargo test / eval → 审查 → 审批 → commit 的流程，加上 L4 隔离和漂移探针。
+9. ~~**进化闸门**：在已接入的 DSH 上完成 proposal → cargo test / eval → 审查 → 审批 → commit 的流程，加上 L4 隔离和漂移探针。~~ 已退役（2026-11-23 主人签字）；漂移探针随周成长恢复。
 
 **可恢复性与幂等性不是首版的优先事项。** 首版只要求三点：基本任务状态、`log.md` 断点、可以人工恢复。有外部影响的动作在 `audit` 中留一条最小执行记录（sent / unknown / failed），恢复时能识别“结果未知”，避免盲目重复。以下内容列为后续增强：崩溃后自动续做、重复消息和重复工具调用的去重、文件与数据库的一致性修复。
 

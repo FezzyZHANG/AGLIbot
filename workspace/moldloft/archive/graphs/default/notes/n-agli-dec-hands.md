@@ -1,13 +1,17 @@
 ---
 id: n-agli-dec-hands
 graph_id: default
-version: 1
-title: 'Delegation: DSH is the main hand; Codex is transitional; Claude Code is the
-  owner''s; core code goes through Moldloft'
+version: 2
+title: 'Delegation: Claude Code is the owner''s; core code goes through Moldloft (DSH
+  and gate clauses superseded 2026-11-23)'
 kind: decision
 state: accepted
 in_graph: true
-summary: 'Claude Code 只归主人用，AGLI 不调用。DSH 是主要的可编程对象，常规研究、闲逛和工作区任务交给它；Codex 作为过渡路径保留。涉及核心代码的工作走
+summary: '2026-11-23 部分被取代：DSH 条款见 n-agli-dec-research-native，闸门执行见 n-agli-dec-gate-retired。Partly
+  superseded 2026-11-23 (DSH clause, gate enforcement).
+
+
+  Claude Code 只归主人用，AGLI 不调用。DSH 是主要的可编程对象，常规研究、闲逛和工作区任务交给它；Codex 作为过渡路径保留。涉及核心代码的工作走
   Moldloft 辅助层：AGLI 只提交工单/提案，主人审阅后再动手。只有 Astra 和 Opus 能直接写核心代码；deepseek-v4.1-flash-1017
   只能做由 Astra 或 Opus 指导的良定义任务。
 
@@ -18,9 +22,15 @@ summary: 'Claude Code 只归主人用，AGLI 不调用。DSH 是主要的可编�
   Opus write core code directly; deepseek-v4.1-flash-1017 only for well-defined tasks
   directed by Astra or Opus.'
 created_at: '2026-11-23T05:36:44Z'
-updated_at: '2026-11-23T05:36:44Z'
+updated_at: '2026-11-23T17:28:44Z'
 adopted_body_hash: null
 links:
+- relation: relates
+  target_type: note
+  target_id: n-agli-dec-gate-retired
+- relation: relates
+  target_type: note
+  target_id: n-agli-dec-research-native
 - relation: relates
   target_type: note
   target_id: n-agli-dec-two-layer
@@ -50,3 +60,5 @@ The working rule lives in the root AGENTS.md so every coding agent sees it.
 Consequences: ticket 22 (re-enable claude for research) becomes removing the claude path from src/hands/delegate.rs. AGLI's hands only write in work/tasks/<id>/, so the allowlist is enforced where core code is actually changed: the evolution gate (ticket 26). The L3 row of DESIGN section 6 routes proposals through Moldloft review.
 
 Update 2026-11-01: DSH replaces Codex as the main hand (#25). Token source and budget for DSH runs are the owner's call: n-agli-q-dsh-tokens.
+
+Update 2026-11-23: superseded in part. Layer 2 (DSH as the main hand and programmable target) is replaced by n-agli-dec-research-native: research uses the native worker, parked for now, and DSH is closed. Enforcing the allowlist 'in the evolution gate (ticket 26)' is replaced by n-agli-dec-gate-retired: the owner upholds it by assigning writers and reviewing diffs. The rest stands: AGLI does not invoke claude, core code goes through Moldloft, and the writer allowlist lives in root AGENTS.md.

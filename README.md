@@ -58,8 +58,8 @@ Telegram 的收发消息走环境变量 `TELEGRAM_PROXY` 指定的代理（例�
 
 聊天及反思调用仍串行占用主循环；慢请求期间上述命令、Ctrl+C 和心跳检查会等待当前处理返回，`/freeze` 目前不具备即时抢占能力。
 
-核心代码提案：`/evolve 提案ID` 开始检查，`/evolve-status 提案ID` 查看状态；通过构建、
-测试、eval 和审查后仍需主人批准，才提交并重启。候选格式和操作说明见 [进化闸门](docs/EVOLUTION.md)。
+核心代码提案进 Moldloft，由主人指定实现者，审阅后经 Git 和 `ops/deploy.ps1` 发布。bot 内的
+进化闸门已退役（2026-11-23），`/evolve` 只回复“暂未开放”，旧协议见 [进化闸门](docs/EVOLUTION.md)。
 
 ## 你会经常改的文件
 

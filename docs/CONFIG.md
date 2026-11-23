@@ -312,7 +312,7 @@ provider_cache:
 | 名称 | 用途 / 读取位置 |
 |---|---|
 | `AGLI_ROOT` | 主程序选择运行时根目录 |
-| `AGLI_SOURCE` | 进化闸门使用的源码 checkout；缺省等于运行时根 |
+| `AGLI_SOURCE` | 源码 checkout；缺省等于运行时根。原供进化闸门使用，闸门退役后代码只解析、不再读取 |
 | `AGLI_LOG_FILE` | 将 bot 标准日志同时写入指定文件 |
 | `RUST_LOG` | tracing 的默认环境日志过滤器（间接通过库读取） |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot 凭据 |
