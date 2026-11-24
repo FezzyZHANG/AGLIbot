@@ -2,9 +2,9 @@ format_version: 1
 graphs:
 - id: default
   name: Default
-  revision: 179
+  revision: 183
   created_at: '2026-10-31 19:39:16.025974'
-  updated_at: '2026-11-23T17:28:53Z'
+  updated_at: '2026-11-23T19:17:13Z'
 sequences:
-  anchors: 0
+  anchors: 105
   tickets: 117
