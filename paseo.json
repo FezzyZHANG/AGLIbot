@@ -1,0 +1,9 @@
+{
+  "worktree": {
+    "setup": "cargo fetch"
+  },
+  "scripts": {
+    "build": { "command": "cargo build" },
+    "test": { "command": "cargo test" }
+  }
+}

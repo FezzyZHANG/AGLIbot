@@ -375,7 +375,7 @@ AGLIbot/
 - DSH 是主要的可编程对象，常规研究取证已使用它；闲逛浏览和其他工作区任务仍按相应流程的实现范围判断。当前调用形式是 `dsh --profile <AGLI 的 profile> --json [--session-id <id>] -`，prompt 走 stdin；`headless` 是建立 profile 时使用的模板名，不是此处执行子命令。每类任务的工具白名单写在 profile 的补丁层里，并且要验证由 DSH 强制执行，不靠提示词。
 - codex 保留为过渡路径，DSH 覆盖对应任务后再退役；Astra 写核心代码仍经 codex（见下一条）。
 - DSH 用哪个 token 来源、预算多少，由主人管理（见笔记 n-agli-q-dsh-tokens）。
-- 核心代码只有 Astra（gpt-6-astra，经 codex）和 Opus（经主人的 Claude Code）能直接写；deepseek-v4.1-flash-1017 只能做良定义任务，即由 Astra 或 Opus 指导的任务：高级模型写计划、指定文件、接口和判定测试，并在送主人前审查 diff。其他模型只能读和提案。工作规则写在根目录 `AGENTS.md`。白名单原先由进化闸门在代码里强制；闸门退役后，由主人在 Moldloft 指定实现者、审阅 diff 并亲自发布来保证。
+- 核心代码只有 Astra（gpt-6.2-astra，经 codex）和 Opus（经主人的 Claude Code）能直接写；Sol（gpt-6.2-sol，经 codex）只能做良定义任务（2026-11-25 起接替 deepseek-v4.1-flash-1017，后者搁置，由主人决定是否恢复），即由 Astra 或 Opus 指导的任务：高级模型写计划、指定文件、接口和判定测试，并在送主人前审查 diff。其他模型只能读和提案。工作规则写在根目录 `AGENTS.md`。白名单原先由进化闸门在代码里强制；闸门退役后，由主人在 Moldloft 指定实现者、审阅 diff 并亲自发布来保证。
 
 **社交化带来的新攻击面**：
 - **权限只认主人的平台 ID**（`acl.yaml`），不认昵称，也不认对方的说法。

@@ -18,11 +18,12 @@ L4 (`config/`, boundaries) is owner-only regardless of model. The in-process evo
 (`evolution/gate.rs`) was retired with the owner's sign-off on 2026-11-23; core code now ships only
 through Git and `ops/deploy.ps1`, and bringing a gate back is itself an L4 change the owner starts.
 
-- **Direct writers:** Astra (`gpt-6-astra`, via Codex) and Opus (via the owner's Claude Code).
-- **Directed writer:** `deepseek-v4.1-flash-1017`, only for well-defined tasks. A task is
-  well-defined when an advanced model (Astra or Opus) directs it: the director writes the
-  plan, names the files and interfaces to touch and the tests that decide acceptance, and
-  reviews the resulting diff before it reaches the owner. The directed model does not widen
+- **Direct writers:** Astra (`gpt-6.2-astra`, via Codex) and Opus (via the owner's Claude Code).
+- **Directed writer:** Sol (`gpt-6.2-sol`, via Codex), only for well-defined tasks.
+  `deepseek-v4.1-flash-1017` held this role until 2026-11-25 and is parked until the owner
+  restores it. A task is well-defined when an advanced model (Astra or Opus) directs it:
+  the director writes the plan, names the files and interfaces to touch and the tests that
+  decide acceptance, and reviews the resulting diff before it reaches the owner. The directed model does not widen
   scope; on ambiguity it stops and hands back to the director instead of guessing.
 - **Everyone else** (other models, and AGLI's own chat/judge models) may read and propose,
   never write core code.
